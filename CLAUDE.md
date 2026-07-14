@@ -4,8 +4,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 프로젝트 현황
 
-**이 저장소는 아직 구현 코드가 없는 기획 단계입니다.** `backend/`, `frontend/` 등은 아직
-스캐폴딩되지 않았습니다. 작업을 시작하기 전에 반드시 아래 두 문서를 먼저 읽으세요 —
+**M1(기반 구축) 스캐폴딩 완료.** `backend/`는 상세개발계획.md §3 트리를 따라 생성되어 있고
+(`app/api`, `app/core`, `app/parsers`, `app/models`, `app/exporters`, `tests/fixtures`),
+`config.py`/DB 모델 6종/`dart_client.py`/`corp_cache.py`/`meta.py`(quota, validate-key)/
+`main.py`가 구현되어 있다. `jobs.py`, `results.py`, `pipeline.py`, `filters.py`,
+`parsers/*`, `exporters/excel.py`는 M2/M3에서 채울 골격(TODO 주석)만 있는 상태다.
+`frontend/`는 아직 스캐폴딩되지 않았다(M4 범위, 마일스톤 순서 준수).
+
+**M1의 ★스파이크(금융위 API 커버리지 실측)는 아직 실행되지 않았다** — OpenDART API 키와
+공공데이터포털 키가 아직 발급되지 않았기 때문. 스크립트는
+`backend/app/core/spike_financial_committee_coverage.py`에 준비되어 있으며, 키 발급 후
+`cd backend && python -m app.core.spike_financial_committee_coverage`로 실행해 대응 1/2
+채택을 결정해야 한다 (이후 M2 착수 전 필수).
+
+작업을 시작하기 전에 반드시 아래 두 문서를 먼저 읽으세요 —
 이 저장소의 유일한 진실 소스(source of truth)입니다.
 
 - [PRD.md](PRD.md) — 제품 요구사항: 무엇을, 왜 만드는지, 확보 가능한 데이터 항목, 리스크
@@ -88,5 +100,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   결정하므로 가장 먼저 검증해야 한다.
 - `backend/tests/fixtures/`에 샘플 감사보고서 원문(10개사)을 두고 파서 단위 테스트를 작성하는
   구조로 계획되어 있다 — 실제 원문 파일이 없으면 M3 작업을 시작할 수 없으니 먼저 확보할 것.
-- 프로젝트 자체 빌드/린트/테스트 명령은 아직 없다(스캐폴딩 전). backend/frontend가 생성되면
-  이 섹션을 실제 명령어(예: `pytest`, `npm run dev`, `npm run lint`)로 갱신할 것.
+
+### 백엔드 실행/테스트 명령 (M1 스캐폴딩 완료 후 실제 확인된 명령)
+
+```
+cd backend
+python -m venv .venv            # Python 3.11 또는 3.12 권장 (아래 "Python 버전 주의" 참고)
+source .venv/Scripts/activate   # Windows Git Bash 기준. PowerShell은 .venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+
+cp .env.example .env            # 실제 키 발급 후 값 채워넣기 (커밋 금지)
+
+uvicorn app.main:app --reload   # http://127.0.0.1:8000, 기동 시 SQLite 테이블 자동 생성
+pytest tests/ -q                # 파서 fixtures 확보 전에는 placeholder 테스트만 존재
+```
+
+**Python 버전 주의**: 이 개발 환경의 기본 `python`이 3.14였는데, 3.14용 `pandas`/`lxml` 등의
+사전 빌드 wheel이 아직 없어 `pip install -r requirements.txt`가 Meson/C 빌드 단계에서 실패했다
+(Visual Studio 빌드 도구 필요). **Python 3.11 또는 3.12로 가상환경을 만들 것** — 이 저장소는
+`py -3.11 -m venv .venv`로 확인 완료. frontend는 아직 없음(M4 착수 시 이 섹션에 `npm run dev`,
+`npm run lint` 추가할 것).

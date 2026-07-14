@@ -1,0 +1,39 @@
+# --- 환경변수 / 비밀정보 ---
+.env
+backend/.env
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+venv/
+.venv/
+env/
+
+# --- DB / 로컬 캐시 데이터 ---
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+backend/data/corp_cache/*
+!backend/data/corp_cache/.gitkeep
+backend/data/documents/*
+!backend/data/documents/.gitkeep
+
+# --- Node / 프론트엔드 ---
+node_modules/
+dist/
+.vite/
+
+# --- 에디터/OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- 로그 ---
+*.log
