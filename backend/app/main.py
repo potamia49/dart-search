@@ -1,8 +1,8 @@
 """FastAPI 엔트리포인트.
 
-상세개발계획.md §3, §8(M1): 시작 시 SQLite DB/테이블을 생성하고 meta 라우터를
-등록한다. jobs/results 라우터는 M2 이후 파이프라인(app/core/pipeline.py)이
-준비되면 등록한다.
+상세개발계획.md §3, §8(M1/M2): 시작 시 SQLite DB/테이블을 생성하고
+meta/jobs/results 라우터를 등록한다. jobs/results는 M2에서 파이프라인
+(app/core/pipeline.py)이 준비되어 함께 등록되었다.
 
 로컬 실행:
     cd backend
@@ -16,7 +16,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.api import meta
+from app.api import jobs, meta, results
 from app.config import get_settings
 from app.core.db import create_all_tables
 
@@ -36,8 +36,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="dart-search backend", version="0.1.0", lifespan=lifespan)
 
 app.include_router(meta.router)
-
-# TODO(M2): app.api.jobs.router, app.api.results.router 등록
+app.include_router(jobs.router)
+app.include_router(results.router)
 
 
 @app.get("/health")

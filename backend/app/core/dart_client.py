@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import date
 from typing import Any
 
@@ -31,6 +32,25 @@ from app.core.db import get_session_factory
 from app.models.api_usage import ApiUsage
 
 logger = logging.getLogger(__name__)
+
+
+class _ApiKeyRedactionFilter(logging.Filter):
+    """httpx의 기본 INFO 로그("HTTP Request: GET <url>...")에는 요청 URL 전체가
+    그대로 찍히는데, 여기에 crtfc_key(DART)/serviceKey(공공데이터포털) 값이 쿼리
+    파라미터로 노출된다. 로그가 파일/외부로 전달될 가능성에 대비해 마스킹한다.
+    """
+
+    _PATTERN = re.compile(r"(crtfc_key|serviceKey)=[^&\s]+")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        if "crtfc_key=" in message or "serviceKey=" in message:
+            record.msg = self._PATTERN.sub(r"\1=***REDACTED***", message)
+            record.args = ()
+        return True
+
+
+logging.getLogger("httpx").addFilter(_ApiKeyRedactionFilter())
 
 
 class DartApiKeyMissingError(RuntimeError):
@@ -264,6 +284,12 @@ class FscCorpInfoClient:
     async def aclose(self) -> None:
         if self._owns_client:
             await self._client.aclose()
+
+    async def __aenter__(self) -> "FscCorpInfoClient":
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self.aclose()
 
     def _require_api_key(self) -> str:
         if not self.settings.data_go_kr_api_key:

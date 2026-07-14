@@ -1,6 +1,6 @@
 """수집 파이프라인 오케스트레이션 (Job 실행).
 
-상세개발계획.md §4 STEP 0~6을 구현하는 곳. M2에서 착수.
+상세개발계획.md §4 STEP 0~6 중 STEP 1~4(M2 범위)를 구현한다.
 
 각 STEP은 `jobs.current_step`/`progress_done`/`progress_total`을 DB에
 체크포인트로 남겨 중단 후 이어하기(resume)가 가능해야 한다
@@ -10,17 +10,795 @@ Job.status를 PAUSED_QUOTA로 전환하고 그 시점까지의 진행 상태를 
 
 | STEP | 내용 | 사용 API |
 |---|---|---|
-| 0 | 조건 입력 검증, Job 생성 | - |
+| 0 | 조건 입력 검증, Job 생성 | - (app/api/jobs.py 책임) |
 | 1 | corp_cache 확인/갱신 | corpCode.xml (app/core/corp_cache.py) |
 | 2 | 외부감사관련(pblntf_ty=F) 공시 목록 페이징 수집 | list.json |
-| 3 | 지역 사전 추림 + 기업개황 확정 + corp_profiles 캐시 적재 | 금융위 API 또는 company.json |
+| 3 | 지역 사전 추림(금융위 API) + 기업개황 확정 + corp_profiles 캐시 적재 | 금융위 기업기본정보, company.json (대응 1) |
 | 4 | 감사보고서 원본 다운로드 (zip 해제, 형식 판별) | document.xml |
-| 5 | 재무제표 파싱(당기/전기 13항목) + 감사의견 추출 | - (app/parsers) |
-| 6 | 매출액 범위 사후 필터 | - |
+| 5 | 재무제표 파싱(당기/전기 13항목) + 감사의견 추출 | - (app/parsers, M3 구현 완료) |
+| 6 | 매출액 범위 사후 필터 | - (M3 구현 완료) |
 
-M1에서는 아직 구현하지 않는다.
+### M3 실측 메모 (원문 서식 분포)
+
+`backend/tests/fixtures/manifest.json`(2026-07-15 실제 DART API로 확보, 25건
++ 2012년 원문 5건 = 30건)를 실측한 결과 **전부 XML**이었다 — 최근(2026년
+4~6월) 분기 보고서는 물론 2012년 초 원문까지도 document.xml API가 XML로
+반환했다. `pdf_parser.py`는 실제 PDF 표본으로 검증하지 못한 best-effort
+구현이며, HWP는 여전히 미구현(실패 기록만) 상태다. 감사의견 분포는 적정
+15건, 한정 2건, 의견거절 10건(재무제표 자체가 첨부되지 않음), 부적정은
+표본에 없었다.
+
+### resume 설계 메모 (상세개발계획.md §5는 후보 목록을 위한 별도 테이블을 두지
+않으므로, STEP별로 "이어하기"의 의미가 다르다는 점을 명시해 둔다):
+
+- STEP 1(corp_cache)과 STEP 2(공시 목록 조회)는 멱등(idempotent)이고 상대적으로
+  호출 비용이 낮다(각각 TTL 체크 1회, list.json 페이지 수만큼). resume 시 이
+  두 STEP은 항상 처음부터 다시 실행한다 — corp_cache는 TTL 이내면 즉시
+  스킵되고, list.json 재조회는 안전하며 후보 목록을 다시 만드는 데 필요하다
+  (후보 목록 자체는 DB에 영구 저장하지 않는다).
+- STEP 3(기업개황 확정)과 STEP 4(원문 다운로드)가 실제로 비용이 큰 구간이며,
+  이 두 STEP의 "이어하기"는 각각 `corp_profiles` 전역 캐시(TTL 기반)와
+  `DOCUMENT_CACHE_DIR`의 로컬 파일 캐시로 구현된다 — 이미 처리된 회사/문서는
+  API를 재호출하지 않는다. `results` 테이블에도 이미 삽입된 corp_code는
+  중복 삽입하지 않는다.
 """
 
-# TODO(M2): STEP 1~4 오케스트레이션 구현
-# TODO(M3): STEP 5 파싱 연동
-# TODO(M2): STEP 6 매출액 필터 연동
+from __future__ import annotations
+
+import io
+import json
+import logging
+import re
+import zipfile
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session, sessionmaker
+
+from app.config import Settings, get_settings
+from app.core.corp_cache import refresh_corp_cache
+from app.core.dart_client import DartApiError, DartClient, FscCorpInfoClient, QuotaExceededError
+from app.core.db import get_session_factory
+from app.core.filters import (
+    industry_matches,
+    normalize_corp_name,
+    parse_address,
+    region_matches,
+    revenue_matches,
+)
+from app.models.corp_profile import CorpProfile
+from app.models.job import Job, JobStatus
+from app.models.result import Result
+from app.parsers.audit_opinion import extract_audit_opinion
+from app.parsers.base import DIRECT_FINANCIAL_FIELDS, ParsedFinancials
+from app.parsers.pdf_parser import parse_pdf_financials
+from app.parsers.xml_parser import parse_xml_financials
+
+logger = logging.getLogger(__name__)
+
+# STEP 번호 (상세개발계획.md §4). STEP 0(Job 생성)은 app/api/jobs.py 책임이다.
+STEP_CORP_CACHE = 1
+STEP_DISCLOSURE_LIST = 2
+STEP_REGION_INDUSTRY_FILTER = 3
+STEP_DOCUMENT_DOWNLOAD = 4
+STEP_PARSE_FINANCIALS = 5
+STEP_REVENUE_FILTER = 6
+
+_DISCLOSURE_PAGE_COUNT = 100  # list.json 1회 최대 100건
+_CHECKPOINT_INTERVAL = 20  # STEP 3/4에서 N건마다 진행률 커밋 + 취소 여부 확인
+
+_UNSET = object()  # _checkpoint()의 error_msg=None(명시적 초기화)과 미지정을 구분하기 위한 sentinel
+
+
+class JobCancelledError(Exception):
+    """다음 체크포인트에서 취소를 감지했을 때 STEP 루프를 즉시 빠져나오기 위한 내부 신호.
+
+    Job.status는 API 레이어(`POST /api/jobs/{id}/cancel`)가 이미 CANCELLED로
+    기록해 두었으므로, 이 예외를 잡는 쪽에서 상태를 다시 덮어쓰지 않는다.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Job 로딩 / 체크포인트 헬퍼
+# ---------------------------------------------------------------------------
+
+
+def _load_job(session_factory: sessionmaker[Session], job_id: int) -> Job | None:
+    with session_factory() as db:
+        job = db.get(Job, job_id)
+        if job is not None:
+            db.expunge(job)
+        return job
+
+
+def _job_status(session_factory: sessionmaker[Session], job_id: int) -> str | None:
+    with session_factory() as db:
+        job = db.get(Job, job_id)
+        return job.status if job else None
+
+
+def _checkpoint(
+    session_factory: sessionmaker[Session],
+    job_id: int,
+    *,
+    status: str | None = None,
+    current_step: int | None = None,
+    progress_done: int | None = None,
+    progress_total: int | None = None,
+    error_msg: str | None | object = _UNSET,
+) -> None:
+    """jobs 테이블에 진행 상태를 커밋 — 이것이 곧 "체크포인트"다."""
+    with session_factory() as db:
+        job = db.get(Job, job_id)
+        if job is None:
+            return
+        if status is not None:
+            job.status = status
+        if current_step is not None:
+            job.current_step = current_step
+        if progress_done is not None:
+            job.progress_done = progress_done
+        if progress_total is not None:
+            job.progress_total = progress_total
+        if error_msg is not _UNSET:
+            job.error_msg = error_msg
+        db.commit()
+
+
+def _raise_if_cancelled(session_factory: sessionmaker[Session], job_id: int) -> None:
+    if _job_status(session_factory, job_id) == JobStatus.CANCELLED:
+        raise JobCancelledError()
+
+
+# ---------------------------------------------------------------------------
+# STEP 2 — 외부감사관련 공시 목록 페이징 수집
+# ---------------------------------------------------------------------------
+
+
+async def _collect_candidates(
+    dart_client: DartClient,
+    session_factory: sessionmaker[Session],
+    job_id: int,
+    cond_period: dict[str, Any],
+) -> list[dict[str, str]]:
+    """STEP 2: list.json(pblntf_ty=F)을 끝까지 페이징 순회해 후보를 모은다.
+
+    같은 회사가 기간 내 여러 건(정정 포함) 공시했을 수 있으므로 corp_code
+    기준으로 dedup하고, rcept_no가 가장 큰(=가장 최근 접수된) 건을 대표로
+    남긴다 (rcept_no는 "접수일자+일련번호"라 문자열 비교로 최신 판별 가능).
+    """
+    bgn_de = cond_period.get("bgn_de")
+    end_de = cond_period.get("end_de")
+    if not bgn_de or not end_de:
+        raise ValueError("cond_period.bgn_de/end_de가 필요합니다.")
+
+    by_corp: dict[str, dict[str, str]] = {}
+    page_no = 1
+    total_page = 1
+
+    while page_no <= total_page:
+        _raise_if_cancelled(session_factory, job_id)
+
+        data = await dart_client.get_disclosure_list(
+            bgn_de=bgn_de,
+            end_de=end_de,
+            pblntf_ty="F",
+            page_no=page_no,
+            page_count=_DISCLOSURE_PAGE_COUNT,
+        )
+        total_page = int(data.get("total_page") or 1)
+
+        for item in data.get("list") or []:
+            corp_code = item.get("corp_code")
+            rcept_no = item.get("rcept_no")
+            if not corp_code or not rcept_no:
+                continue
+            existing = by_corp.get(corp_code)
+            if existing is None or rcept_no > existing["rcept_no"]:
+                by_corp[corp_code] = {
+                    "corp_code": corp_code,
+                    "corp_name": item.get("corp_name") or "",
+                    "rcept_no": rcept_no,
+                }
+
+        _checkpoint(
+            session_factory,
+            job_id,
+            current_step=STEP_DISCLOSURE_LIST,
+            progress_done=page_no,
+            progress_total=total_page,
+        )
+        page_no += 1
+
+    logger.info("STEP2 완료: 후보 %s개사 (job_id=%s)", len(by_corp), job_id)
+    return list(by_corp.values())
+
+
+# ---------------------------------------------------------------------------
+# STEP 3 — 지역 사전 추림 + 기업개황 확정 + corp_profiles 캐시 적재 + 필터
+# ---------------------------------------------------------------------------
+
+
+def _profile_is_fresh(profile: CorpProfile, ttl_days: int) -> bool:
+    if profile is None or not profile.fetched_at:
+        return False
+    try:
+        fetched = datetime.fromisoformat(profile.fetched_at)
+    except ValueError:
+        return False
+    return datetime.now() - fetched <= timedelta(days=ttl_days)
+
+
+async def _fsc_lookup_region(
+    fsc_client: FscCorpInfoClient, corp_name: str
+) -> tuple[str | None, str | None] | None:
+    """금융위 기업기본정보 API(getCorpOutline_V2)로 회사명 조회 후 (시도, 시군구)를 반환.
+
+    반환값 의미:
+    - `None`: 매칭되는 회사가 없거나(이름 검색 결과 없음) FSC 호출 자체가
+      실패했다 — 호출부는 이 경우 "보수적으로" company.json을 직접 호출해
+      확정해야 한다 (상세개발계획.md §4-1, 스파이크 결과 커버리지 100%지만
+      안전망으로 유지).
+    - `(sido, sigungu)`: 매칭은 됐다는 뜻(주소 파싱에 실패해 둘 다 None일
+      수도 있음 — 이 경우도 지역 조건이 있으면 `region_matches`가 자연히
+      탈락시킨다).
+
+    corp_name이 비어 있으면 애초에 검색 자체가 무의미하므로(빈 문자열은
+    `FscCorpInfoClient`가 필터 파라미터를 아예 안 붙여 전체 목록을 반환할
+    위험이 있다) FSC를 호출하지 않고 곧바로 None(미매칭 취급)을 반환한다.
+    """
+    corp_nm_norm = normalize_corp_name(corp_name or "")
+    if not corp_nm_norm:
+        return None
+
+    try:
+        fsc_data = await fsc_client.get_corp_basic_info(
+            page_no=1, num_of_rows=5, corp_nm=corp_nm_norm
+        )
+    except Exception as exc:  # noqa: BLE001 - FSC는 DART와 별도 쿼터라 여기서만 흡수하고 폴백
+        logger.warning("FSC 기업기본정보 조회 실패 corp_name=%s: %s", corp_name, exc)
+        return None
+
+    # 실측 확인된 응답 스키마(spike_financial_committee_coverage.py 참고):
+    # response.body.items.item = [...] (리스트). 결과 없음일 때도 items는
+    # {"item": []}로 비어있지 않은 dict라서 "if items:" 식의 truthy 판정은
+    # 항상 참이 되므로, 반드시 item 리스트 자체의 길이로 매칭 여부를 판정한다.
+    body = fsc_data.get("response", {}).get("body", {})
+    item_list = body.get("items", {}).get("item") or []
+    if isinstance(item_list, dict):  # 단건 응답 시 dict로 오는 경우 대비
+        item_list = [item_list]
+    if not item_list:
+        return None
+
+    address = (item_list[0].get("enpBsadr") or "").strip() or None
+    return parse_address(address)
+
+
+async def _resolve_candidate_profile(
+    dart_client: DartClient,
+    fsc_client: FscCorpInfoClient,
+    session_factory: sessionmaker[Session],
+    settings: Settings,
+    corp_code: str,
+    corp_name: str,
+    cond_region: dict[str, Any],
+) -> CorpProfile | None:
+    """후보 1건의 지역/업종 판정에 필요한 corp_profiles 레코드를 확정한다.
+
+    ★ 지역 사전 추림 경계 지점 (상세개발계획.md §4-1, 대응 1) ★
+    1. corp_profiles 캐시에 TTL 이내로 신선한 레코드가 있으면 API 호출 없이
+       그대로 재사용한다 (대응 2와 동일, 변경 없음).
+    2. 캐시 미스면 DART company.json(회사당 1건, 일일 쿼터 20,000건 소모)을
+       바로 부르지 않고, 먼저 금융위 기업기본정보 API(별도 쿼터, 무료)로
+       회사명을 조회해 주소를 가볍게 확인한다.
+       - 지역이 맞거나(cond_region이 비어 지역 필터 자체가 없는 경우 포함)
+         FSC에서 매칭되지 않으면(이름 검색 결과 없음 — 보수적으로 놓치는
+         것보다 낫다는 판단), company.json을 호출해 전화번호/대표자/
+         업종코드까지 확정하고 corp_profiles를 풀 데이터로 upsert한다
+         (기존 대응 2 로직과 동일).
+       - FSC에서 매칭됐는데 지역이 명백히 다르면 company.json 호출을
+         생략해 DART 쿼터를 아낀다. 대신 FSC에서 얻은 sido/sigungu만
+         corp_profiles에 upsert해 두면(phone/ceo_name/induty_code는
+         null) 다음 Job 실행 때도 캐시가 fresh하면 FSC/DART 모두
+         재호출하지 않는다. 이 후보는 `region_matches`가 False를
+         반환해 자연히 필터에서 탈락한다.
+
+    company.json 조회가 (쿼터 초과가 아닌) 실패하면 None을 반환해 해당
+    후보를 이번 STEP에서는 건너뛰게 한다 — Job 전체를 실패시키지 않는다.
+    """
+    with session_factory() as db:
+        profile = db.get(CorpProfile, corp_code)
+        if profile is not None and _profile_is_fresh(profile, settings.corp_profile_ttl_days):
+            db.expunge(profile)
+            return profile
+
+    fsc_result = await _fsc_lookup_region(fsc_client, corp_name)
+    if fsc_result is not None:
+        fsc_sido, fsc_sigungu = fsc_result
+        if not region_matches(fsc_sido, fsc_sigungu, cond_region):
+            # FSC로 지역 불일치가 명백 → company.json 호출 생략, 부분 데이터만 upsert.
+            now_iso = datetime.now().isoformat(timespec="seconds")
+            with session_factory() as db:
+                profile = db.get(CorpProfile, corp_code)
+                if profile is None:
+                    profile = CorpProfile(corp_code=corp_code)
+                    db.add(profile)
+                profile.corp_name = profile.corp_name or corp_name
+                profile.sido = fsc_sido
+                profile.sigungu = fsc_sigungu
+                profile.fetched_at = now_iso
+                db.commit()
+                db.refresh(profile)
+                db.expunge(profile)
+                logger.info(
+                    "STEP3: FSC로 지역 불일치 확인, company.json 호출 생략 corp_code=%s (sido=%s)",
+                    corp_code,
+                    fsc_sido,
+                )
+                return profile
+
+    # 여기 도달하는 경우: (a) FSC에서 지역이 맞다고 확인됨, (b) cond_region이
+    # 비어 지역 필터가 없음, (c) FSC 매칭 자체가 안 되거나 호출 실패 — 모두
+    # company.json으로 직접 확정한다 (기존 대응 2 로직과 동일).
+    try:
+        company = await dart_client.get_company(corp_code)
+    except QuotaExceededError:
+        raise
+    except DartApiError as exc:
+        logger.warning("company.json 조회 실패 corp_code=%s: %s", corp_code, exc)
+        return None
+
+    address = (company.get("adres") or "").strip() or None
+    sido, sigungu = parse_address(address)
+    now_iso = datetime.now().isoformat(timespec="seconds")
+
+    with session_factory() as db:
+        profile = db.get(CorpProfile, corp_code)
+        if profile is None:
+            profile = CorpProfile(corp_code=corp_code)
+            db.add(profile)
+        profile.corp_name = company.get("corp_name")
+        profile.address = address
+        profile.sido = sido
+        profile.sigungu = sigungu
+        profile.induty_code = company.get("induty_code")
+        profile.phone = company.get("phn_no")
+        profile.ceo_name = company.get("ceo_nm")
+        profile.fetched_at = now_iso
+        db.commit()
+        db.refresh(profile)
+        db.expunge(profile)
+        return profile
+
+
+async def _run_region_industry_filter(
+    dart_client: DartClient,
+    fsc_client: FscCorpInfoClient,
+    session_factory: sessionmaker[Session],
+    settings: Settings,
+    job_id: int,
+    candidates: list[dict[str, str]],
+    cond_region: dict[str, Any],
+    cond_industry: list[str],
+) -> None:
+    """STEP 3: 후보 전체에 대해 지역/업종 필터를 적용하고 통과 건만 results에 선삽입."""
+    total = len(candidates)
+    _checkpoint(
+        session_factory,
+        job_id,
+        current_step=STEP_REGION_INDUSTRY_FILTER,
+        progress_done=0,
+        progress_total=total,
+    )
+
+    with session_factory() as db:
+        existing_corp_codes = {
+            row[0]
+            for row in db.execute(
+                select(Result.corp_code).where(Result.job_id == job_id)
+            ).all()
+        }
+
+    done = 0
+    for candidate in candidates:
+        if done % _CHECKPOINT_INTERVAL == 0:
+            _raise_if_cancelled(session_factory, job_id)
+
+        corp_code = candidate["corp_code"]
+        profile = await _resolve_candidate_profile(
+            dart_client,
+            fsc_client,
+            session_factory,
+            settings,
+            corp_code,
+            candidate.get("corp_name") or "",
+            cond_region,
+        )
+        done += 1
+
+        if (
+            profile is not None
+            and corp_code not in existing_corp_codes
+            and region_matches(profile.sido, profile.sigungu, cond_region)
+            and industry_matches(profile.induty_code, cond_industry)
+        ):
+            with session_factory() as db:
+                db.add(
+                    Result(
+                        job_id=job_id,
+                        corp_code=corp_code,
+                        rcept_no=candidate.get("rcept_no"),
+                        corp_name=profile.corp_name or candidate.get("corp_name"),
+                        address=profile.address,
+                        phone=profile.phone,
+                        ceo_name=profile.ceo_name,
+                        induty_code=profile.induty_code,
+                    )
+                )
+                db.commit()
+            existing_corp_codes.add(corp_code)
+
+        if done % _CHECKPOINT_INTERVAL == 0 or done == total:
+            _checkpoint(session_factory, job_id, progress_done=done, progress_total=total)
+
+    logger.info(
+        "STEP3 완료: 후보 %s개사 중 %s개사 필터 통과 (job_id=%s)",
+        total,
+        len(existing_corp_codes),
+        job_id,
+    )
+
+
+# ---------------------------------------------------------------------------
+# STEP 4 — 감사보고서 원본 다운로드
+# ---------------------------------------------------------------------------
+
+
+def _classify_extension(filename: str) -> str:
+    ext = Path(filename).suffix.lower().lstrip(".")
+    if ext in ("xml", "pdf", "hwp"):
+        return ext.upper()
+    return ext.upper() or "UNKNOWN"
+
+
+async def _run_document_download(
+    dart_client: DartClient,
+    session_factory: sessionmaker[Session],
+    settings: Settings,
+    job_id: int,
+) -> None:
+    """STEP 4: results에 선삽입된 rcept_no 각각에 대해 감사보고서 원본을 다운로드.
+
+    이 STEP에서는 파일 확장자로 XML/PDF/HWP만 판별해 로그로 남긴다 — 실제
+    재무제표 파싱은 다음 STEP인 `_run_financial_parsing`(STEP 5)이 별도로
+    맡는다. 이미 `DOCUMENT_CACHE_DIR/{rcept_no}/`에 파일이 있으면 재다운로드
+    하지 않는다(§9 리스크 대응, resume의 핵심).
+    """
+    with session_factory() as db:
+        rows = db.execute(
+            select(Result.rcept_no).where(
+                Result.job_id == job_id, Result.rcept_no.is_not(None)
+            )
+        ).all()
+    rcept_nos = sorted({row[0] for row in rows if row[0]})
+
+    total = len(rcept_nos)
+    _checkpoint(
+        session_factory,
+        job_id,
+        current_step=STEP_DOCUMENT_DOWNLOAD,
+        progress_done=0,
+        progress_total=total,
+    )
+
+    cache_root = Path(settings.document_cache_dir)
+    done = 0
+    for rcept_no in rcept_nos:
+        if done % _CHECKPOINT_INTERVAL == 0:
+            _raise_if_cancelled(session_factory, job_id)
+
+        target_dir = cache_root / rcept_no
+        if target_dir.is_dir() and any(target_dir.iterdir()):
+            logger.info("원문 로컬 캐시 재사용 rcept_no=%s (%s)", rcept_no, target_dir)
+            done += 1
+            if done % _CHECKPOINT_INTERVAL == 0 or done == total:
+                _checkpoint(session_factory, job_id, progress_done=done, progress_total=total)
+            continue
+
+        try:
+            zip_bytes = await dart_client.get_document(rcept_no)
+        except QuotaExceededError:
+            raise
+        except DartApiError as exc:
+            logger.warning("document.xml 다운로드 실패 rcept_no=%s: %s", rcept_no, exc)
+            done += 1
+            if done % _CHECKPOINT_INTERVAL == 0 or done == total:
+                _checkpoint(session_factory, job_id, progress_done=done, progress_total=total)
+            continue
+
+        target_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+                zf.extractall(target_dir)
+        except zipfile.BadZipFile:
+            logger.warning("원문 zip 해제 실패 rcept_no=%s", rcept_no)
+            done += 1
+            if done % _CHECKPOINT_INTERVAL == 0 or done == total:
+                _checkpoint(session_factory, job_id, progress_done=done, progress_total=total)
+            continue
+
+        extensions = sorted(
+            {_classify_extension(p.name) for p in target_dir.rglob("*") if p.is_file()}
+        )
+        logger.info("원문 다운로드 완료 rcept_no=%s 파일형식=%s", rcept_no, extensions)
+
+        done += 1
+        if done % _CHECKPOINT_INTERVAL == 0 or done == total:
+            _checkpoint(session_factory, job_id, progress_done=done, progress_total=total)
+
+    logger.info("STEP4 완료: 원문 %s건 처리 (job_id=%s)", total, job_id)
+
+
+# ---------------------------------------------------------------------------
+# STEP 5 — 재무제표 파싱(당기/전기 13항목) + 감사의견 추출
+# ---------------------------------------------------------------------------
+
+_FISCAL_DATE_RE = re.compile(r'AUNIT="PERIODTO"\s+AUNITVALUE="(\d{4})(\d{2})(\d{2})"')
+
+
+def _pick_document_file(target_dir: Path) -> Path | None:
+    """rcept_no 캐시 디렉터리에서 파싱 대상 원문 1개를 고른다 (XML 우선)."""
+    xml_files = sorted(target_dir.rglob("*.xml"))
+    if xml_files:
+        return xml_files[0]
+    pdf_files = sorted(target_dir.rglob("*.pdf"))
+    if pdf_files:
+        return pdf_files[0]
+    return None
+
+
+def _extract_fiscal_date(raw_text: str) -> str | None:
+    """XML 커버 페이지의 PERIODTO(결산기준일) 속성에서 YYYY-MM-DD를 뽑는다."""
+    match = _FISCAL_DATE_RE.search(raw_text)
+    if not match:
+        return None
+    return f"{match.group(1)}-{match.group(2)}-{match.group(3)}"
+
+
+def _apply_parsed_result(
+    session_factory: sessionmaker[Session],
+    result_id: int,
+    parsed: ParsedFinancials,
+    audit_opinion: str | None,
+    fiscal_date: str | None,
+) -> None:
+    with session_factory() as db:
+        result = db.get(Result, result_id)
+        if result is None:
+            return
+        for f in DIRECT_FINANCIAL_FIELDS + ("gross_margin",):
+            setattr(result, f"{f}_cur", parsed.values_cur.get(f))
+            setattr(result, f"{f}_prv", parsed.values_prv.get(f))
+        result.audit_opinion = audit_opinion
+        result.fiscal_date = fiscal_date
+        result.parse_status = parsed.parse_status
+        result.parse_note = parsed.parse_note
+        db.commit()
+
+
+async def _run_financial_parsing(
+    session_factory: sessionmaker[Session],
+    settings: Settings,
+    job_id: int,
+) -> None:
+    """STEP 5: parse_status가 아직 없는 results만 원문을 열어 파싱한다.
+
+    파싱은 로컬 파일(STEP 4 캐시)만 사용하므로 DART/FSC API 호출이 없다 —
+    쿼터와 무관하다. `parse_status IS NULL`을 재시도 조건으로 삼아 이미
+    파싱된 건은 다시 열지 않는다(resume/재시도 겸용, retry_failed_parsing도
+    동일 함수를 재사용한다).
+    """
+    with session_factory() as db:
+        rows = db.execute(
+            select(Result.id, Result.rcept_no).where(
+                Result.job_id == job_id,
+                Result.rcept_no.is_not(None),
+                Result.parse_status.is_(None),
+            )
+        ).all()
+
+    total = len(rows)
+    _checkpoint(
+        session_factory,
+        job_id,
+        current_step=STEP_PARSE_FINANCIALS,
+        progress_done=0,
+        progress_total=total,
+    )
+
+    cache_root = Path(settings.document_cache_dir)
+    done = 0
+    for result_id, rcept_no in rows:
+        if done % _CHECKPOINT_INTERVAL == 0:
+            _raise_if_cancelled(session_factory, job_id)
+
+        target_dir = cache_root / rcept_no
+        doc_path = _pick_document_file(target_dir) if target_dir.is_dir() else None
+
+        if doc_path is None:
+            _apply_parsed_result(
+                session_factory,
+                result_id,
+                ParsedFinancials(parse_status="FAILED", parse_note="원문 파일을 찾을 수 없음(STEP4 다운로드 실패 추정)"),
+                None,
+                None,
+            )
+        else:
+            raw_bytes = doc_path.read_bytes()
+            suffix = doc_path.suffix.lower()
+            if suffix == ".xml":
+                parsed = parse_xml_financials(raw_bytes)
+                raw_text = raw_bytes.decode("utf-8", errors="ignore")
+            elif suffix == ".pdf":
+                parsed = parse_pdf_financials(raw_bytes)
+                raw_text = ""
+            else:
+                parsed = ParsedFinancials(parse_status="FAILED", parse_note=f"지원하지 않는 원문 형식: {suffix}")
+                raw_text = ""
+
+            opinion = extract_audit_opinion(raw_text) if raw_text else None
+            fiscal_date = _extract_fiscal_date(raw_text) if raw_text else None
+            _apply_parsed_result(session_factory, result_id, parsed, opinion, fiscal_date)
+
+        done += 1
+        if done % _CHECKPOINT_INTERVAL == 0 or done == total:
+            _checkpoint(session_factory, job_id, progress_done=done, progress_total=total)
+
+    logger.info("STEP5 완료: %s건 파싱 (job_id=%s)", total, job_id)
+
+
+# ---------------------------------------------------------------------------
+# STEP 6 — 매출액 범위 사후 필터
+# ---------------------------------------------------------------------------
+
+
+def _run_revenue_filter(
+    session_factory: sessionmaker[Session], job_id: int, cond_revenue: dict[str, Any]
+) -> None:
+    """STEP 6: 당기 매출액(revenue_cur)이 조건 범위를 벗어나면 excluded_by_revenue=1.
+
+    매출액을 파싱하지 못한 건(revenue_cur is None)은 사후 필터를 적용할 수
+    없으므로 그대로 두고(제외하지 않음) parse_status로 검수하게 한다
+    (상세개발계획.md §4-3).
+    """
+    if cond_revenue.get("min_krw") is None and cond_revenue.get("max_krw") is None:
+        return
+
+    with session_factory() as db:
+        results = db.execute(select(Result).where(Result.job_id == job_id)).scalars().all()
+        for result in results:
+            if result.revenue_cur is None:
+                continue
+            result.excluded_by_revenue = 0 if revenue_matches(result.revenue_cur, cond_revenue) else 1
+        db.commit()
+
+    logger.info("STEP6 완료: 매출액 필터 적용 (job_id=%s)", job_id)
+
+
+async def retry_failed_parsing(job_id: int) -> None:
+    """parse_status=FAILED인 results만 골라 STEP 5(파싱)를 재시도한다.
+
+    `POST /api/jobs/{id}/retry-failed`(app/api/jobs.py)가 FAILED 건의
+    parse_status를 NULL로 리셋해 두면, `_run_financial_parsing`이 그 건만
+    다시 열어 파싱한다(위 STEP 5 설명 참고 — 별도 재시도 로직을 새로 만들
+    필요 없이 동일 함수를 재사용).
+    """
+    settings = get_settings()
+    session_factory = get_session_factory()
+    job = _load_job(session_factory, job_id)
+    if job is None:
+        logger.error("retry_failed_parsing: job_id=%s 를 찾을 수 없습니다.", job_id)
+        return
+
+    try:
+        await _run_financial_parsing(session_factory, settings, job_id)
+        cond_revenue: dict[str, Any] = json.loads(job.cond_revenue) if job.cond_revenue else {}
+        _run_revenue_filter(session_factory, job_id, cond_revenue)
+        logger.info("Job %s 재파싱 완료", job_id)
+    except JobCancelledError:
+        logger.info("Job %s 재파싱 중 취소 감지", job_id)
+    except Exception:  # noqa: BLE001 - 백그라운드 작업은 여기서 반드시 흡수해야 한다
+        logger.exception("Job %s 재파싱 중 예외 발생", job_id)
+
+
+# ---------------------------------------------------------------------------
+# Job 실행 엔트리포인트 (BackgroundTasks에서 호출)
+# ---------------------------------------------------------------------------
+
+
+async def run_job(job_id: int) -> None:
+    """Job 1건을 STEP 1~6까지 실행한다.
+
+    - `QuotaExceededError`: Job을 PAUSED_QUOTA로 전환하고 정상 반환한다
+      (예외를 상위로 전파하지 않는다 — CLAUDE.md 핵심 제약 4번).
+    - `JobCancelledError`: 체크포인트에서 취소를 감지 — 상태는 이미
+      CANCELLED이므로 그대로 반환한다.
+    - 그 외 예외: FAILED + error_msg를 기록하고 반환한다. `BackgroundTasks`로
+      실행되므로 예외를 그대로 던지면 로그에만 남고 Job 상태가 갱신되지
+      않는다 — 반드시 이 함수 내부에서 흡수해야 한다.
+    """
+    settings = get_settings()
+    settings.ensure_dirs()
+    session_factory = get_session_factory()
+
+    job = _load_job(session_factory, job_id)
+    if job is None:
+        logger.error("run_job: job_id=%s 를 찾을 수 없습니다.", job_id)
+        return
+    if job.status == JobStatus.CANCELLED:
+        logger.info("run_job: job_id=%s 는 이미 CANCELLED 상태 — 실행하지 않음.", job_id)
+        return
+
+    _checkpoint(session_factory, job_id, status=JobStatus.RUNNING, error_msg=None)
+
+    cond_region: dict[str, Any] = json.loads(job.cond_region) if job.cond_region else {}
+    cond_revenue: dict[str, Any] = json.loads(job.cond_revenue) if job.cond_revenue else {}
+    cond_industry: list[str] = json.loads(job.cond_industry) if job.cond_industry else []
+    cond_period: dict[str, Any] = json.loads(job.cond_period) if job.cond_period else {}
+
+    dart_client = DartClient(settings=settings, session_factory=session_factory)
+    # 금융위 기업기본정보 API 클라이언트 — DART와 별도 쿼터라 dart_client와
+    # 독립적으로 생성/종료한다 (상세개발계획.md §4-1 대응 1).
+    fsc_client = FscCorpInfoClient(settings=settings)
+    try:
+        # STEP 1: corp_cache 갱신 (TTL 이내면 사실상 즉시 반환)
+        _raise_if_cancelled(session_factory, job_id)
+        _checkpoint(session_factory, job_id, current_step=STEP_CORP_CACHE)
+        await refresh_corp_cache(dart_client, session_factory, settings)
+
+        # STEP 2: 외부감사관련 공시 목록 수집
+        _raise_if_cancelled(session_factory, job_id)
+        candidates = await _collect_candidates(dart_client, session_factory, job_id, cond_period)
+
+        # STEP 3: 지역 사전 추림(FSC) + 지역/업종 필터 + corp_profiles 캐시 적재 + results 선삽입
+        _raise_if_cancelled(session_factory, job_id)
+        await _run_region_industry_filter(
+            dart_client,
+            fsc_client,
+            session_factory,
+            settings,
+            job_id,
+            candidates,
+            cond_region,
+            cond_industry,
+        )
+
+        # STEP 4: 감사보고서 원문 다운로드
+        _raise_if_cancelled(session_factory, job_id)
+        await _run_document_download(dart_client, session_factory, settings, job_id)
+
+        # STEP 5: 재무제표 파싱(당기/전기 13항목) + 감사의견 추출 (API 호출 없음)
+        _raise_if_cancelled(session_factory, job_id)
+        await _run_financial_parsing(session_factory, settings, job_id)
+
+        # STEP 6: 매출액 범위 사후 필터
+        _raise_if_cancelled(session_factory, job_id)
+        _run_revenue_filter(session_factory, job_id, cond_revenue)
+
+        _checkpoint(session_factory, job_id, status=JobStatus.DONE, current_step=STEP_REVENUE_FILTER)
+        logger.info("Job %s 완료 (STEP1~6)", job_id)
+
+    except JobCancelledError:
+        logger.info("Job %s 취소 감지 — 중단.", job_id)
+        # 상태는 이미 CANCELLED (cancel API가 기록) — 여기서 덮어쓰지 않는다.
+    except QuotaExceededError as exc:
+        logger.warning("Job %s 쿼터 초과로 일시정지: %s", job_id, exc)
+        _checkpoint(session_factory, job_id, status=JobStatus.PAUSED_QUOTA, error_msg=str(exc))
+    except Exception as exc:  # noqa: BLE001 - 백그라운드 작업은 여기서 반드시 흡수해야 한다
+        logger.exception("Job %s 실행 중 예외 발생", job_id)
+        _checkpoint(session_factory, job_id, status=JobStatus.FAILED, error_msg=str(exc))
+    finally:
+        await dart_client.aclose()
+        await fsc_client.aclose()

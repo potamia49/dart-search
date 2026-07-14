@@ -165,14 +165,16 @@ async def run_coverage_spike(
                 result.unmatched.append(company)
                 continue
 
-            # NOTE: 실제 응답 스키마는 발급 후 확인 필요. 아래는 잠정 판정 로직이며
-            # 실측 시 응답 필드명에 맞게 조정해야 한다.
-            items = (
-                fsc_data.get("response", {})
-                .get("body", {})
-                .get("items", [])
-            )
-            if items:
+            # 실측 확인된 응답 스키마: response.body.items.item = [...] (리스트),
+            # 결과 없음일 때도 items는 {"item": []}로 비어있지 않은 dict라서
+            # "if items:" 식의 truthy 판정은 항상 참이 되는 버그가 있었다 — 반드시
+            # item 리스트 자체의 길이(또는 totalCount)로 판정해야 한다.
+            body = fsc_data.get("response", {}).get("body", {})
+            item_list = body.get("items", {}).get("item") or []
+            if isinstance(item_list, dict):  # 단건 응답 시 dict로 오는 경우 대비
+                item_list = [item_list]
+
+            if item_list:
                 result.matched.append(company)
             else:
                 result.unmatched.append(company)

@@ -46,6 +46,75 @@ def normalize_corp_name(raw: str) -> str:
     return name
 
 
-# TODO(M2): 지역 사전 추림(대응1: 금융위 주소DB 매칭 / 대응2: corp_profiles 컬럼 매칭) 구현
-# TODO(M2): 업종 필터 — induty_code prefix 매칭 구현
-# TODO(M3): 매출액 사후 필터 — results.revenue_cur 기준 min/max 구현
+def parse_address(address: str | None) -> tuple[str | None, str | None]:
+    """기업개황 API의 `adres` 문자열에서 (표준 시도명, 시군구명)을 추출.
+
+    DART 주소는 "전라북도 군산시 현충로 35 (나운동)"처럼 시도/시군구가 앞의
+    두 토큰으로 오는 경우가 대부분이다. 시도 토큰을 `normalize_sido`로 표준화하지
+    못하면(세종 등 시군구가 없는 경우 포함, 표기 편차 등) 시군구도 신뢰할 수
+    없으므로 함께 None 처리한다. corp_profiles 적재(STEP 3, §4-1 대응 2) 시 사용.
+    """
+    if not address:
+        return None, None
+    tokens = address.strip().split()
+    if not tokens:
+        return None, None
+    sido = normalize_sido(tokens[0])
+    if sido is None:
+        return None, None
+    sigungu = tokens[1] if len(tokens) > 1 else None
+    return sido, sigungu
+
+
+def region_matches(
+    sido: str | None, sigungu: str | None, cond_region: dict | None
+) -> bool:
+    """corp_profiles의 (sido, sigungu)가 Job.cond_region 조건과 일치하는지 판정.
+
+    cond_region: {"sido": "경남", "sigungu": ["김해시", "양산시"]} 형태(§5).
+    - cond_region이 비어 있으면(지역 조건 없음) 무조건 통과.
+    - sido가 지정되었는데 프로필의 sido를 알 수 없거나 다르면 탈락.
+    - sigungu 목록이 지정되었는데 프로필의 sigungu가 그 목록에 없으면 탈락
+      (목록이 비어 있으면 해당 시도 전체 통과).
+    """
+    if not cond_region:
+        return True
+    cond_sido_raw = cond_region.get("sido")
+    if cond_sido_raw:
+        cond_sido = normalize_sido(cond_sido_raw) or cond_sido_raw
+        if sido != cond_sido:
+            return False
+    cond_sigungu = cond_region.get("sigungu") or []
+    if cond_sigungu and sigungu not in cond_sigungu:
+        return False
+    return True
+
+
+def industry_matches(induty_code: str | None, cond_industry: list[str] | None) -> bool:
+    """corp_profiles.induty_code가 Job.cond_industry(prefix 목록, §5) 중 하나로 시작하는지 판정.
+
+    cond_industry가 비어 있으면(업종 조건 없음) 무조건 통과.
+    """
+    if not cond_industry:
+        return True
+    if not induty_code:
+        return False
+    return any(induty_code.startswith(prefix) for prefix in cond_industry)
+
+
+def revenue_matches(revenue_cur: float | None, cond_revenue: dict | None) -> bool:
+    """results.revenue_cur가 Job.cond_revenue(min_krw/max_krw, §5) 범위 안인지 판정.
+
+    revenue_cur를 모르면(파싱 실패/재무제표 미첨부) 사후 필터를 적용할 수 없으므로
+    무조건 통과시킨다 — 매출액 미상 건을 섣불리 제외하지 않는다(§4-3).
+    """
+    if revenue_cur is None:
+        return True
+    cond_revenue = cond_revenue or {}
+    min_krw = cond_revenue.get("min_krw")
+    max_krw = cond_revenue.get("max_krw")
+    if min_krw is not None and revenue_cur < min_krw:
+        return False
+    if max_krw is not None and revenue_cur > max_krw:
+        return False
+    return True
