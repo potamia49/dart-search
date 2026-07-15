@@ -8,7 +8,8 @@
     POST /api/jobs/{id}/resume         중단(쿼터/오류) Job 이어하기
     POST /api/jobs/{id}/retry-failed   파싱 실패 건만 재시도
 
-Job 실행 자체(STEP 1~4)는 `app/core/pipeline.py`의 `run_job()`이 담당하고,
+Job 실행 자체(STEP 1~7, STEP7은 2026-07-15 추가된 "최근 N년 재무이력"
+수집 — CLAUDE.md 참고)는 `app/core/pipeline.py`의 `run_job()`이 담당하고,
 이 라우터는 FastAPI `BackgroundTasks`로 그것을 트리거/조회/취소만 한다.
 """
 
@@ -16,7 +17,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -63,6 +64,10 @@ class JobCreateRequest(BaseModel):
     revenue: RevenueCondition = Field(default_factory=RevenueCondition)
     industry: list[str] = Field(default_factory=list)
     period: PeriodCondition
+    # STEP 7(최근 N년 재무이력, 2026-07-15 추가) 목표 연도수. 감사보고서 1건이
+    # 당기·전기 2개년을 비교식으로 담기 때문에 짝수만 허용한다(상세개발계획.md
+    # §4-6). 기본값 4는 사용자와 논의해 확정.
+    history_years: Literal[2, 4, 6, 10] = 4
 
 
 class JobResponse(BaseModel):
@@ -73,6 +78,7 @@ class JobResponse(BaseModel):
     cond_revenue: dict[str, Any] | None
     cond_industry: list[str] | None
     cond_period: dict[str, Any] | None
+    history_years: int | None
     status: str | None
     current_step: int | None
     progress_done: int | None
@@ -89,6 +95,7 @@ class JobResponse(BaseModel):
             cond_revenue=json.loads(job.cond_revenue) if job.cond_revenue else None,
             cond_industry=json.loads(job.cond_industry) if job.cond_industry else None,
             cond_period=json.loads(job.cond_period) if job.cond_period else None,
+            history_years=job.history_years,
             status=job.status,
             current_step=job.current_step,
             progress_done=job.progress_done,
@@ -116,6 +123,7 @@ async def create_job(
         cond_revenue=json.dumps(payload.revenue.model_dump(), ensure_ascii=False),
         cond_industry=json.dumps(payload.industry, ensure_ascii=False),
         cond_period=json.dumps(payload.period.model_dump(), ensure_ascii=False),
+        history_years=payload.history_years,
         status=JobStatus.PENDING,
         current_step=0,
         progress_done=0,

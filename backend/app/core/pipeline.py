@@ -1,6 +1,7 @@
 """수집 파이프라인 오케스트레이션 (Job 실행).
 
-상세개발계획.md §4 STEP 0~6 중 STEP 1~4(M2 범위)를 구현한다.
+상세개발계획.md §4 STEP 0~7을 구현한다(STEP 1~4는 M2, STEP 5~6은 M3,
+STEP 7은 2026-07-15 추가된 "최근 N년 재무이력" 확장).
 
 각 STEP은 `jobs.current_step`/`progress_done`/`progress_total`을 DB에
 체크포인트로 남겨 중단 후 이어하기(resume)가 가능해야 한다
@@ -17,6 +18,45 @@ Job.status를 PAUSED_QUOTA로 전환하고 그 시점까지의 진행 상태를 
 | 4 | 감사보고서 원본 다운로드 (zip 해제, 형식 판별) | document.xml |
 | 5 | 재무제표 파싱(당기/전기 13항목) + 감사의견 추출 | - (app/parsers, M3 구현 완료) |
 | 6 | 매출액 범위 사후 필터 | - (M3 구현 완료) |
+| 7 | 최근 N년 재무 이력 수집 (excluded_by_revenue=0인 최종 결과만 대상) | list.json(corp_code 지정) + document.xml (2026-07-15 추가) |
+
+### STEP 7 설계 메모 (2026-07-15 추가 — "최근 N년치 재무정보 이력")
+
+- **"필터 통과 후에만" 원칙**: STEP 3(FSC 사전 추림)와 같은 철학으로, STEP 7은
+  전체 후보가 아니라 STEP 1~6을 다 통과해 `results`에 남아 있고
+  `excluded_by_revenue=0`인 회사만 대상으로 한다 — 쿼터 영향이 최종 결과
+  건수에만 비례한다.
+- **실측(2026-07-15): `list.json`에 `corp_code`를 지정하면 3개월 조회기간
+  제한이 사라진다.** STEP 2가 겪은 "corp_code 없이는 90일 제한"(위 §4-1
+  근처 설명)과 달리, corp_code를 지정한 조회는 10년 범위(`bgn_de=20160101`
+  ~`end_de=20260630`)도 한 번에 성공했다(응답 5건, 2021~2025 회계연도
+  감사보고서). 따라서 STEP 7은 `_split_period_into_windows()`를 사용하지
+  않고 단일 기간으로 그 회사의 list.json을 조회한다.
+- **처리 순서는 최신 공시 → 과거 공시 순(newest-first)이다** — 최초 요청
+  문서는 "오래된 것부터"를 제안했지만, "목표 연도수만큼 모이면 그만
+  찾는다"는 조기 중단 조건과 결합하면 oldest-first는 정작 가장 최근 연도를
+  놓칠 수 있다(예: N=4년치를 채우려는데 오래된 보고서부터 훑다가 4개
+  연도를 다 채우면 가장 최신 보고서를 아예 열어보지 않게 됨 — "최근 N년"이라는
+  기능 취지에 반한다). newest-first로 훑어야 항상 최근 연도부터 확정되고,
+  중복되는 연도(정정 공시 포함)는 "이미 있으면 건너뜀" 규칙으로 자동으로
+  최신 rcept_no 값이 유지된다.
+- **회계연도(fiscal_year) 판정**: 원문에는 당기 결산기준일(PERIODTO)만 있고
+  전기 결산기준일은 별도 마커가 없다 — 당기 연도는 PERIODTO 연도 그대로,
+  전기 연도는 "당기 연도 - 1"로 계산한다(연 1회 정기감사 가정,
+  `app/models/financial_snapshot.py` 참고).
+- **조회 기간(`bgn_de`)은 목표 연도수(N)의 N/2+2년 전 1/1로 잡는다** — 결산월이
+  회사마다 다르고 감사보고서 제출 시점도 매년 정확히 같지 않을 수 있어 여유를
+  둔다(`_history_window()`).
+- **다운로드/파싱은 STEP 4/5 로직을 100% 재사용한다** — 새 파서를 만들지
+  않고 `parse_xml_financials`/`parse_pdf_financials`/`_extract_fiscal_date`를
+  그대로 호출한다. document.xml 다운로드는 STEP 4와 동일한
+  `DOCUMENT_CACHE_DIR` 로컬 캐시를 공유한다(`_ensure_document_cached()`로
+  STEP 4/7이 공유하도록 추출).
+- **resume**: 회사(result_id)별로 이미 `financial_snapshots`에 쌓인 distinct
+  fiscal_year 수가 `history_years` 이상이면 그 회사는 list.json 호출조차
+  하지 않고 건너뛴다. STEP 2/3처럼 list.json 자체는 호출 비용이 낮아
+  resume 시 다시 호출해도 무방하다 — 실제로 비용이 큰 document.xml
+  다운로드만 `DOCUMENT_CACHE_DIR` 로컬 캐시로 진짜 resume된다.
 
 ### M3 실측 메모 (원문 서식 분포)
 
@@ -69,10 +109,11 @@ from app.core.filters import (
     revenue_matches,
 )
 from app.models.corp_profile import CorpProfile
+from app.models.financial_snapshot import FinancialSnapshot
 from app.models.job import Job, JobStatus
 from app.models.result import Result
 from app.parsers.audit_opinion import extract_audit_opinion
-from app.parsers.base import DIRECT_FINANCIAL_FIELDS, ParsedFinancials
+from app.parsers.base import DIRECT_FINANCIAL_FIELDS, STANDARD_FINANCIAL_FIELDS, ParsedFinancials
 from app.parsers.pdf_parser import parse_pdf_financials
 from app.parsers.xml_parser import parse_xml_financials
 
@@ -85,6 +126,9 @@ STEP_REGION_INDUSTRY_FILTER = 3
 STEP_DOCUMENT_DOWNLOAD = 4
 STEP_PARSE_FINANCIALS = 5
 STEP_REVENUE_FILTER = 6
+STEP_HISTORY_COLLECTION = 7
+
+DEFAULT_HISTORY_YEARS = 4  # JobCreateRequest.history_years 기본값과 동일 (app/api/jobs.py)
 
 _DISCLOSURE_PAGE_COUNT = 100  # list.json 1회 최대 100건
 _CHECKPOINT_INTERVAL = 20  # STEP 3/4에서 N건마다 진행률 커밋 + 취소 여부 확인
@@ -157,6 +201,33 @@ def _raise_if_cancelled(session_factory: sessionmaker[Session], job_id: int) -> 
 # ---------------------------------------------------------------------------
 
 
+_LIST_JSON_MAX_WINDOW_DAYS = 90  # corp_code 없이 날짜만으로 조회할 때 list.json이 허용하는 최대 기간(실측: 3개월 초과 시 status=100)
+
+
+def _split_period_into_windows(bgn_de: str, end_de: str, max_days: int = _LIST_JSON_MAX_WINDOW_DAYS) -> list[tuple[str, str]]:
+    """`bgn_de`~`end_de`(YYYYMMDD)를 `max_days`일 이하 구간으로 분할한다.
+
+    OpenDART list.json은 corp_code를 지정하지 않고 날짜 범위로만 검색할 경우
+    조회 기간이 3개월(90일)을 넘을 수 없다(실측: 초과 시 `status=100,
+    message="corp_code가 없는 경우 검색기간은 3개월만 가능합니다"`로 즉시 실패).
+    달력월(month) 경계 계산(1/31 + 3개월이 4/30인지 5/1인지 등)은 엣지케이스가
+    많아 보수적으로 90일 고정 폭으로 분할한다. 마지막 구간은 원래 `end_de`를
+    넘지 않도록 clamp한다.
+    """
+    start = datetime.strptime(bgn_de, "%Y%m%d")
+    end = datetime.strptime(end_de, "%Y%m%d")
+    if start > end:
+        raise ValueError(f"cond_period.bgn_de({bgn_de})가 end_de({end_de})보다 늦을 수 없습니다.")
+
+    windows: list[tuple[str, str]] = []
+    window_start = start
+    while window_start <= end:
+        window_end = min(window_start + timedelta(days=max_days - 1), end)
+        windows.append((window_start.strftime("%Y%m%d"), window_end.strftime("%Y%m%d")))
+        window_start = window_end + timedelta(days=1)
+    return windows
+
+
 async def _collect_candidates(
     dart_client: DartClient,
     session_factory: sessionmaker[Session],
@@ -165,54 +236,79 @@ async def _collect_candidates(
 ) -> list[dict[str, str]]:
     """STEP 2: list.json(pblntf_ty=F)을 끝까지 페이징 순회해 후보를 모은다.
 
-    같은 회사가 기간 내 여러 건(정정 포함) 공시했을 수 있으므로 corp_code
-    기준으로 dedup하고, rcept_no가 가장 큰(=가장 최근 접수된) 건을 대표로
-    남긴다 (rcept_no는 "접수일자+일련번호"라 문자열 비교로 최신 판별 가능).
+    `bgn_de`~`end_de` 전체 구간이 90일을 넘으면 `_split_period_into_windows()`로
+    90일 이하 구간으로 나눠 구간별로 페이징 호출한다(위 `_LIST_JSON_MAX_WINDOW_DAYS`
+    설명 참고 — 상세개발계획.md §7-1 기본값인 "최근 1년" 검색이 그대로 실패하지
+    않도록 하기 위한 대응, 2026-07-15 실측으로 발견).
+
+    같은 회사가 여러 구간에 걸쳐(정정 포함) 여러 건 공시했을 수 있으므로
+    `by_corp` dict를 구간 루프 바깥에 두고 corp_code 기준으로 dedup하며,
+    rcept_no가 가장 큰(=가장 최근 접수된) 건을 대표로 남긴다 (rcept_no는
+    "접수일자+일련번호"라 문자열 비교로 최신 판별 가능).
+
+    진행률(`progress_done`/`progress_total`)은 페이지 단위 누적 카운트로
+    관리한다 — 구간별 총 페이지 수는 그 구간을 조회하기 전까지 알 수 없으므로,
+    각 구간을 "최소 1페이지"로 잡아 `progress_total`을 구간 수만큼으로
+    초기화해 두고, 구간의 실제 `total_page`를 알게 되는 순간 차이만큼
+    보정한다(기존 단일 구간 코드의 "우선 1로 잡고 첫 응답으로 갱신" 방식을
+    구간이 여러 개인 경우로 자연스럽게 확장한 것).
     """
     bgn_de = cond_period.get("bgn_de")
     end_de = cond_period.get("end_de")
     if not bgn_de or not end_de:
         raise ValueError("cond_period.bgn_de/end_de가 필요합니다.")
 
+    windows = _split_period_into_windows(bgn_de, end_de)
+
     by_corp: dict[str, dict[str, str]] = {}
-    page_no = 1
-    total_page = 1
+    pages_done = 0
+    pages_total = len(windows)  # 구간마다 최소 1페이지로 초기 추정, 실제 total_page를 알게 되면 보정
 
-    while page_no <= total_page:
-        _raise_if_cancelled(session_factory, job_id)
+    for window_bgn, window_end in windows:
+        page_no = 1
+        total_page = 1
 
-        data = await dart_client.get_disclosure_list(
-            bgn_de=bgn_de,
-            end_de=end_de,
-            pblntf_ty="F",
-            page_no=page_no,
-            page_count=_DISCLOSURE_PAGE_COUNT,
-        )
-        total_page = int(data.get("total_page") or 1)
+        while page_no <= total_page:
+            _raise_if_cancelled(session_factory, job_id)
 
-        for item in data.get("list") or []:
-            corp_code = item.get("corp_code")
-            rcept_no = item.get("rcept_no")
-            if not corp_code or not rcept_no:
-                continue
-            existing = by_corp.get(corp_code)
-            if existing is None or rcept_no > existing["rcept_no"]:
-                by_corp[corp_code] = {
-                    "corp_code": corp_code,
-                    "corp_name": item.get("corp_name") or "",
-                    "rcept_no": rcept_no,
-                }
+            data = await dart_client.get_disclosure_list(
+                bgn_de=window_bgn,
+                end_de=window_end,
+                pblntf_ty="F",
+                page_no=page_no,
+                page_count=_DISCLOSURE_PAGE_COUNT,
+            )
+            new_total_page = int(data.get("total_page") or 1)
+            if new_total_page != total_page:
+                pages_total += new_total_page - total_page
+                total_page = new_total_page
 
-        _checkpoint(
-            session_factory,
-            job_id,
-            current_step=STEP_DISCLOSURE_LIST,
-            progress_done=page_no,
-            progress_total=total_page,
-        )
-        page_no += 1
+            for item in data.get("list") or []:
+                corp_code = item.get("corp_code")
+                rcept_no = item.get("rcept_no")
+                if not corp_code or not rcept_no:
+                    continue
+                existing = by_corp.get(corp_code)
+                if existing is None or rcept_no > existing["rcept_no"]:
+                    by_corp[corp_code] = {
+                        "corp_code": corp_code,
+                        "corp_name": item.get("corp_name") or "",
+                        "rcept_no": rcept_no,
+                    }
 
-    logger.info("STEP2 완료: 후보 %s개사 (job_id=%s)", len(by_corp), job_id)
+            pages_done += 1
+            _checkpoint(
+                session_factory,
+                job_id,
+                current_step=STEP_DISCLOSURE_LIST,
+                progress_done=pages_done,
+                progress_total=pages_total,
+            )
+            page_no += 1
+
+    logger.info(
+        "STEP2 완료: 구간 %s개, 후보 %s개사 (job_id=%s)", len(windows), len(by_corp), job_id
+    )
     return list(by_corp.values())
 
 
@@ -463,6 +559,44 @@ def _classify_extension(filename: str) -> str:
     return ext.upper() or "UNKNOWN"
 
 
+async def _ensure_document_cached(
+    dart_client: DartClient, settings: Settings, rcept_no: str
+) -> Path | None:
+    """rcept_no 1건에 대응하는 원문을 `DOCUMENT_CACHE_DIR/{rcept_no}/`에 확보하고 그 경로를 반환.
+
+    이미 로컬 캐시에 있으면 재다운로드하지 않는다(§9 리스크 대응, resume의
+    핵심). STEP 4(`_run_document_download`)와 STEP 7(`_collect_history_for_result`)이
+    이 헬퍼를 공유한다 — 다운로드/zip 해제 로직은 두 STEP에서 완전히
+    동일하므로 새로 만들지 않고 추출했다. `QuotaExceededError`는 그대로
+    상위로 전파하고, 그 외 다운로드/압축해제 실패는 로그만 남기고 None을
+    반환한다(해당 rcept_no 1건만 건너뛰고 Job 전체를 실패시키지 않는다).
+    """
+    target_dir = Path(settings.document_cache_dir) / rcept_no
+    if target_dir.is_dir() and any(target_dir.iterdir()):
+        logger.info("원문 로컬 캐시 재사용 rcept_no=%s (%s)", rcept_no, target_dir)
+        return target_dir
+
+    try:
+        zip_bytes = await dart_client.get_document(rcept_no)
+    except QuotaExceededError:
+        raise
+    except DartApiError as exc:
+        logger.warning("document.xml 다운로드 실패 rcept_no=%s: %s", rcept_no, exc)
+        return None
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            zf.extractall(target_dir)
+    except zipfile.BadZipFile:
+        logger.warning("원문 zip 해제 실패 rcept_no=%s", rcept_no)
+        return None
+
+    extensions = sorted({_classify_extension(p.name) for p in target_dir.rglob("*") if p.is_file()})
+    logger.info("원문 다운로드 완료 rcept_no=%s 파일형식=%s", rcept_no, extensions)
+    return target_dir
+
+
 async def _run_document_download(
     dart_client: DartClient,
     session_factory: sessionmaker[Session],
@@ -471,10 +605,9 @@ async def _run_document_download(
 ) -> None:
     """STEP 4: results에 선삽입된 rcept_no 각각에 대해 감사보고서 원본을 다운로드.
 
-    이 STEP에서는 파일 확장자로 XML/PDF/HWP만 판별해 로그로 남긴다 — 실제
-    재무제표 파싱은 다음 STEP인 `_run_financial_parsing`(STEP 5)이 별도로
-    맡는다. 이미 `DOCUMENT_CACHE_DIR/{rcept_no}/`에 파일이 있으면 재다운로드
-    하지 않는다(§9 리스크 대응, resume의 핵심).
+    실제 다운로드/캐시 재사용/zip 해제는 `_ensure_document_cached()`가
+    담당한다 — 실제 재무제표 파싱은 다음 STEP인 `_run_financial_parsing`
+    (STEP 5)이 별도로 맡는다.
     """
     with session_factory() as db:
         rows = db.execute(
@@ -493,46 +626,12 @@ async def _run_document_download(
         progress_total=total,
     )
 
-    cache_root = Path(settings.document_cache_dir)
     done = 0
     for rcept_no in rcept_nos:
         if done % _CHECKPOINT_INTERVAL == 0:
             _raise_if_cancelled(session_factory, job_id)
 
-        target_dir = cache_root / rcept_no
-        if target_dir.is_dir() and any(target_dir.iterdir()):
-            logger.info("원문 로컬 캐시 재사용 rcept_no=%s (%s)", rcept_no, target_dir)
-            done += 1
-            if done % _CHECKPOINT_INTERVAL == 0 or done == total:
-                _checkpoint(session_factory, job_id, progress_done=done, progress_total=total)
-            continue
-
-        try:
-            zip_bytes = await dart_client.get_document(rcept_no)
-        except QuotaExceededError:
-            raise
-        except DartApiError as exc:
-            logger.warning("document.xml 다운로드 실패 rcept_no=%s: %s", rcept_no, exc)
-            done += 1
-            if done % _CHECKPOINT_INTERVAL == 0 or done == total:
-                _checkpoint(session_factory, job_id, progress_done=done, progress_total=total)
-            continue
-
-        target_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-                zf.extractall(target_dir)
-        except zipfile.BadZipFile:
-            logger.warning("원문 zip 해제 실패 rcept_no=%s", rcept_no)
-            done += 1
-            if done % _CHECKPOINT_INTERVAL == 0 or done == total:
-                _checkpoint(session_factory, job_id, progress_done=done, progress_total=total)
-            continue
-
-        extensions = sorted(
-            {_classify_extension(p.name) for p in target_dir.rglob("*") if p.is_file()}
-        )
-        logger.info("원문 다운로드 완료 rcept_no=%s 파일형식=%s", rcept_no, extensions)
+        await _ensure_document_cached(dart_client, settings, rcept_no)
 
         done += 1
         if done % _CHECKPOINT_INTERVAL == 0 or done == total:
@@ -687,6 +786,215 @@ def _run_revenue_filter(
     logger.info("STEP6 완료: 매출액 필터 적용 (job_id=%s)", job_id)
 
 
+# ---------------------------------------------------------------------------
+# STEP 7 — 최근 N년 재무 이력 수집 (2026-07-15 추가)
+# ---------------------------------------------------------------------------
+
+
+def _history_window(history_years: int) -> tuple[str, str]:
+    """STEP 7이 list.json(corp_code 지정)에 넘길 (bgn_de, end_de)를 계산.
+
+    목표 연도수(N)를 커버하기에 충분히 여유를 둔 과거 시점까지 잡는다 —
+    회사마다 결산월이 다르고 감사보고서 제출 시점도 매년 정확히 같은 시기가
+    아닐 수 있어, 필요한 보고서 수(대략 N/2건)보다 넉넉하게 N/2+2년을
+    거슬러 올라간다. corp_code를 지정하면 3개월 제한이 없다는 점은 실측으로
+    확인했다(위 STEP 7 설계 메모 참고) — 그래서 STEP 2와 달리
+    `_split_period_into_windows()`가 필요 없다.
+    """
+    back_years = history_years // 2 + 2
+    end_de = datetime.now().strftime("%Y%m%d")
+    bgn_de = f"{datetime.now().year - back_years}0101"
+    return bgn_de, end_de
+
+
+async def _fetch_all_disclosures_for_corp(
+    dart_client: DartClient, corp_code: str, bgn_de: str, end_de: str
+) -> list[dict[str, Any]]:
+    """corp_code를 지정해 그 회사의 외부감사관련(F) 공시를 전량 페이징 수집한다.
+
+    한 회사가 감사보고서를 100건 넘게 제출하는 경우는 실무상 없다고 봐도
+    무방하지만(연 1회 정기감사 기준 수십 년치), STEP 2와의 일관성을 위해
+    total_page를 그대로 신뢰해 끝까지 순회한다.
+    """
+    items: list[dict[str, Any]] = []
+    page_no = 1
+    total_page = 1
+    while page_no <= total_page:
+        data = await dart_client.get_disclosure_list(
+            corp_code=corp_code,
+            bgn_de=bgn_de,
+            end_de=end_de,
+            pblntf_ty="F",
+            page_no=page_no,
+            page_count=_DISCLOSURE_PAGE_COUNT,
+        )
+        total_page = int(data.get("total_page") or 1)
+        items.extend(data.get("list") or [])
+        page_no += 1
+    return items
+
+
+def _upsert_financial_snapshot(
+    session_factory: sessionmaker[Session],
+    result_id: int,
+    rcept_no: str,
+    fiscal_year: str,
+    values: dict[str, float | None],
+    parse_status: str,
+    parse_note: str | None,
+) -> None:
+    """회사(result_id)-회계연도 단위로 financial_snapshots를 upsert.
+
+    이미 그 연도의 행이 있으면 갱신한다 — 다만 호출부(`_collect_history_for_result`)가
+    newest-first로 순회하며 "이미 확보한 연도는 건너뛴다"는 규칙을 적용하므로,
+    실제로 같은 연도가 두 번 upsert되는 경우는 이 STEP 실행 1회 안에서는
+    일어나지 않는다(재실행/resume 시에는 이전에 이미 기록된 연도라 애초에
+    호출부에서 걸러진다).
+    """
+    with session_factory() as db:
+        existing = db.execute(
+            select(FinancialSnapshot).where(
+                FinancialSnapshot.result_id == result_id,
+                FinancialSnapshot.fiscal_year == fiscal_year,
+            )
+        ).scalar_one_or_none()
+        if existing is None:
+            existing = FinancialSnapshot(result_id=result_id, fiscal_year=fiscal_year)
+            db.add(existing)
+        existing.rcept_no = rcept_no
+        for f in STANDARD_FINANCIAL_FIELDS:  # gross_margin 포함 — 파서가 이미 계산해 둔 값을 그대로 저장
+            setattr(existing, f, values.get(f))
+        existing.parse_status = parse_status
+        existing.parse_note = parse_note
+        db.commit()
+
+
+async def _collect_history_for_result(
+    dart_client: DartClient,
+    session_factory: sessionmaker[Session],
+    settings: Settings,
+    result_id: int,
+    corp_code: str,
+    history_years: int,
+) -> None:
+    """회사(result) 1건에 대해 최근 `history_years`개 회계연도를 채운다.
+
+    이미 `financial_snapshots`에 history_years개 이상의 distinct fiscal_year가
+    있으면 아무 API도 호출하지 않고 즉시 반환한다(resume의 핵심).
+    """
+    with session_factory() as db:
+        existing_years = {
+            row[0]
+            for row in db.execute(
+                select(FinancialSnapshot.fiscal_year).where(FinancialSnapshot.result_id == result_id)
+            ).all()
+        }
+    if len(existing_years) >= history_years:
+        return
+
+    bgn_de, end_de = _history_window(history_years)
+    disclosures = await _fetch_all_disclosures_for_corp(dart_client, corp_code, bgn_de, end_de)
+
+    # newest-first (rcept_no 내림차순) — 위 STEP 7 설계 메모 참고. 정정 공시도
+    # 자연히 원본보다 먼저 훑이게 되어 "연도별 최신 rcept_no 우선" dedup이 된다.
+    disclosures.sort(key=lambda item: item.get("rcept_no") or "", reverse=True)
+
+    collected_years = set(existing_years)
+    for item in disclosures:
+        if len(collected_years) >= history_years:
+            break
+        rcept_no = item.get("rcept_no")
+        if not rcept_no:
+            continue
+
+        target_dir = await _ensure_document_cached(dart_client, settings, rcept_no)
+        if target_dir is None:
+            continue
+        doc_path = _pick_document_file(target_dir)
+        if doc_path is None:
+            continue
+
+        raw_bytes = doc_path.read_bytes()
+        suffix = doc_path.suffix.lower()
+        if suffix == ".xml":
+            parsed = parse_xml_financials(raw_bytes)
+            raw_text = raw_bytes.decode("utf-8", errors="ignore")
+        elif suffix == ".pdf":
+            parsed = parse_pdf_financials(raw_bytes)
+            raw_text = ""
+        else:
+            continue
+
+        fiscal_date = _extract_fiscal_date(raw_text) if raw_text else None
+        if fiscal_date is None:
+            # 결산기준일을 못 뽑으면 연도를 알 수 없어 이 공시는 이력에 반영하지 않는다
+            # (results의 최신 스냅샷과 달리, 이 STEP은 연도 키가 필수다).
+            continue
+
+        fiscal_year_cur = fiscal_date[:4]
+        fiscal_year_prv = str(int(fiscal_year_cur) - 1)
+
+        for fiscal_year, values in (
+            (fiscal_year_cur, parsed.values_cur),
+            (fiscal_year_prv, parsed.values_prv),
+        ):
+            if fiscal_year in collected_years:
+                continue
+            _upsert_financial_snapshot(
+                session_factory, result_id, rcept_no, fiscal_year, values, parsed.parse_status, parsed.parse_note
+            )
+            collected_years.add(fiscal_year)
+
+
+async def _run_history_collection(
+    dart_client: DartClient,
+    session_factory: sessionmaker[Session],
+    settings: Settings,
+    job_id: int,
+    history_years: int,
+) -> None:
+    """STEP 7: 최종 결과(`excluded_by_revenue=0`)에 남은 회사만 최근 N년 이력을 채운다.
+
+    STEP 3의 FSC 사전 추림과 동일한 "값비싼 호출은 후보를 최대한 추린 뒤에"
+    원칙 — 매출액 필터까지 다 통과한 회사만 대상으로 해 쿼터 영향을 최종
+    결과 건수에만 비례하게 한다.
+    """
+    with session_factory() as db:
+        rows = db.execute(
+            select(Result.id, Result.corp_code).where(
+                Result.job_id == job_id,
+                Result.excluded_by_revenue == 0,
+                Result.corp_code.is_not(None),
+            )
+        ).all()
+
+    total = len(rows)
+    _checkpoint(
+        session_factory,
+        job_id,
+        current_step=STEP_HISTORY_COLLECTION,
+        progress_done=0,
+        progress_total=total,
+    )
+
+    done = 0
+    for result_id, corp_code in rows:
+        if done % _CHECKPOINT_INTERVAL == 0:
+            _raise_if_cancelled(session_factory, job_id)
+
+        await _collect_history_for_result(
+            dart_client, session_factory, settings, result_id, corp_code, history_years
+        )
+
+        done += 1
+        if done % _CHECKPOINT_INTERVAL == 0 or done == total:
+            _checkpoint(session_factory, job_id, progress_done=done, progress_total=total)
+
+    logger.info(
+        "STEP7 완료: 최근 %s년 이력 수집 대상 %s건 처리 (job_id=%s)", history_years, total, job_id
+    )
+
+
 async def retry_failed_parsing(job_id: int) -> None:
     """parse_status=FAILED인 results만 골라 STEP 5(파싱)를 재시도한다.
 
@@ -719,7 +1027,7 @@ async def retry_failed_parsing(job_id: int) -> None:
 
 
 async def run_job(job_id: int) -> None:
-    """Job 1건을 STEP 1~6까지 실행한다.
+    """Job 1건을 STEP 1~7까지 실행한다.
 
     - `QuotaExceededError`: Job을 PAUSED_QUOTA로 전환하고 정상 반환한다
       (예외를 상위로 전파하지 않는다 — CLAUDE.md 핵심 제약 4번).
@@ -787,8 +1095,16 @@ async def run_job(job_id: int) -> None:
         _raise_if_cancelled(session_factory, job_id)
         _run_revenue_filter(session_factory, job_id, cond_revenue)
 
-        _checkpoint(session_factory, job_id, status=JobStatus.DONE, current_step=STEP_REVENUE_FILTER)
-        logger.info("Job %s 완료 (STEP1~6)", job_id)
+        # STEP 7: 최근 N년 재무 이력 수집 (excluded_by_revenue=0인 최종 결과만 대상,
+        # 2026-07-15 추가) — Job 완료(DONE) 시점이 STEP 6에서 이 지점으로 이동했다
+        # (M3에서 STEP4->STEP6로 옮긴 전례와 동일한 패턴).
+        _raise_if_cancelled(session_factory, job_id)
+        await _run_history_collection(
+            dart_client, session_factory, settings, job_id, job.history_years or DEFAULT_HISTORY_YEARS
+        )
+
+        _checkpoint(session_factory, job_id, status=JobStatus.DONE, current_step=STEP_HISTORY_COLLECTION)
+        logger.info("Job %s 완료 (STEP1~7)", job_id)
 
     except JobCancelledError:
         logger.info("Job %s 취소 감지 — 중단.", job_id)

@@ -10,7 +10,11 @@
       cond_period   TEXT,   -- JSON: {"bgn_de":"20250101","end_de":"20251231"}
       status        TEXT,   -- PENDING/RUNNING/PAUSED_QUOTA/DONE/FAILED/CANCELLED
       current_step  INTEGER, progress_done INTEGER, progress_total INTEGER,
-      error_msg     TEXT
+      error_msg     TEXT,
+      history_years INTEGER  -- STEP 7(최근 N년 재무이력)의 목표 연도수. 2/4/6/10만
+                              -- 허용(app/api/jobs.py JobCreateRequest), 기본 4.
+                              -- cond_* JSON들과 달리 "검색 필터"가 아니라 STEP7
+                              -- 파이프라인 실행 파라미터라 별도 컬럼으로 둔다.
     );
 """
 
@@ -37,6 +41,7 @@ class Job(Base):
     progress_done: Mapped[int | None] = mapped_column(Integer, nullable=True)
     progress_total: Mapped[int | None] = mapped_column(Integer, nullable=True)
     error_msg: Mapped[str | None] = mapped_column(String, nullable=True)
+    history_years: Mapped[int | None] = mapped_column(Integer, nullable=True, default=4, server_default="4")
 
 
 # 상세개발계획.md §5 status 값 (하드코딩 대신 상수로 참조)

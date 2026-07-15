@@ -70,7 +70,31 @@ def test_create_job_returns_pending_and_triggers_background_task(monkeypatch):
         assert body["status"] == JobStatus.PENDING
         assert body["cond_region"] == {"sido": "경남", "sigungu": ["김해시"]}
         assert body["cond_industry"] == ["C25"]
+        assert body["history_years"] == 4  # 미지정 시 기본값
         assert calls == [body["id"]]
+    finally:
+        app_main.app.dependency_overrides.clear()
+
+
+def test_create_job_accepts_custom_history_years(monkeypatch):
+    client, _calls = _build_test_client(monkeypatch)
+    try:
+        payload = _sample_payload()
+        payload["history_years"] = 10
+        resp = client.post("/api/jobs", json=payload)
+        assert resp.status_code == 200
+        assert resp.json()["history_years"] == 10
+    finally:
+        app_main.app.dependency_overrides.clear()
+
+
+def test_create_job_rejects_invalid_history_years(monkeypatch):
+    client, _calls = _build_test_client(monkeypatch)
+    try:
+        payload = _sample_payload()
+        payload["history_years"] = 3  # 짝수 옵션(2/4/6/10)이 아님
+        resp = client.post("/api/jobs", json=payload)
+        assert resp.status_code == 422
     finally:
         app_main.app.dependency_overrides.clear()
 

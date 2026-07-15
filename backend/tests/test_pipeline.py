@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -19,8 +20,10 @@ from app.config import Settings
 from app.core import pipeline
 from app.core.dart_client import DartApiError, QuotaExceededError
 from app.models.corp_profile import CorpProfile
+from app.models.financial_snapshot import FinancialSnapshot
 from app.models.job import Job, JobStatus
 from app.models.result import ParseStatus, Result
+from app.parsers.base import ParsedFinancials
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -36,23 +39,36 @@ class FakeDartClient:
     - `disclosure_pages`: STEP 2용 — list.json 페이지별 응답(dict) 리스트.
     - `companies`: STEP 3용 — corp_code -> company.json 응답(dict).
     - `documents`: STEP 4용 — rcept_no -> zip bytes.
+    - `disclosure_pages_by_corp`: STEP 7용 — corp_code -> list.json 페이지별
+      응답(dict) 리스트. STEP 7은 corp_code를 지정해 조회하므로 bgn_de/end_de가
+      아니라 corp_code로 라우팅한다.
     - `raise_quota_after`: N번째 호출(1-base) 이후부터 QuotaExceededError를 던진다.
     """
 
     def __init__(
         self,
         disclosure_pages: list[dict] | None = None,
+        disclosure_pages_by_window: dict[tuple[str, str], list[dict]] | None = None,
+        disclosure_pages_by_corp: dict[str, list[dict]] | None = None,
         companies: dict[str, dict] | None = None,
         documents: dict[str, bytes] | None = None,
         raise_quota_after: int | None = None,
     ) -> None:
         self.disclosure_pages = disclosure_pages or []
+        # STEP 2가 90일 초과 기간을 여러 구간으로 나눠 호출하게 되면서, 구간마다
+        # page_no가 1부터 다시 시작한다. 구간별로 다른 응답을 줘야 하는 테스트는
+        # (bgn_de, end_de) -> 페이지 리스트 로 키를 잡는 이 딕셔너리를 사용한다.
+        # 지정하지 않으면 기존처럼 `disclosure_pages`를 page_no로만 인덱싱한다
+        # (단일 구간짜리 기존 테스트와 호환).
+        self.disclosure_pages_by_window = disclosure_pages_by_window or {}
+        self.disclosure_pages_by_corp = disclosure_pages_by_corp or {}
         self.companies = companies or {}
         self.documents = documents or {}
         self.raise_quota_after = raise_quota_after
         self.call_count = 0
         self.company_calls: list[str] = []
         self.document_calls: list[str] = []
+        self.disclosure_list_calls: list[dict] = []
         self.closed = False
 
     async def _tick(self) -> None:
@@ -62,7 +78,13 @@ class FakeDartClient:
 
     async def get_disclosure_list(self, **params) -> dict:
         await self._tick()
+        self.disclosure_list_calls.append(dict(params))
         page_no = params["page_no"]
+        if self.disclosure_pages_by_corp and params.get("corp_code") in self.disclosure_pages_by_corp:
+            return self.disclosure_pages_by_corp[params["corp_code"]][page_no - 1]
+        if self.disclosure_pages_by_window:
+            key = (params.get("bgn_de"), params.get("end_de"))
+            return self.disclosure_pages_by_window[key][page_no - 1]
         return self.disclosure_pages[page_no - 1]
 
     async def get_company(self, corp_code: str) -> dict:
@@ -125,6 +147,32 @@ def _make_zip(file_name: str, content: bytes = b"<xml>dummy</xml>") -> bytes:
     return buf.getvalue()
 
 
+def _history_doc_zip(period_to: str, revenue_cur: int, revenue_prv: int, file_name: str = "doc.xml") -> bytes:
+    """STEP 7 테스트용 가짜 원문. `_extract_fiscal_date`가 읽는 PERIODTO 속성은
+    실제 정규식과 맞게 넣어두고(진짜 파서를 태우지 않고 그대로 사용), 재무
+    수치는 REV_CUR/REV_PRV 마커로 심어 `_fake_parse_xml_financials`가 그대로
+    읽게 한다(xml_parser 자체 로직은 test_parsers.py에서 이미 검증했으므로
+    여기서는 STEP 7 오케스트레이션만 확인한다)."""
+    content = (
+        f'<ROOT><P AUNIT="PERIODFROM" AUNITVALUE="20200101"/>'
+        f'<P AUNIT="PERIODTO" AUNITVALUE="{period_to}"/>'
+        f"REV_CUR={revenue_cur};REV_PRV={revenue_prv}</ROOT>"
+    ).encode("utf-8")
+    return _make_zip(file_name, content)
+
+
+def _fake_parse_xml_financials(raw_bytes: bytes) -> ParsedFinancials:
+    text = raw_bytes.decode("utf-8")
+    match = re.search(r"REV_CUR=(\d+);REV_PRV=(\d+)", text)
+    assert match is not None
+    return ParsedFinancials(
+        values_cur={"revenue": int(match.group(1))},
+        values_prv={"revenue": int(match.group(2))},
+        parse_status="OK",
+        parse_note=None,
+    )
+
+
 def _make_job(
     session_factory,
     *,
@@ -132,6 +180,7 @@ def _make_job(
     cond_revenue: dict | None = None,
     cond_industry: list[str] | None = None,
     cond_period: dict | None = None,
+    history_years: int = 4,
     status: str = JobStatus.PENDING,
 ) -> int:
     with session_factory() as db:
@@ -142,6 +191,7 @@ def _make_job(
             cond_revenue=json.dumps(cond_revenue or {}, ensure_ascii=False),
             cond_industry=json.dumps(cond_industry or [], ensure_ascii=False),
             cond_period=json.dumps(cond_period or {"bgn_de": "20260101", "end_de": "20260131"}),
+            history_years=history_years,
             status=status,
             current_step=0,
             progress_done=0,
@@ -208,6 +258,69 @@ async def test_collect_candidates_requires_period():
     client = FakeDartClient(disclosure_pages=[])
     with pytest.raises(ValueError):
         await pipeline._collect_candidates(client, None, 1, {})
+
+
+def test_split_period_into_windows_chunks_by_90_days():
+    """실측(2026-07-15): corp_code 없이 날짜만으로 list.json을 조회하면 조회
+    기간이 3개월(90일)을 넘을 수 없다 — 90일 고정 폭으로 분할하는지 검증."""
+    windows = pipeline._split_period_into_windows("20260101", "20260410")
+
+    assert windows == [("20260101", "20260331"), ("20260401", "20260410")]
+
+
+def test_split_period_into_windows_single_window_when_within_90_days():
+    windows = pipeline._split_period_into_windows("20260101", "20260131")
+
+    assert windows == [("20260101", "20260131")]
+
+
+@pytest.mark.asyncio
+async def test_collect_candidates_splits_period_over_90_days_and_dedupes_across_windows(
+    db_session_factory,
+):
+    """상세개발계획.md §7-1 기본값인 "최근 1년" 검색처럼 90일을 넘는 기간이
+    들어와도 실패하지 않고 구간별로 나눠 호출해야 한다(2026-07-15 실측
+    발견 — 3개월 초과 시 list.json이 status=100으로 즉시 실패)."""
+    job_id = _make_job(db_session_factory)
+
+    window1 = ("20260101", "20260331")
+    window2 = ("20260401", "20260410")
+    page_w1 = {
+        "status": "000",
+        "total_page": 1,
+        "list": [{"corp_code": "A1", "corp_name": "가나다상사", "rcept_no": "20260201000001"}],
+    }
+    page_w2 = {
+        "status": "000",
+        "total_page": 1,
+        "list": [
+            # A1의 정정 공시(2구간에서 접수) — rcept_no가 더 크므로 대표 건이 갱신되어야 함
+            {"corp_code": "A1", "corp_name": "가나다상사", "rcept_no": "20260405000002"},
+            {"corp_code": "A2", "corp_name": "라마바상사", "rcept_no": "20260406000003"},
+        ],
+    }
+    client = FakeDartClient(
+        disclosure_pages_by_window={window1: [page_w1], window2: [page_w2]}
+    )
+
+    candidates = await pipeline._collect_candidates(
+        client, db_session_factory, job_id, {"bgn_de": "20260101", "end_de": "20260410"}
+    )
+
+    by_corp = {c["corp_code"]: c for c in candidates}
+    assert set(by_corp) == {"A1", "A2"}
+    assert by_corp["A1"]["rcept_no"] == "20260405000002"  # 2구간의 최신 건으로 dedup
+    assert client.call_count == 2  # 구간 2개 x 페이지 1개
+
+    called_periods = {(c["bgn_de"], c["end_de"]) for c in client.disclosure_list_calls}
+    assert called_periods == {window1, window2}
+    for call in client.disclosure_list_calls:
+        assert call["page_no"] == 1  # 각 구간은 page_no가 1부터 다시 시작
+
+    job = _get_job(db_session_factory, job_id)
+    assert job.current_step == pipeline.STEP_DISCLOSURE_LIST
+    assert job.progress_done == 2
+    assert job.progress_total == 2
 
 
 # ---------------------------------------------------------------------------
@@ -1022,3 +1135,289 @@ def test_run_revenue_filter_no_condition_leaves_untouched(db_session_factory):
     with db_session_factory() as db:
         result = db.execute(select(Result).where(Result.job_id == job_id)).scalar_one()
     assert result.excluded_by_revenue == 0
+
+
+# ---------------------------------------------------------------------------
+# STEP 7 — 최근 N년 재무 이력 수집 (2026-07-15 추가)
+# ---------------------------------------------------------------------------
+
+
+def test_history_window_looks_back_n_over_2_plus_2_years():
+    bgn_de, end_de = pipeline._history_window(4)
+    assert end_de == datetime.now().strftime("%Y%m%d")
+    assert bgn_de == f"{datetime.now().year - 4}0101"  # 4//2+2 = 4
+
+    bgn_de2, _ = pipeline._history_window(10)
+    assert bgn_de2 == f"{datetime.now().year - 7}0101"  # 10//2+2 = 7
+
+
+def _seed_result(session_factory, *, job_id: int, corp_code: str, excluded_by_revenue: int = 0) -> int:
+    with session_factory() as db:
+        result = Result(job_id=job_id, corp_code=corp_code, rcept_no="SEED", excluded_by_revenue=excluded_by_revenue)
+        db.add(result)
+        db.commit()
+        db.refresh(result)
+        return result.id
+
+
+@pytest.mark.asyncio
+async def test_collect_history_for_result_stops_once_target_years_reached(
+    db_session_factory, tmp_path, monkeypatch
+):
+    """3건의 공시(각 당기·전기 비교)로 목표 4개 연도를 채우면, 더 오래된 4번째
+    공시는 다운로드하지 않아야 한다(쿼터 절감 — newest-first 조기 중단)."""
+    monkeypatch.setattr(pipeline, "parse_xml_financials", _fake_parse_xml_financials)
+    settings = Settings(document_cache_dir=str(tmp_path / "documents"))
+    job_id = _make_job(db_session_factory)
+    result_id = _seed_result(db_session_factory, job_id=job_id, corp_code="H1")
+
+    r1, r2, r3, r4 = "20260601000001", "20250601000002", "20240601000003", "20230601000004"
+    disclosure_page = {
+        "status": "000",
+        "total_page": 1,
+        "list": [
+            {"corp_code": "H1", "corp_name": "이력회사", "rcept_no": r1},
+            {"corp_code": "H1", "corp_name": "이력회사", "rcept_no": r2},
+            {"corp_code": "H1", "corp_name": "이력회사", "rcept_no": r3},
+            {"corp_code": "H1", "corp_name": "이력회사", "rcept_no": r4},
+        ],
+    }
+    documents = {
+        r1: _history_doc_zip("20251231", revenue_cur=25_000_000, revenue_prv=24_000_000, file_name=f"{r1}.xml"),
+        r2: _history_doc_zip("20241231", revenue_cur=24_999_999, revenue_prv=23_000_000, file_name=f"{r2}.xml"),
+        r3: _history_doc_zip("20231231", revenue_cur=22_999_999, revenue_prv=22_000_000, file_name=f"{r3}.xml"),
+        # r4는 documents에 아예 없음 -> 만약 호출된다면 DartApiError로 드러난다.
+    }
+    client = FakeDartClient(disclosure_pages_by_corp={"H1": [disclosure_page]}, documents=documents)
+
+    await pipeline._collect_history_for_result(client, db_session_factory, settings, result_id, "H1", 4)
+
+    assert client.document_calls == [r1, r2, r3]  # r4는 조기 중단으로 다운로드되지 않음
+
+    with db_session_factory() as db:
+        snapshots = {
+            s.fiscal_year: s
+            for s in db.execute(
+                select(FinancialSnapshot).where(FinancialSnapshot.result_id == result_id)
+            ).scalars().all()
+        }
+    assert set(snapshots) == {"2025", "2024", "2023", "2022"}
+    assert snapshots["2025"].revenue == 25_000_000  # r1 당기
+    assert snapshots["2024"].revenue == 24_000_000  # r1 전기 (r2 당기의 24,999,999가 아님 — newest-first 우선)
+    assert snapshots["2023"].revenue == 23_000_000  # r2 전기
+    assert snapshots["2022"].revenue == 22_000_000  # r3 전기
+    assert all(s.rcept_no in (r1, r2, r3) for s in snapshots.values())
+
+
+@pytest.mark.asyncio
+async def test_collect_history_for_result_insufficient_disclosures_does_not_fail(
+    db_session_factory, tmp_path, monkeypatch
+):
+    """목표 연도수(4년)를 채울 만큼 공시가 없어도 에러 없이 찾은 만큼만 채운다."""
+    monkeypatch.setattr(pipeline, "parse_xml_financials", _fake_parse_xml_financials)
+    settings = Settings(document_cache_dir=str(tmp_path / "documents"))
+    job_id = _make_job(db_session_factory)
+    result_id = _seed_result(db_session_factory, job_id=job_id, corp_code="H2")
+
+    r1 = "20260601000001"
+    disclosure_page = {
+        "status": "000",
+        "total_page": 1,
+        "list": [{"corp_code": "H2", "corp_name": "짧은이력회사", "rcept_no": r1}],
+    }
+    documents = {r1: _history_doc_zip("20251231", revenue_cur=1_000, revenue_prv=900, file_name=f"{r1}.xml")}
+    client = FakeDartClient(disclosure_pages_by_corp={"H2": [disclosure_page]}, documents=documents)
+
+    await pipeline._collect_history_for_result(client, db_session_factory, settings, result_id, "H2", 4)
+
+    with db_session_factory() as db:
+        snapshots = db.execute(
+            select(FinancialSnapshot).where(FinancialSnapshot.result_id == result_id)
+        ).scalars().all()
+    assert {s.fiscal_year for s in snapshots} == {"2025", "2024"}  # 목표 4년에 못 미쳐도 정상 종료
+
+
+@pytest.mark.asyncio
+async def test_collect_history_for_result_skips_api_when_already_sufficient(db_session_factory, tmp_path):
+    """이미 목표 연도수만큼 financial_snapshots가 있으면 list.json조차 호출하지 않는다(resume 핵심)."""
+    settings = Settings(document_cache_dir=str(tmp_path / "documents"))
+    job_id = _make_job(db_session_factory)
+    result_id = _seed_result(db_session_factory, job_id=job_id, corp_code="H3")
+    with db_session_factory() as db:
+        db.add(FinancialSnapshot(result_id=result_id, fiscal_year="2025", rcept_no="X"))
+        db.add(FinancialSnapshot(result_id=result_id, fiscal_year="2024", rcept_no="X"))
+        db.commit()
+
+    client = FakeDartClient()  # 응답을 아무것도 안 줌 -> 호출되면 즉시 실패
+
+    await pipeline._collect_history_for_result(client, db_session_factory, settings, result_id, "H3", 2)
+
+    assert client.call_count == 0
+    assert client.disclosure_list_calls == []
+
+
+@pytest.mark.asyncio
+async def test_run_history_collection_only_processes_final_included_results(
+    db_session_factory, tmp_path, monkeypatch
+):
+    """excluded_by_revenue=1인 회사는 STEP 7 대상에서 제외된다."""
+    monkeypatch.setattr(pipeline, "parse_xml_financials", _fake_parse_xml_financials)
+    settings = Settings(document_cache_dir=str(tmp_path / "documents"))
+    job_id = _make_job(db_session_factory)
+    included_id = _seed_result(db_session_factory, job_id=job_id, corp_code="I1", excluded_by_revenue=0)
+    _seed_result(db_session_factory, job_id=job_id, corp_code="EXCLUDED", excluded_by_revenue=1)
+
+    r1 = "20260601000001"
+    disclosure_page = {
+        "status": "000",
+        "total_page": 1,
+        "list": [{"corp_code": "I1", "corp_name": "포함회사", "rcept_no": r1}],
+    }
+    documents = {r1: _history_doc_zip("20251231", revenue_cur=1_000, revenue_prv=900, file_name=f"{r1}.xml")}
+    client = FakeDartClient(disclosure_pages_by_corp={"I1": [disclosure_page]}, documents=documents)
+
+    await pipeline._run_history_collection(client, db_session_factory, settings, job_id, 2)
+
+    # EXCLUDED가 조회됐다면 corp_code로 라우팅되는 disclosure_pages_by_corp에 없어
+    # KeyError가 났을 것이다 — 그런 예외 없이 통과했다는 것 자체가 스킵되었다는 증거.
+    with db_session_factory() as db:
+        snapshots = db.execute(select(FinancialSnapshot)).scalars().all()
+    assert {s.result_id for s in snapshots} == {included_id}
+
+    job = _get_job(db_session_factory, job_id)
+    assert job.current_step == pipeline.STEP_HISTORY_COLLECTION
+    assert job.progress_done == 1  # EXCLUDED는 애초에 대상 목록에서 제외되어 카운트되지 않음
+    assert job.progress_total == 1
+
+
+@pytest.mark.asyncio
+async def test_run_job_completes_step7_and_marks_done(monkeypatch, db_session_factory, patch_pipeline_env):
+    """run_job이 STEP 7까지 실행하고, DONE 시점이 STEP7 완료 이후로 이동했는지 확인."""
+    monkeypatch.setattr(pipeline, "parse_xml_financials", _fake_parse_xml_financials)
+    job_id = _make_job(
+        db_session_factory,
+        cond_region={},
+        cond_industry=[],
+        cond_period={"bgn_de": "20260101", "end_de": "20260131"},
+        history_years=2,
+    )
+
+    main_rcept = "20260101000001"
+    disclosure_page = {
+        "status": "000",
+        "total_page": 1,
+        "list": [{"corp_code": "A1", "corp_name": "테스트상사", "rcept_no": main_rcept}],
+    }
+    company = {"corp_name": "테스트상사", "adres": "경상남도 김해시 1", "induty_code": "C25110"}
+    main_doc = _history_doc_zip("20251231", revenue_cur=5_000, revenue_prv=4_000, file_name=f"{main_rcept}.xml")
+
+    fake_client = FakeDartClient(
+        disclosure_pages=[disclosure_page],
+        disclosure_pages_by_corp={"A1": [disclosure_page]},  # STEP7이 같은 rcept_no를 다시 찾음(로컬 캐시 재사용)
+        companies={"A1": company},
+        documents={main_rcept: main_doc},
+    )
+    monkeypatch.setattr(pipeline, "DartClient", lambda **kwargs: fake_client)
+
+    await pipeline.run_job(job_id)
+
+    job = _get_job(db_session_factory, job_id)
+    assert job.status == JobStatus.DONE
+    assert job.current_step == pipeline.STEP_HISTORY_COLLECTION
+
+    with db_session_factory() as db:
+        result = db.execute(select(Result).where(Result.job_id == job_id)).scalar_one()
+        snapshots = db.execute(
+            select(FinancialSnapshot).where(FinancialSnapshot.result_id == result.id)
+        ).scalars().all()
+    assert {s.fiscal_year for s in snapshots} == {"2025", "2024"}  # history_years=2로 충분
+    # STEP4에서 이미 캐시된 문서를 STEP7이 재다운로드하지 않았어야 한다(로컬 캐시 재사용).
+    assert fake_client.document_calls == [main_rcept]
+
+
+@pytest.mark.asyncio
+async def test_run_job_quota_exceeded_during_step7_pauses_and_resumes(
+    monkeypatch, db_session_factory, patch_pipeline_env
+):
+    """STEP 7 도중 쿼터 초과가 나면 PAUSED_QUOTA로 전환되고, 이미 확보한 연도는
+    보존된 채로 재실행(resume) 시 이어서 채워진다."""
+    monkeypatch.setattr(pipeline, "parse_xml_financials", _fake_parse_xml_financials)
+    job_id = _make_job(
+        db_session_factory,
+        cond_region={},
+        cond_industry=[],
+        cond_period={"bgn_de": "20260101", "end_de": "20260131"},
+        history_years=4,
+    )
+
+    main_rcept = "20260601000001"  # STEP2/4에서 이미 다운로드되어 로컬 캐시로 재사용됨
+    older_rcept = "20250601000002"  # STEP7에서 새로 다운로드해야 하는 건
+    disclosure_page_step2 = {
+        "status": "000",
+        "total_page": 1,
+        "list": [{"corp_code": "A1", "corp_name": "테스트상사", "rcept_no": main_rcept}],
+    }
+    disclosure_page_step7 = {
+        "status": "000",
+        "total_page": 1,
+        "list": [
+            {"corp_code": "A1", "corp_name": "테스트상사", "rcept_no": main_rcept},
+            {"corp_code": "A1", "corp_name": "테스트상사", "rcept_no": older_rcept},
+        ],
+    }
+    company = {"corp_name": "테스트상사", "adres": "경상남도 김해시 1", "induty_code": "C25110"}
+    main_doc = _history_doc_zip("20251231", revenue_cur=5_000, revenue_prv=4_000, file_name=f"{main_rcept}.xml")
+    older_doc = _history_doc_zip("20241231", revenue_cur=3_000, revenue_prv=2_000, file_name=f"{older_rcept}.xml")
+
+    # 호출 순서: STEP2 list.json(1) + STEP3 company.json(2) + STEP4 document(3)
+    # + STEP7 list.json(4) + STEP7 older_rcept document(5, 쿼터 초과 유도).
+    # main_rcept는 STEP4가 이미 로컬 캐시에 내려받아 STEP7에서 재호출되지 않는다.
+    fake_client = FakeDartClient(
+        disclosure_pages=[disclosure_page_step2],
+        disclosure_pages_by_corp={"A1": [disclosure_page_step7]},
+        companies={"A1": company},
+        documents={main_rcept: main_doc, older_rcept: older_doc},
+        raise_quota_after=4,
+    )
+    monkeypatch.setattr(pipeline, "DartClient", lambda **kwargs: fake_client)
+
+    await pipeline.run_job(job_id)
+
+    job = _get_job(db_session_factory, job_id)
+    assert job.status == JobStatus.PAUSED_QUOTA
+    assert job.current_step == pipeline.STEP_HISTORY_COLLECTION
+
+    with db_session_factory() as db:
+        result = db.execute(select(Result).where(Result.job_id == job_id)).scalar_one()
+        snapshots = {
+            s.fiscal_year
+            for s in db.execute(
+                select(FinancialSnapshot).where(FinancialSnapshot.result_id == result.id)
+            ).scalars().all()
+        }
+    assert snapshots == {"2025", "2024"}  # main_rcept 처리분은 쿼터 초과 이전에 이미 커밋됨
+
+    # --- resume: 쿼터 제한 없는 새 클라이언트로 재실행 ---
+    resumed_client = FakeDartClient(
+        disclosure_pages=[disclosure_page_step2],
+        disclosure_pages_by_corp={"A1": [disclosure_page_step7]},
+        companies={"A1": company},
+        documents={main_rcept: main_doc, older_rcept: older_doc},
+    )
+    monkeypatch.setattr(pipeline, "DartClient", lambda **kwargs: resumed_client)
+
+    await pipeline.run_job(job_id)
+
+    job = _get_job(db_session_factory, job_id)
+    assert job.status == JobStatus.DONE
+    with db_session_factory() as db:
+        result = db.execute(select(Result).where(Result.job_id == job_id)).scalar_one()
+        snapshots = {
+            s.fiscal_year
+            for s in db.execute(
+                select(FinancialSnapshot).where(FinancialSnapshot.result_id == result.id)
+            ).scalars().all()
+        }
+    assert snapshots == {"2025", "2024", "2023"}  # older_rcept의 당기(2024, 이미 있음)+전기(2023, 신규)
+    assert main_rcept not in resumed_client.document_calls  # STEP4 캐시 재사용 — 재다운로드 없음
+    assert resumed_client.document_calls == [older_rcept]

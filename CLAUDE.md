@@ -22,9 +22,108 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 `POST /api/jobs/{id}/resume`, `POST /api/jobs/{id}/retry-failed` — parse_status=FAILED
 건만 STEP5 재실행)와 `app/api/results.py`(`GET /api/jobs/{id}/results`, 페이징/
 `parse_status`/`excluded_by_revenue` 필터, 실제 값이 채워짐)가 `main.py`에 등록되어
-실제 OpenDART API로 end-to-end 스모크 테스트를 통과했다. `app/api/results.py`의
-`/export`만 M4 TODO로 남아 있다. `exporters/excel.py`는 아직 M4에서 채울 골격만
-있다. `frontend/`는 아직 스캐폴딩되지 않았다(M4 범위, 마일스톤 순서 준수).
+실제 OpenDART API로 end-to-end 스모크 테스트를 통과했다.
+
+**M4 백엔드 TODO 3종 구현 완료(2026-07-15).** ① `GET /api/meta/regions`/
+`GET /api/meta/industries`를 `app/api/meta.py`에 추가했다 — 정적 데이터는
+각각 신규 파일 `app/core/region_data.py`(17개 시도 + 시군구, `filters.py`의
+`SIDO_ALIASES` key와 1:1 일치. 세종특별자치시는 하위 시군구가 없는 단층제라
+빈 배열로 처리)와 `app/core/industry_data.py`(KSIC 10차 대분류 21개(A~U) +
+중분류 2자리 코드, `induty_code` prefix 매칭 체계와 동일)에 두었다. ②
+`app/exporters/excel.py`의 `export_results()`를 구현했다 — `results` DB
+필드명은 그대로 유지하고(`RESULT_COLUMN_LABELS` dict로 파일 출력 시에만
+한국어 헤더로 매핑), pandas DataFrame을 거쳐 xlsx(openpyxl)/csv(`utf-8-sig`
+BOM)로 직렬화한다. ③ `app/api/results.py`에 `GET /api/jobs/{id}/export?
+format=xlsx|csv`를 추가했다 — 기존 `/results`의 쿼리 빌더를
+`_build_results_query()`로 공유 추출해 `parse_status`/`excluded_by_revenue`
+필터를 동일하게 지원하고, 페이징 없이 전체를 내려준다. `format`이 xlsx/csv가
+아니면 400, `Content-Disposition: attachment`, xlsx/csv 각각 정확한
+`Content-Type`을 반환한다. 신규 테스트: `backend/tests/test_api_meta.py`,
+`backend/tests/test_exporters.py`, `backend/tests/test_api_results.py`.
+
+**M4 프론트엔드 구현 완료(2026-07-15).** `frontend/`를 Vite + React 18 +
+TypeScript + Mantine 9로 스캐폴딩했다(UI 라이브러리는 상세개발계획.md에서
+권장한 Mantine 채택). `vite.config.ts`에 dev proxy(`/api` →
+`http://localhost:8000`)를 설정해 프론트가 DART API 키를 전혀 다루지 않고
+백엔드의 `/api/...`만 호출하도록 했다. 3개 라우트(`/search`, `/jobs`,
+`/jobs/:id/results`)를 react-router-dom으로 구성했고, `frontend/src/api/`에
+`jobs.ts`/`meta.ts`/`results.ts`/`client.ts`로 백엔드 REST 계약을 타입과 함께
+정리했다. SearchPage(지역/매출액/업종/기간 입력 → `POST /api/jobs`,
+"예상 규모 미리보기" 버튼은 대응 API가 없어 스코프 제외), JobsPage(RUNNING
+Job이 있을 때만 2초 폴링 + `clearInterval` 정리, PAUSED_QUOTA/FAILED/RUNNING
+상태별 액션 버튼), ResultPage(핵심 컬럼 기본 표시 + 35개 컬럼 표시/숨김 토글,
+parse_status/excluded_by_revenue 필터 탭, 행 클릭 시 당기·전기 전 항목 +
+DART 원문 링크 Drawer, 현재 필터를 반영한 Excel/CSV 다운로드)까지 구현했다.
+백엔드(M2~M4 TODO 포함)를 실제로 띄운 채 Playwright로 end-to-end 스모크
+테스트(폼 제출 → Job 생성 payload 검증 → 목록/진행률/버튼 노출 → 결과
+테이블/상세 패널/DART 링크 조립)를 수행해 콘솔/런타임 에러가 없음을
+확인했고, `npm run build`(tsc 타입체크)/`npm run lint`(oxlint) 모두
+통과했다. 상세는 `frontend/README.md`와 상세개발계획.md M4 체크리스트 참고.
+스모크 테스트 중 STEP 2(list.json)가 `corp_code` 미지정 시 조회 기간을
+3개월까지만 허용한다는 DART API 제약을 발견했다(1년 기본값으로 Job을
+만들면 즉시 FAILED) — 프론트는 상세개발계획.md §7-1 명세("기본값 최근
+1년")를 그대로 구현했으므로 UI를 임의로 바꾸지 않았고, 이 제약은 STEP 2를
+분할 조회하도록 보강할지 여부를 dart-backend/dart-parser 에이전트가
+판단할 사항으로 남겨둔다. **→ 이 건은 같은 날(2026-07-15) 백엔드에서
+90일 단위 분할 조회로 해결했다(아래 "M2에서 확정된 설계 판단"의 STEP 2
+분할 조회 항목 참고)** — 프론트/§7-1의 "기본값 최근 1년" UI는 그대로 두고
+백엔드 STEP 2 내부에서만 분할하므로 계약 변경 없음.
+
+**STEP 7(최근 N년 재무이력) 추가 구현 완료(2026-07-15, 백엔드 전용).**
+사용자가 "최근 N년치 재무 이력"을 요청해, 기존 STEP 1~6(당기·전기 2개년만
+수집) 뒤에 STEP 7을 추가했다 — `results` 테이블의 `_cur`/`_prv` 컬럼 의미는
+전혀 건드리지 않고("가장 최근 감사보고서 1건의 당기·전기" 그대로 유지),
+새 테이블 `financial_snapshots`(`app/models/financial_snapshot.py`, 회사×
+회계연도 단위, `UNIQUE(result_id, fiscal_year)`)에 이력을 별도로 쌓는다.
+핵심 설계:
+- **"필터 통과 후에만" 원칙 재사용**: STEP 3(FSC 사전 추림)와 같은 철학으로,
+  STEP 7은 STEP 1~6을 다 통과하고 `excluded_by_revenue=0`인 최종 결과만
+  대상으로 한다 — 쿼터 영향이 최종 결과 건수에만 비례.
+- **실측(2026-07-15): `list.json`에 `corp_code`를 지정하면 3개월 조회기간
+  제한이 사라진다.** `corp_code=01552935`(시대산업)로 10년 범위
+  (`bgn_de=20160101`~`end_de=20260630`)를 조회해 2021~2025 회계연도 감사
+  보고서 5건을 한 번에 받았다 — STEP 2가 겪은 "corp_code 없이는 90일
+  제한"과 달리, STEP 7은 `_split_period_into_windows()`가 필요 없다(단일
+  기간 조회로 충분).
+  `history_years`(짝수 2/4/6/10, 기본 4)만큼의 서로 다른 회계연도를 모을
+  때까지 최신 공시부터(newest-first) document.xml을 열어 파싱하고, 목표에
+  도달하면 더 오래된 공시는 다운로드하지 않는다 — 자세한 이유(oldest-first로
+  하면 오히려 최신 연도를 놓칠 수 있음)와 회계연도 판정 규칙은
+  `app/core/pipeline.py`의 STEP 7 설계 메모, `app/models/financial_snapshot.py`
+  참고. 다운로드/파싱은 STEP 4/5 로직(`_ensure_document_cached()`로 STEP 4와
+  공유 추출, `parse_xml_financials`/`parse_pdf_financials`)을 그대로 재사용했다
+  — 새 파서를 만들지 않았다. `POST /api/jobs`에 `history_years` 필드가
+  추가됐고(`Job.history_years` 컬럼), Job DONE 시점이 STEP 6에서 STEP 7
+  완료 시점으로 다시 이동했다(M3에서 STEP4→STEP6로 옮긴 전례와 동일한
+  패턴). 신규 조회 API `GET /api/jobs/{id}/results/{result_id}/history`
+  (오래된 연도 → 최신 연도 순 반환, `app/api/results.py`)를 추가했다 —
+  기존 `/results` 목록 응답과 `/export`는 스코프 밖이라 건드리지 않았다.
+  단위 테스트: `backend/tests/test_pipeline.py`의 STEP 7 섹션(조기 중단/
+  연도 부족/resume 단축/STEP7 드라이버 필터링/run_job 통합/쿼터초과+resume
+  총 7종), `backend/tests/test_api_jobs.py`(history_years 검증 2종),
+  `backend/tests/test_api_results.py`(history 엔드포인트 5종).
+
+**STEP 7 프론트엔드 연동 완료(2026-07-15).** `frontend/src/pages/SearchPage.tsx`에
+"재무 이력 조회 기간" `SegmentedControl`(2/4/6/10년, 기본 4년)을 추가해
+`POST /api/jobs` payload 최상위에 `history_years`를 함께 보낸다.
+`frontend/src/types/index.ts`에 `HistoryYears`/`FinancialSnapshotResponse`
+타입과 `JobCreateRequest.history_years`/`JobResponse.history_years`를
+추가했다. `frontend/src/api/results.ts`에 `getResultHistory(jobId, resultId)`
+(`GET /api/jobs/{id}/results/{result_id}/history`)를 추가했고,
+`frontend/src/components/ResultDetailDrawer.tsx`의 당기·전기 표 아래에
+연도를 열로, 재무 13항목을 행으로 배치한 이력 표를 추가했다 — Drawer가
+열려 선택된 `result.id`가 바뀔 때만(목록 로드 시 전체 미리 fetch하지 않고)
+`useEffect`로 lazy fetch하며, 빈 배열(매출액 제외 등)은 에러가 아니라
+안내 문구로 표시한다. 기존 `/results` 목록 API 호출 방식과 당기·전기
+표시 로직은 그대로 두었다. `npm run build`(tsc)/`npm run lint`(oxlint)
+통과 확인. **실제 화면에서의 end-to-end 확인은 이번에 하지 못했다** —
+이 시점에 기동 중이던 백엔드 프로세스(port 8000)가 STEP 7 반영 이전의
+구버전 코드로 떠 있었고, SQLite DB 파일에도 `jobs.history_years`/
+`financial_snapshots` 마이그레이션이 반영되지 않아(별도 프로세스로 최신
+코드를 띄워 확인해 보니 `no such column: jobs.history_years` 오류 발생),
+재기동 시 DB 스키마 정합이 필요한 상태였다 — 다음 세션에서 백엔드
+프로세스를 재기동(+ 필요 시 DB 스키마 갱신)한 뒤 실제 폼 제출/Drawer
+렌더링을 재확인할 것.
 
 ### M2에서 확정된 설계 판단 (상세개발계획.md §4-1과 함께 참고)
 
@@ -64,6 +163,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   시군구가 없는 주소 등 예외 케이스는 M3/M5 검수 단계에서 실측 후 보강 대상.
 - STEP 6(매출액 필터) 완료 시점에 Job을 `DONE`으로 표시한다(M2 시점에는 STEP4
   완료 시 바로 DONE으로 표시했으나, M3에서 STEP5/6이 붙으면서 이 지점으로 이동했다).
+- **STEP 2(list.json)는 `bgn_de`~`end_de`를 90일 단위로 분할해 구간별로 페이징
+  호출한다 (2026-07-15 실측 발견 후 당일 수정).** M4 프론트 스모크 테스트에서
+  corp_code 없이 날짜 범위만으로 list.json을 조회하면 조회 기간이 3개월(90일)을
+  넘을 수 없다는 제약을 실측했다(`status=100, message="corp_code가 없는 경우
+  검색기간은 3개월만 가능합니다"`가 즉시 반환되고 Job이 FAILED 처리됨). 상세개발
+  계획.md §7-1이 SearchPage 기간 입력의 기본값을 "최근 1년"으로 명시하고 있어
+  사용자가 기본값 그대로 제출하는 가장 흔한 경로가 100% 실패하는 문제였다.
+  `app/core/pipeline.py`의 `_split_period_into_windows()`가 전체 구간을 90일
+  이하(달력월 경계 계산의 엣지케이스를 피하기 위해 보수적으로 고정 일수 사용)
+  구간으로 나누고, `_collect_candidates()`가 구간마다 `by_corp` dict를 그대로
+  재사용하며 페이징 순회한다 — 여러 구간에 걸쳐 같은 회사가 여러 건(정정 포함)
+  잡혀도 corp_code 기준 dedup + rcept_no 최신 우선 로직이 구간을 넘나들며 그대로
+  동작한다. 진행률(`progress_done`/`progress_total`)은 "구간마다 최소 1페이지"로
+  초기 추정한 뒤 각 구간의 실제 `total_page`를 알게 되는 시점에 차이만큼 보정하는
+  방식으로 페이지 단위 누적 카운트를 유지한다. 별도 "기간 분할기" 클래스나 분할
+  일수를 설정값으로 빼는 등의 추상화는 과설계로 판단해 만들지 않았다 — STEP 2
+  함수 범위 안에서 처리한다. `POST /api/jobs`가 받는 조건 스키마나 프론트 계약은
+  바뀌지 않는다(프론트는 여전히 "최근 1년"을 그대로 보낼 수 있고, 분할은 백엔드
+  STEP 2 내부에서만 일어난다). 관련 테스트:
+  `backend/tests/test_pipeline.py`의
+  `test_split_period_into_windows_chunks_by_90_days`,
+  `test_split_period_into_windows_single_window_when_within_90_days`,
+  `test_collect_candidates_splits_period_over_90_days_and_dedupes_across_windows`.
 
 ### M3에서 확정된 설계 판단 (상세개발계획.md §4-4와 함께 참고)
 
