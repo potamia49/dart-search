@@ -103,6 +103,15 @@ DART 원문 링크 Drawer, 현재 필터를 반영한 Excel/CSV 다운로드)까
   총 7종), `backend/tests/test_api_jobs.py`(history_years 검증 2종),
   `backend/tests/test_api_results.py`(history 엔드포인트 5종).
 
+**M5 착수: 루트 README.md 작성 완료(2026-07-15).** 설치/실행(백엔드·프론트엔드
+공통)/API 키 발급 안내(OpenDART, 공공데이터포털)/사용 흐름/현재 진행 상황을
+정리한 [README.md](README.md)를 루트에 추가했다 — `frontend/README.md`(M4,
+프론트 세부 구조)는 그대로 유지하고 루트 README는 프로젝트 전체 개요 + 두
+백엔드/프론트를 아우르는 실행 안내를 담당하도록 역할을 나눴다. 상세개발계획.md
+§8 M5 체크리스트의 "README 작성"/"파싱 실패 건 재시도 기능"(M3에서 이미 구현)
+항목을 완료로 표시했다. 남은 M5 항목은 샘플 10개사 수동 검수와 실전 조건 풀
+실행(쿼터 상당량 소모 예정이라 사용자 확인 후 진행 예정)이다.
+
 **STEP 7 프론트엔드 연동 완료(2026-07-15).** `frontend/src/pages/SearchPage.tsx`에
 "재무 이력 조회 기간" `SegmentedControl`(2/4/6/10년, 기본 4년)을 추가해
 `POST /api/jobs` payload 최상위에 `history_years`를 함께 보낸다.
@@ -116,14 +125,19 @@ DART 원문 링크 Drawer, 현재 필터를 반영한 Excel/CSV 다운로드)까
 `useEffect`로 lazy fetch하며, 빈 배열(매출액 제외 등)은 에러가 아니라
 안내 문구로 표시한다. 기존 `/results` 목록 API 호출 방식과 당기·전기
 표시 로직은 그대로 두었다. `npm run build`(tsc)/`npm run lint`(oxlint)
-통과 확인. **실제 화면에서의 end-to-end 확인은 이번에 하지 못했다** —
-이 시점에 기동 중이던 백엔드 프로세스(port 8000)가 STEP 7 반영 이전의
-구버전 코드로 떠 있었고, SQLite DB 파일에도 `jobs.history_years`/
-`financial_snapshots` 마이그레이션이 반영되지 않아(별도 프로세스로 최신
-코드를 띄워 확인해 보니 `no such column: jobs.history_years` 오류 발생),
-재기동 시 DB 스키마 정합이 필요한 상태였다 — 다음 세션에서 백엔드
-프로세스를 재기동(+ 필요 시 DB 스키마 갱신)한 뒤 실제 폼 제출/Drawer
-렌더링을 재확인할 것.
+통과 확인. **실제 화면에서의 end-to-end 확인을 다음 세션(같은 날, 2026-07-15
+후반)에 완료했다.** 이전 세션 종료 시점에는 기동 중이던 백엔드 프로세스(port 8000)가
+STEP 7 반영 이전의 구버전 코드로 떠 있었고 `jobs.history_years` 컬럼 관련 오류가
+있었으나, 이번에 다시 확인해보니(누가/언제 고쳤는지는 불명확) `dart_search.db`에
+이미 `jobs.history_years` 컬럼과 `financial_snapshots` 테이블이 정상 존재했다.
+venv(Python 3.11.3)로 백엔드를 재기동(port 8000)한 뒤, `dart-frontend` 에이전트가
+Vite dev 서버 + Playwright(headless Chromium, `npm install --no-save`로 임시 설치,
+package.json 변경 없음)로 실제 폼 제출(경상남도 김해시, 2026-06-01~05,
+history_years=4 기본값) → Job 폴링 → Job #7 완료 → 결과 상세 Drawer의 "재무 이력
+(최근 N년)" 표에 2023~2026년 4개 연도 × 재무 13항목 값이 정상 렌더링됨을 확인했다
+(콘솔/네트워크 에러 없음, `GET /api/jobs/{id}/results/{result_id}/history` 정상
+응답). 코드 수정은 필요 없었다 — 실제 버그는 없었고 초기 스크립트 실패 2회는
+Playwright 셀렉터 문제였다. 테스트 중 실제 DART API 쿼터 30건 사용(555→585).
 
 ### M2에서 확정된 설계 판단 (상세개발계획.md §4-1과 함께 참고)
 
