@@ -113,6 +113,7 @@ export default function ResultDetailDrawer({ jobId, result, onClose }: ResultDet
           <Group>
             {result.parse_status && <Badge>{result.parse_status}</Badge>}
             {result.excluded_by_revenue === 1 && <Badge color="orange">매출액 제외</Badge>}
+            {result.excluded_by_assets === 1 && <Badge color="orange">총자산 제외</Badge>}
             {result.rcept_no && (
               <Anchor
                 href={`${DART_ORIGINAL_DOC_BASE}${result.rcept_no}`}

@@ -66,6 +66,7 @@ RESULT_COLUMN_LABELS: dict[str, str] = {
     "parse_status": "파싱상태",
     "parse_note": "파싱비고",
     "excluded_by_revenue": "매출액조건제외여부",
+    "excluded_by_assets": "총자산조건제외여부",  # §4-7-2, 2026-07-15 추가
 }
 
 # DataFrame 컬럼 순서(=RESULT_COLUMN_LABELS 순서, Result 모델 필드 순서와 동일).

@@ -108,9 +108,16 @@ from app.core.filters import (
     region_matches,
     revenue_matches,
 )
+from app.core.fsc_index import (
+    enrich_and_screen_financials,
+    filter_local_candidates,
+    is_fsc_index_stale,
+    resolve_candidate_pairs,
+)
 from app.models.corp_profile import CorpProfile
 from app.models.financial_snapshot import FinancialSnapshot
-from app.models.job import Job, JobStatus
+from app.models.fsc_corp_index import FscCorpIndex
+from app.models.job import Job, JobPhase, JobStatus
 from app.models.result import Result
 from app.parsers.audit_opinion import extract_audit_opinion
 from app.parsers.base import DIRECT_FINANCIAL_FIELDS, STANDARD_FINANCIAL_FIELDS, ParsedFinancials
@@ -127,6 +134,11 @@ STEP_DOCUMENT_DOWNLOAD = 4
 STEP_PARSE_FINANCIALS = 5
 STEP_REVENUE_FILTER = 6
 STEP_HISTORY_COLLECTION = 7
+
+# Phase 1(§4-7, 2026-07-15 M6 재설계) — A2~A4를 단일 스텝으로 취급해 진행률을
+# 표시한다. STEP 1~3(구 파이프라인의 corp_cache/list.json/company.json 전국
+# 순회)을 대체하므로 기존 STEP 번호와 겹치지 않게 새 번호를 쓴다.
+STEP_PHASE1_CANDIDATES = 10
 
 DEFAULT_HISTORY_YEARS = 4  # JobCreateRequest.history_years 기본값과 동일 (app/api/jobs.py)
 
@@ -168,18 +180,25 @@ def _checkpoint(
     job_id: int,
     *,
     status: str | None = None,
+    phase: str | None = None,
     current_step: int | None = None,
     progress_done: int | None = None,
     progress_total: int | None = None,
     error_msg: str | None | object = _UNSET,
 ) -> None:
-    """jobs 테이블에 진행 상태를 커밋 — 이것이 곧 "체크포인트"다."""
+    """jobs 테이블에 진행 상태를 커밋 — 이것이 곧 "체크포인트"다.
+
+    `phase`(§4-7-1, 2026-07-15 추가)는 Phase 1(`run_job_phase1`)/Phase 2
+    (`run_job_phase2`)가 완료 시점에 `jobs.phase`를 명시적으로 남길 때만 쓴다.
+    """
     with session_factory() as db:
         job = db.get(Job, job_id)
         if job is None:
             return
         if status is not None:
             job.status = status
+        if phase is not None:
+            job.phase = phase
         if current_step is not None:
             job.current_step = current_step
         if progress_done is not None:
@@ -786,6 +805,30 @@ def _run_revenue_filter(
     logger.info("STEP6 완료: 매출액 필터 적용 (job_id=%s)", job_id)
 
 
+def _run_assets_filter(
+    session_factory: sessionmaker[Session], job_id: int, cond_total_assets: dict[str, Any]
+) -> None:
+    """B4(구 STEP 6과 병행, §4-7-2 2026-07-15 추가): 당기 총자산(total_assets_cur)이
+    조건 범위를 벗어나면 excluded_by_assets=1.
+
+    `_run_revenue_filter`(STEP 6)와 완전히 동일한 패턴이다 — `revenue_matches`가
+    이름과 무관하게 순수 값 범위 판정이라 그대로 재사용한다. 총자산을 파싱하지
+    못한 건은 그대로 두고(제외하지 않음) parse_status로 검수하게 한다.
+    """
+    if cond_total_assets.get("min_krw") is None and cond_total_assets.get("max_krw") is None:
+        return
+
+    with session_factory() as db:
+        results = db.execute(select(Result).where(Result.job_id == job_id)).scalars().all()
+        for result in results:
+            if result.total_assets_cur is None:
+                continue
+            result.excluded_by_assets = 0 if revenue_matches(result.total_assets_cur, cond_total_assets) else 1
+        db.commit()
+
+    logger.info("STEP6(총자산) 완료: 총자산 필터 적용 (job_id=%s)", job_id)
+
+
 # ---------------------------------------------------------------------------
 # STEP 7 — 최근 N년 재무 이력 수집 (2026-07-15 추가)
 # ---------------------------------------------------------------------------
@@ -953,17 +996,21 @@ async def _run_history_collection(
     job_id: int,
     history_years: int,
 ) -> None:
-    """STEP 7: 최종 결과(`excluded_by_revenue=0`)에 남은 회사만 최근 N년 이력을 채운다.
+    """STEP 7: 최종 결과(`excluded_by_revenue=0` and `excluded_by_assets=0`)에
+    남은 회사만 최근 N년 이력을 채운다.
 
     STEP 3의 FSC 사전 추림과 동일한 "값비싼 호출은 후보를 최대한 추린 뒤에"
-    원칙 — 매출액 필터까지 다 통과한 회사만 대상으로 해 쿼터 영향을 최종
-    결과 건수에만 비례하게 한다.
+    원칙 — 매출액·총자산 필터까지 다 통과한 회사만 대상으로 해 쿼터 영향을
+    최종 결과 건수에만 비례하게 한다. `excluded_by_assets`는 §4-7-2(2026-07-15
+    추가) 총자산 필터 컬럼이다 — 이 조건을 쓰지 않는 기존 run_job() 흐름에서는
+    모든 행이 기본값 0이라 이 조건 추가로 동작이 바뀌지 않는다.
     """
     with session_factory() as db:
         rows = db.execute(
             select(Result.id, Result.corp_code).where(
                 Result.job_id == job_id,
                 Result.excluded_by_revenue == 0,
+                Result.excluded_by_assets == 0,
                 Result.corp_code.is_not(None),
             )
         ).all()
@@ -1013,7 +1060,11 @@ async def retry_failed_parsing(job_id: int) -> None:
     try:
         await _run_financial_parsing(session_factory, settings, job_id)
         cond_revenue: dict[str, Any] = json.loads(job.cond_revenue) if job.cond_revenue else {}
+        cond_total_assets: dict[str, Any] = (
+            json.loads(job.cond_total_assets) if job.cond_total_assets else {}
+        )
         _run_revenue_filter(session_factory, job_id, cond_revenue)
+        _run_assets_filter(session_factory, job_id, cond_total_assets)
         logger.info("Job %s 재파싱 완료", job_id)
     except JobCancelledError:
         logger.info("Job %s 재파싱 중 취소 감지", job_id)
@@ -1118,3 +1169,321 @@ async def run_job(job_id: int) -> None:
     finally:
         await dart_client.aclose()
         await fsc_client.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 — 공공데이터 발굴 (A2~A4, 상세개발계획.md §4-7/§4-7-1, 2026-07-15 M6 재설계)
+# ---------------------------------------------------------------------------
+#
+# run_job()(위, STEP 1~7)은 손대지 않고 그대로 둔다 — Phase 2(아래 run_job_phase2)가
+# 그 STEP 4~7 함수를 그대로 재사용한다. run_job_phase1()은 run_job()을 참고해
+# 만든 새 오케스트레이터로, STEP 1~3(corp_cache 갱신 + list.json 전국 수집 +
+# company.json 지역 필터)을 완전히 대체한다 — DART를 전혀 호출하지 않는다.
+#
+# **A1(FSC 전역 인덱스 전수 크롤, 약 10시간 소요 추정)은 이 함수 안에서
+# 트리거하지 않는다.** `fsc_corp_index`가 비어 있으면(한 번도 크롤되지
+# 않았으면) 이 Job은 안내 메시지와 함께 FAILED 처리된다 — 관리자가 별도로
+# `POST /api/meta/fsc-index/refresh`(app/api/meta.py)를 호출해 전역 인덱스를
+# 먼저 구축해야 한다. TTL이 지났지만 데이터 자체는 있으면(완전히 비어있지
+# 않으면) 경고 로그만 남기고 그 데이터로 계속 진행한다(오래된 데이터라도
+# 없는 것보다 낫다는 판단 — corp_profiles/corp_cache TTL 정책과 다른 점:
+# 저 둘은 "매 Job 실행 중 자연히 갱신"되지만, fsc_corp_index 전수 갱신은
+# 비용이 커 Job 실행 중 자동 갱신하지 않기 때문).
+
+
+def _insert_phase1_candidates_into_results(
+    session_factory: sessionmaker[Session],
+    job_id: int,
+    pairs: list[tuple[FscCorpIndex, str]],
+) -> int:
+    """A4가 확정한 (FscCorpIndex, corp_code) 쌍을 results에 선삽입.
+
+    corp_name/address/phone/ceo_name은 `fsc_corp_index`에서 아는 값까지만
+    채우고, revenue_cur/total_assets_cur는 A3 스크리닝 추정치를 임시로
+    채워둔다(§7-3 "phase=CANDIDATES Job의 결과는 후보 목록으로 표시 — A3
+    스크리닝 추정치를 보여준다"에 대응) — Phase 2가 원문을 파싱하면
+    `_apply_parsed_result`(STEP 5)가 이 값을 확정치로 덮어쓴다. induty_code/
+    fiscal_date/audit_opinion/parse_status 등 원문 파싱으로만 알 수 있는
+    값은 그대로 NULL로 둔다.
+    """
+    with session_factory() as db:
+        existing_corp_codes = {
+            row[0]
+            for row in db.execute(
+                select(Result.corp_code).where(Result.job_id == job_id)
+            ).all()
+        }
+        inserted = 0
+        for candidate, corp_code in pairs:
+            if corp_code in existing_corp_codes:
+                continue
+            db.add(
+                Result(
+                    job_id=job_id,
+                    corp_code=corp_code,
+                    corp_name=candidate.corp_name,
+                    address=candidate.address,
+                    phone=candidate.phone,
+                    ceo_name=candidate.ceo_name,
+                    revenue_cur=candidate.revenue_latest,
+                    total_assets_cur=candidate.total_assets_latest,
+                )
+            )
+            existing_corp_codes.add(corp_code)
+            inserted += 1
+        db.commit()
+    return inserted
+
+
+async def run_job_phase1(job_id: int) -> None:
+    """Phase 1(A2~A4)을 실행해 후보 corp_code를 확정하고 results에 선삽입한다.
+
+    완료 시 `status=DONE`, `phase=CANDIDATES`로 멈춘다 — Phase 2(재무정보
+    수집)는 사용자가 `POST /api/jobs/{id}/start-financials`를 호출해야
+    시작된다(§4-7-1). `run_job()`과 마찬가지로 예외는 이 함수 내부에서
+    흡수해 Job 상태에 반영한다(BackgroundTasks가 예외를 그냥 삼켜버리므로).
+    """
+    settings = get_settings()
+    session_factory = get_session_factory()
+
+    job = _load_job(session_factory, job_id)
+    if job is None:
+        logger.error("run_job_phase1: job_id=%s 를 찾을 수 없습니다.", job_id)
+        return
+    if job.status == JobStatus.CANCELLED:
+        logger.info("run_job_phase1: job_id=%s 는 이미 CANCELLED 상태 — 실행하지 않음.", job_id)
+        return
+
+    _checkpoint(
+        session_factory,
+        job_id,
+        status=JobStatus.RUNNING,
+        error_msg=None,
+        current_step=STEP_PHASE1_CANDIDATES,
+    )
+
+    with session_factory() as db:
+        has_index = db.execute(select(FscCorpIndex.id).limit(1)).first() is not None
+
+    if not has_index:
+        _checkpoint(
+            session_factory,
+            job_id,
+            status=JobStatus.FAILED,
+            error_msg=(
+                "fsc_corp_index가 비어 있습니다. 관리자가 먼저 "
+                "POST /api/meta/fsc-index/refresh로 금융위 전역 인덱스를 구축해야 합니다."
+            ),
+        )
+        logger.error("run_job_phase1: job_id=%s — fsc_corp_index가 비어 있어 실행 불가.", job_id)
+        return
+
+    if is_fsc_index_stale(session_factory, settings=settings):
+        logger.warning(
+            "run_job_phase1: job_id=%s — fsc_corp_index가 TTL(%s일)을 초과했지만 "
+            "기존 데이터로 계속 진행합니다. 필요하면 관리자가 갱신하세요.",
+            job_id,
+            settings.fsc_index_ttl_days,
+        )
+
+    cond_region: dict[str, Any] = json.loads(job.cond_region) if job.cond_region else {}
+    cond_revenue: dict[str, Any] = json.loads(job.cond_revenue) if job.cond_revenue else {}
+    cond_total_assets: dict[str, Any] = (
+        json.loads(job.cond_total_assets) if job.cond_total_assets else {}
+    )
+    cond_industry: list[str] = json.loads(job.cond_industry) if job.cond_industry else []
+
+    fsc_client = FscCorpInfoClient(settings=settings)
+    try:
+        _raise_if_cancelled(session_factory, job_id)
+        with session_factory() as db:
+            local_candidates = filter_local_candidates(
+                db, cond_region=cond_region, cond_industry=cond_industry
+            )
+            for row in local_candidates:
+                db.expunge(row)
+
+        _checkpoint(session_factory, job_id, progress_done=0, progress_total=len(local_candidates))
+        logger.info(
+            "Job %s Phase1 A2 완료: 지역/업종 로컬 필터 통과 %s개사", job_id, len(local_candidates)
+        )
+
+        _raise_if_cancelled(session_factory, job_id)
+        screened = await enrich_and_screen_financials(
+            fsc_client,
+            session_factory,
+            local_candidates,
+            cond_revenue=cond_revenue,
+            cond_total_assets=cond_total_assets,
+        )
+        logger.info("Job %s Phase1 A3 완료: 재무 스크리닝 통과 %s개사", job_id, len(screened))
+
+        _raise_if_cancelled(session_factory, job_id)
+        with session_factory() as db:
+            pairs = resolve_candidate_pairs(db, screened)
+
+        inserted = _insert_phase1_candidates_into_results(session_factory, job_id, pairs)
+        logger.info("Job %s Phase1 A4 완료: corp_code 확정/선삽입 %s개사", job_id, inserted)
+
+        _checkpoint(
+            session_factory,
+            job_id,
+            status=JobStatus.DONE,
+            phase=JobPhase.CANDIDATES,
+            progress_done=len(local_candidates),
+            progress_total=len(local_candidates),
+        )
+        logger.info("Job %s Phase1(A2~A4) 완료 — 후보 %s개사 확정", job_id, inserted)
+
+    except JobCancelledError:
+        logger.info("Job %s Phase1 실행 중 취소 감지 — 중단.", job_id)
+    except QuotaExceededError as exc:
+        # FSC는 DART와 별도 쿼터라 이번 스코프에서는 도달하지 않지만, 향후
+        # FSC 자체에 쿼터 관리가 도입될 경우를 대비해 방어적으로 처리한다.
+        logger.warning("Job %s Phase1 실행 중 쿼터 초과: %s", job_id, exc)
+        _checkpoint(session_factory, job_id, status=JobStatus.PAUSED_QUOTA, error_msg=str(exc))
+    except Exception as exc:  # noqa: BLE001 - 백그라운드 작업은 여기서 반드시 흡수해야 한다
+        logger.exception("Job %s Phase1 실행 중 예외 발생", job_id)
+        _checkpoint(session_factory, job_id, status=JobStatus.FAILED, error_msg=str(exc))
+    finally:
+        await fsc_client.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — 재무정보 크롤링 (B1~B5, 기존 STEP 4~7 재사용, §4-7/§4-7-1)
+# ---------------------------------------------------------------------------
+
+
+async def _backfill_latest_rcept_no_for_job(
+    dart_client: DartClient,
+    session_factory: sessionmaker[Session],
+    job_id: int,
+    history_years: int,
+) -> None:
+    """Phase 2 B2/B3 준비 단계: results에 이미 있는 corp_code마다 최신 감사보고서의
+    rcept_no를 찾아 채운다.
+
+    기존 STEP 4(`_run_document_download`)/STEP 5(`_run_financial_parsing`)는
+    `results.rcept_no`가 이미 채워져 있다는 전제로 동작한다(구 파이프라인에서는
+    STEP 2/3이 이를 채웠다). Phase 1(A1~A4)은 FSC 데이터만으로 후보를 확정하므로
+    rcept_no를 모른다 — 이 함수가 그 간극을 메운다. **새 다운로드/파싱 로직을
+    만들지 않고** 이미 STEP 7이 쓰는 `_fetch_all_disclosures_for_corp()`(corp_code
+    지정 list.json 페이징, 기간 제한 없음 실측)를 그대로 재사용해 후보 회사의
+    공시 목록만 가볍게 조회한다 — 실제 원문 다운로드는 뒤이은 STEP 4가 담당한다.
+    """
+    with session_factory() as db:
+        rows = db.execute(
+            select(Result.id, Result.corp_code).where(
+                Result.job_id == job_id,
+                Result.corp_code.is_not(None),
+                Result.rcept_no.is_(None),
+            )
+        ).all()
+
+    if not rows:
+        return
+
+    bgn_de, end_de = _history_window(history_years)
+    done = 0
+    total = len(rows)
+    for result_id, corp_code in rows:
+        if done % _CHECKPOINT_INTERVAL == 0:
+            _raise_if_cancelled(session_factory, job_id)
+
+        disclosures = await _fetch_all_disclosures_for_corp(dart_client, corp_code, bgn_de, end_de)
+        disclosures.sort(key=lambda item: item.get("rcept_no") or "", reverse=True)
+        latest_rcept_no = disclosures[0].get("rcept_no") if disclosures else None
+
+        if latest_rcept_no:
+            with session_factory() as db:
+                result = db.get(Result, result_id)
+                if result is not None:
+                    result.rcept_no = latest_rcept_no
+                    db.commit()
+
+        done += 1
+
+    logger.info(
+        "Phase2 rcept_no 백필 완료: %s/%s개사 (job_id=%s)",
+        sum(1 for _rid, code in rows if code),
+        total,
+        job_id,
+    )
+
+
+async def run_job_phase2(job_id: int) -> None:
+    """Phase 2(B1~B5)를 실행해 Phase 1이 확정한 corp_code 목록에 대해서만
+    재무 이력을 채운다.
+
+    `POST /api/jobs/{id}/start-financials`가 `phase=FINANCIALS`/`status=RUNNING`
+    으로 전환한 뒤 백그라운드로 호출한다. 입력은 "STEP 2가 모은 전국 후보"가
+    아니라 "이미 results에 있는(Phase 1이 확정한) corp_code 목록"이라는 점만
+    다르고, 실제 다운로드/파싱/필터 로직(STEP 4/5/6/7)은 전혀 새로 만들지
+    않고 그대로 재사용한다.
+    """
+    settings = get_settings()
+    settings.ensure_dirs()
+    session_factory = get_session_factory()
+
+    job = _load_job(session_factory, job_id)
+    if job is None:
+        logger.error("run_job_phase2: job_id=%s 를 찾을 수 없습니다.", job_id)
+        return
+    if job.status == JobStatus.CANCELLED:
+        logger.info("run_job_phase2: job_id=%s 는 이미 CANCELLED 상태 — 실행하지 않음.", job_id)
+        return
+
+    _checkpoint(session_factory, job_id, status=JobStatus.RUNNING, error_msg=None)
+
+    cond_revenue: dict[str, Any] = json.loads(job.cond_revenue) if job.cond_revenue else {}
+    cond_total_assets: dict[str, Any] = (
+        json.loads(job.cond_total_assets) if job.cond_total_assets else {}
+    )
+    history_years = job.history_years or DEFAULT_HISTORY_YEARS
+
+    dart_client = DartClient(settings=settings, session_factory=session_factory)
+    try:
+        # B2/B3 준비: results의 corp_code마다 최신 공시(rcept_no) 백필 —
+        # 기존 STEP4가 rcept_no를 입력으로 삼기 때문에 필요한 최소한의 준비 단계.
+        _raise_if_cancelled(session_factory, job_id)
+        _checkpoint(session_factory, job_id, current_step=STEP_DOCUMENT_DOWNLOAD)
+        await _backfill_latest_rcept_no_for_job(dart_client, session_factory, job_id, history_years)
+
+        # B3: 감사보고서 원문 다운로드 (기존 STEP 4 재사용)
+        _raise_if_cancelled(session_factory, job_id)
+        await _run_document_download(dart_client, session_factory, settings, job_id)
+
+        # B3: 재무제표 파싱(당기/전기 13항목) + 감사의견 추출 (기존 STEP 5 재사용, API 호출 없음)
+        _raise_if_cancelled(session_factory, job_id)
+        await _run_financial_parsing(session_factory, settings, job_id)
+
+        # B4: 매출액·총자산 최종 확정 필터 (기존 STEP 6 재사용 + 총자산 병행, §4-7-2)
+        _raise_if_cancelled(session_factory, job_id)
+        _run_revenue_filter(session_factory, job_id, cond_revenue)
+        _run_assets_filter(session_factory, job_id, cond_total_assets)
+
+        # B5: 최근 N년 재무 이력 수집 (기존 STEP 7 재사용)
+        _raise_if_cancelled(session_factory, job_id)
+        await _run_history_collection(
+            dart_client, session_factory, settings, job_id, history_years
+        )
+
+        _checkpoint(
+            session_factory,
+            job_id,
+            status=JobStatus.DONE,
+            phase=JobPhase.FINANCIALS,
+            current_step=STEP_HISTORY_COLLECTION,
+        )
+        logger.info("Job %s Phase2(B1~B5) 완료", job_id)
+
+    except JobCancelledError:
+        logger.info("Job %s Phase2 실행 중 취소 감지 — 중단.", job_id)
+    except QuotaExceededError as exc:
+        logger.warning("Job %s Phase2 실행 중 쿼터 초과로 일시정지: %s", job_id, exc)
+        _checkpoint(session_factory, job_id, status=JobStatus.PAUSED_QUOTA, error_msg=str(exc))
+    except Exception as exc:  # noqa: BLE001 - 백그라운드 작업은 여기서 반드시 흡수해야 한다
+        logger.exception("Job %s Phase2 실행 중 예외 발생", job_id)
+        _checkpoint(session_factory, job_id, status=JobStatus.FAILED, error_msg=str(exc))
+    finally:
+        await dart_client.aclose()

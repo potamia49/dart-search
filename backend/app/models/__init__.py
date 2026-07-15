@@ -9,6 +9,7 @@ from app.models.base import Base
 from app.models.corp_cache import CacheMeta, CorpCache
 from app.models.corp_profile import CorpProfile
 from app.models.financial_snapshot import FinancialSnapshot
+from app.models.fsc_corp_index import FscCorpIndex
 from app.models.job import Job
 from app.models.result import Result
 from app.models.api_usage import ApiUsage
@@ -19,6 +20,7 @@ __all__ = [
     "CacheMeta",
     "CorpProfile",
     "FinancialSnapshot",
+    "FscCorpIndex",
     "Job",
     "Result",
     "ApiUsage",

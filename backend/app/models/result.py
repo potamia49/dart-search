@@ -59,6 +59,11 @@ class Result(Base):
     parse_status: Mapped[str | None] = mapped_column(String, nullable=True)  # OK/PARTIAL/FAILED
     parse_note: Mapped[str | None] = mapped_column(String, nullable=True)
     excluded_by_revenue: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    excluded_by_assets: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # §4-7-2 총자산 필터(2026-07-15 추가) — excluded_by_revenue와 완전히 동일한
+    # 패턴. total_assets_cur(원문 파싱으로 확보되는 값) 기준 사후 확정 판정이며,
+    # Phase 1의 사전 스크리닝(app/core/fsc_index.py A3) 성공 여부와 무관하게
+    # 항상 정확히 동작한다.
 
 
 class ParseStatus:

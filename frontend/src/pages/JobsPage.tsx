@@ -12,9 +12,11 @@ import {
 } from '@mantine/core'
 import { notifications } from '@mantine/notifications'
 import { cancelJob, listJobs, resumeJob, retryFailedJob } from '../api/jobs'
-import { getQuota } from '../api/meta'
-import type { JobResponse, QuotaResponse } from '../types'
+import { getFscIndexStatus, getQuota } from '../api/meta'
+import type { FscIndexStatus, JobResponse, QuotaResponse } from '../types'
 import JobStatusBadge from '../components/JobStatusBadge'
+import JobPhaseBadge from '../components/JobPhaseBadge'
+import FscIndexStatusNote from '../components/FscIndexStatusNote'
 import { summarizeJobConditions } from '../util/jobSummary'
 
 const POLL_INTERVAL_MS = 2000
@@ -23,14 +25,20 @@ export default function JobsPage() {
   const navigate = useNavigate()
   const [jobs, setJobs] = useState<JobResponse[]>([])
   const [quota, setQuota] = useState<QuotaResponse | null>(null)
+  const [fscIndexStatus, setFscIndexStatus] = useState<FscIndexStatus | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
   const intervalRef = useRef<number | null>(null)
 
   const refresh = useCallback(async () => {
     try {
-      const [jobsData, quotaData] = await Promise.all([listJobs(), getQuota()])
+      const [jobsData, quotaData, fscIndexData] = await Promise.all([
+        listJobs(),
+        getQuota(),
+        getFscIndexStatus(),
+      ])
       setJobs(jobsData)
       setQuota(quotaData)
+      setFscIndexStatus(fscIndexData)
       setLoadError(null)
     } catch {
       setLoadError('작업 목록을 불러오지 못했습니다. 백엔드 서버가 실행 중인지 확인하세요.')
@@ -100,6 +108,8 @@ export default function JobsPage() {
         )}
       </Group>
 
+      <FscIndexStatusNote status={fscIndexStatus} />
+
       {loadError && <Alert color="red">{loadError}</Alert>}
 
       {jobs.length === 0 && !loadError && (
@@ -125,6 +135,7 @@ export default function JobsPage() {
                     <Group gap="sm">
                       <Text fw={600}>#{job.id} {job.name ?? '(이름 없음)'}</Text>
                       <JobStatusBadge status={job.status} />
+                      <JobPhaseBadge phase={job.phase} />
                     </Group>
                     <Text size="sm" c="dimmed">
                       {summarizeJobConditions(job)}

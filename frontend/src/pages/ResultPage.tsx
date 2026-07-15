@@ -20,12 +20,15 @@ import { ALL_COLUMNS, DEFAULT_VISIBLE_KEYS, formatCell } from '../util/resultCol
 import { summarizeJobConditions } from '../util/jobSummary'
 import ColumnToggle from '../components/ColumnToggle'
 import ResultDetailDrawer from '../components/ResultDetailDrawer'
+import CandidatesView from '../components/CandidatesView'
 
-type FilterTab = 'ALL' | 'OK' | 'PARTIAL' | 'FAILED' | 'EXCLUDED'
+type FilterTab = 'ALL' | 'OK' | 'PARTIAL' | 'FAILED' | 'EXCLUDED_REVENUE' | 'EXCLUDED_ASSETS'
 
 const PAGE_SIZE = 50
 
-function tabToParams(tab: FilterTab): { parse_status?: ParseStatus; excluded_by_revenue?: boolean } {
+function tabToParams(
+  tab: FilterTab,
+): { parse_status?: ParseStatus; excluded_by_revenue?: boolean; excluded_by_assets?: boolean } {
   switch (tab) {
     case 'OK':
       return { parse_status: 'OK' }
@@ -33,18 +36,18 @@ function tabToParams(tab: FilterTab): { parse_status?: ParseStatus; excluded_by_
       return { parse_status: 'PARTIAL' }
     case 'FAILED':
       return { parse_status: 'FAILED' }
-    case 'EXCLUDED':
+    case 'EXCLUDED_REVENUE':
       return { excluded_by_revenue: true }
+    case 'EXCLUDED_ASSETS':
+      return { excluded_by_assets: true }
     default:
       return {}
   }
 }
 
-export default function ResultPage() {
-  const { id } = useParams<{ id: string }>()
-  const jobId = Number(id)
-
-  const [job, setJob] = useState<JobResponse | null>(null)
+/** phase='FINANCIALS'(Phase 2 완료/진행) Job의 "확정 결과" 뷰 — M2~M4 시점과 동일한
+ * 결과 테이블/필터 탭/컬럼 토글/상세 Drawer/다운로드. §4-7-2로 "총자산 제외" 탭만 추가됐다. */
+function FinancialsResultsView({ jobId }: { jobId: number }) {
   const [tab, setTab] = useState<FilterTab>('ALL')
   const [page, setPage] = useState(1)
   const [data, setData] = useState<ResultListResponse | null>(null)
@@ -57,14 +60,6 @@ export default function ResultPage() {
   const [exporting, setExporting] = useState(false)
 
   useEffect(() => {
-    if (!Number.isFinite(jobId)) return
-    getJob(jobId)
-      .then(setJob)
-      .catch(() => setError('작업 정보를 불러오지 못했습니다.'))
-  }, [jobId])
-
-  useEffect(() => {
-    if (!Number.isFinite(jobId)) return
     setLoading(true)
     setError(null)
     listResults(jobId, { page, page_size: PAGE_SIZE, ...tabToParams(tab) })
@@ -103,16 +98,7 @@ export default function ResultPage() {
   const totalPages = data ? Math.max(1, Math.ceil(data.total / data.page_size)) : 1
 
   return (
-    <Stack maw={1200} mx="auto">
-      <div>
-        <Title order={2}>결과 조회 — 작업 #{jobId}</Title>
-        {job && (
-          <Text size="sm" c="dimmed">
-            {summarizeJobConditions(job)}
-          </Text>
-        )}
-      </div>
-
+    <Stack>
       <Group justify="space-between">
         <Tabs value={tab} onChange={handleTabChange}>
           <Tabs.List>
@@ -120,7 +106,8 @@ export default function ResultPage() {
             <Tabs.Tab value="OK">파싱 성공</Tabs.Tab>
             <Tabs.Tab value="PARTIAL">부분 성공</Tabs.Tab>
             <Tabs.Tab value="FAILED">실패 (검수 필요)</Tabs.Tab>
-            <Tabs.Tab value="EXCLUDED">매출액 제외 건</Tabs.Tab>
+            <Tabs.Tab value="EXCLUDED_REVENUE">매출액 제외 건</Tabs.Tab>
+            <Tabs.Tab value="EXCLUDED_ASSETS">총자산 제외 건</Tabs.Tab>
           </Tabs.List>
         </Tabs>
 
@@ -178,6 +165,41 @@ export default function ResultPage() {
       )}
 
       <ResultDetailDrawer jobId={jobId} result={selected} onClose={() => setSelected(null)} />
+    </Stack>
+  )
+}
+
+export default function ResultPage() {
+  const { id } = useParams<{ id: string }>()
+  const jobId = Number(id)
+
+  const [job, setJob] = useState<JobResponse | null>(null)
+  const [jobError, setJobError] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (!Number.isFinite(jobId)) return
+    getJob(jobId)
+      .then(setJob)
+      .catch(() => setJobError('작업 정보를 불러오지 못했습니다.'))
+  }, [jobId])
+
+  return (
+    <Stack maw={1200} mx="auto">
+      <div>
+        <Title order={2}>결과 조회 — 작업 #{jobId}</Title>
+        {job && (
+          <Text size="sm" c="dimmed">
+            {summarizeJobConditions(job)}
+          </Text>
+        )}
+      </div>
+
+      {jobError && <Alert color="red">{jobError}</Alert>}
+
+      {!job && !jobError && <Loader />}
+
+      {job && job.phase === 'CANDIDATES' && <CandidatesView job={job} />}
+      {job && job.phase === 'FINANCIALS' && <FinancialsResultsView jobId={jobId} />}
     </Stack>
   )
 }

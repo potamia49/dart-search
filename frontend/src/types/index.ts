@@ -11,6 +11,10 @@ export type JobStatus =
 
 export type ParseStatus = 'OK' | 'PARTIAL' | 'FAILED'
 
+/** M6 재설계(§4-7-1) — Job이 Phase 1(후보 확정)까지만 끝난 상태인지,
+ * Phase 2(재무정보 수집)까지 트리거된 상태인지. */
+export type JobPhase = 'CANDIDATES' | 'FINANCIALS'
+
 export interface RegionCondition {
   sido: string | null
   sigungu: string[]
@@ -20,6 +24,9 @@ export interface RevenueCondition {
   min_krw: number | null
   max_krw: number | null
 }
+
+/** cond_total_assets — RevenueCondition과 동일 스키마 (§4-7-2, 2026-07-15 추가). */
+export type TotalAssetsCondition = RevenueCondition
 
 export interface PeriodCondition {
   bgn_de: string
@@ -34,8 +41,12 @@ export interface JobCreateRequest {
   name: string | null
   region: RegionCondition
   revenue: RevenueCondition
+  total_assets: TotalAssetsCondition
   industry: string[]
-  period: PeriodCondition
+  // M6 재설계 이후 Phase 1(A2~A4)은 이 값을 쓰지 않는다 — 백엔드
+  // JobCreateRequest.period도 optional로 정정됐으므로 아예 보내지 않는다
+  // (SearchPage 화면에서도 이 입력을 노출하지 않는다 — §4-7-1).
+  period?: PeriodCondition
   history_years: HistoryYears
 }
 
@@ -45,14 +56,21 @@ export interface JobResponse {
   name: string | null
   cond_region: RegionCondition | null
   cond_revenue: RevenueCondition | null
+  cond_total_assets: TotalAssetsCondition | null
   cond_industry: string[] | null
   cond_period: PeriodCondition | null
   history_years: number | null
   status: JobStatus | null
+  phase: JobPhase | null
   current_step: number | null
   progress_done: number | null
   progress_total: number | null
   error_msg: string | null
+}
+
+/** POST /api/jobs/{id}/start-financials 요청 바디 (§4-7-1). */
+export interface StartFinancialsRequest {
+  history_years: HistoryYears
 }
 
 export interface ResultResponse {
@@ -100,6 +118,7 @@ export interface ResultResponse {
   parse_status: ParseStatus | null
   parse_note: string | null
   excluded_by_revenue: number
+  excluded_by_assets: number
 }
 
 export interface ResultListResponse {
@@ -125,6 +144,18 @@ export interface QuotaResponse {
   call_count: number
   limit: number
   remaining: number
+}
+
+/** GET /api/meta/fsc-index/status (2026-07-15 추가) — Phase 1이 쓰는
+ * fsc_corp_index 전역 인덱스의 마지막 완료 갱신 시각/TTL 초과 여부.
+ * 백엔드는 TTL이 지나도 자동 갱신하지 않고 로그에만 남기므로, 화면에서
+ * 바로 확인할 수 있게 노출한다. */
+export interface FscIndexStatus {
+  row_count: number
+  last_completed_at: string | null
+  ttl_days: number
+  is_stale: boolean
+  crawl_in_progress: boolean
 }
 
 export interface KeyCheckResult {

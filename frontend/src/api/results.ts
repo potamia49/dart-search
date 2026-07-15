@@ -6,6 +6,7 @@ export interface ListResultsParams {
   page_size?: number
   parse_status?: ParseStatus
   excluded_by_revenue?: boolean
+  excluded_by_assets?: boolean
 }
 
 export async function listResults(

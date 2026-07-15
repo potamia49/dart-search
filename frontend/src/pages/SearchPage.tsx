@@ -6,27 +6,18 @@ import {
   Group,
   NumberInput,
   Paper,
-  SegmentedControl,
   Stack,
   Text,
   TextInput,
   Title,
 } from '@mantine/core'
-import { DateInput } from '@mantine/dates'
 import { notifications } from '@mantine/notifications'
 import RegionSelect from '../components/RegionSelect'
 import IndustryTreeSelect from '../components/IndustryTreeSelect'
-import { getIndustries, getRegions } from '../api/meta'
+import FscIndexStatusNote from '../components/FscIndexStatusNote'
+import { getFscIndexStatus, getIndustries, getRegions } from '../api/meta'
 import { createJob } from '../api/jobs'
-import type { HistoryYears, IndustryMeta, RegionMeta } from '../types'
-import { oneYearAgoIso, todayIso, toYyyymmdd } from '../util/date'
-
-const HISTORY_YEARS_OPTIONS: { label: string; value: HistoryYears }[] = [
-  { label: '2년', value: 2 },
-  { label: '4년', value: 4 },
-  { label: '6년', value: 6 },
-  { label: '10년', value: 10 },
-]
+import type { FscIndexStatus, IndustryMeta, RegionMeta } from '../types'
 
 const EOK = 100_000_000 // 1억원 = 100,000,000원
 
@@ -35,6 +26,7 @@ export default function SearchPage() {
 
   const [regions, setRegions] = useState<RegionMeta[]>([])
   const [industries, setIndustries] = useState<IndustryMeta[]>([])
+  const [fscIndexStatus, setFscIndexStatus] = useState<FscIndexStatus | null>(null)
   const [metaError, setMetaError] = useState<string | null>(null)
 
   const [name, setName] = useState('')
@@ -42,10 +34,9 @@ export default function SearchPage() {
   const [sigungu, setSigungu] = useState<string[]>([])
   const [minRevenueEok, setMinRevenueEok] = useState<number | ''>('')
   const [maxRevenueEok, setMaxRevenueEok] = useState<number | ''>('')
+  const [minAssetsEok, setMinAssetsEok] = useState<number | ''>('')
+  const [maxAssetsEok, setMaxAssetsEok] = useState<number | ''>('')
   const [industryCodes, setIndustryCodes] = useState<string[]>([])
-  const [bgnDe, setBgnDe] = useState<string | null>(oneYearAgoIso())
-  const [endDe, setEndDe] = useState<string | null>(todayIso())
-  const [historyYears, setHistoryYears] = useState<HistoryYears>(4)
 
   const [submitting, setSubmitting] = useState(false)
 
@@ -64,18 +55,22 @@ export default function SearchPage() {
         if (!cancelled) setMetaError('지역/업종 목록을 불러오지 못했습니다. 백엔드 서버가 실행 중인지 확인하세요.')
       }
     }
+    async function loadFscIndexStatus() {
+      try {
+        const data = await getFscIndexStatus()
+        if (!cancelled) setFscIndexStatus(data)
+      } catch {
+        // FSC 인덱스 상태는 참고용 표시일 뿐이라 실패해도 검색 폼 자체는 그대로 쓸 수 있게 조용히 무시한다.
+      }
+    }
     loadMeta()
+    loadFscIndexStatus()
     return () => {
       cancelled = true
     }
   }, [])
 
   async function handleSubmit() {
-    if (!bgnDe || !endDe) {
-      notifications.show({ color: 'red', message: '공시 대상 기간을 입력해 주세요.' })
-      return
-    }
-
     setSubmitting(true)
     try {
       const job = await createJob({
@@ -85,11 +80,14 @@ export default function SearchPage() {
           min_krw: minRevenueEok === '' ? null : Math.round(minRevenueEok * EOK),
           max_krw: maxRevenueEok === '' ? null : Math.round(maxRevenueEok * EOK),
         },
+        total_assets: {
+          min_krw: minAssetsEok === '' ? null : Math.round(minAssetsEok * EOK),
+          max_krw: maxAssetsEok === '' ? null : Math.round(maxAssetsEok * EOK),
+        },
         industry: industryCodes,
-        period: { bgn_de: toYyyymmdd(bgnDe), end_de: toYyyymmdd(endDe) },
-        history_years: historyYears,
+        history_years: 4,
       })
-      notifications.show({ color: 'green', message: `수집 작업(#${job.id})을 시작했습니다.` })
+      notifications.show({ color: 'green', message: `후보 확정 작업(#${job.id})을 시작했습니다.` })
       navigate('/jobs')
     } catch {
       notifications.show({ color: 'red', message: '수집 작업 생성에 실패했습니다.' })
@@ -101,11 +99,16 @@ export default function SearchPage() {
   return (
     <Stack maw={860} mx="auto">
       <Title order={2}>검색 조건</Title>
+      <Text size="sm" c="dimmed">
+        지역/매출액/총자산/업종 조건으로 후보 회사를 먼저 확정합니다(Phase 1). 재무제표
+        다년치 수집(Phase 2)은 후보 목록을 확인한 뒤 별도로 시작합니다.
+      </Text>
       {metaError && (
         <Alert color="red" title="목록 로딩 실패">
           {metaError}
         </Alert>
       )}
+      <FscIndexStatusNote status={fscIndexStatus} />
 
       <Paper withBorder p="md">
         <Stack>
@@ -155,6 +158,28 @@ export default function SearchPage() {
 
       <Paper withBorder p="md">
         <Title order={4} mb="sm">
+          총자산 범위 (억원, 미입력 시 무제한)
+        </Title>
+        <Group grow>
+          <NumberInput
+            label="최소"
+            placeholder="예: 30"
+            min={0}
+            value={minAssetsEok}
+            onChange={(v) => setMinAssetsEok(v === '' ? '' : Number(v))}
+          />
+          <NumberInput
+            label="최대"
+            placeholder="예: 300"
+            min={0}
+            value={maxAssetsEok}
+            onChange={(v) => setMaxAssetsEok(v === '' ? '' : Number(v))}
+          />
+        </Group>
+      </Paper>
+
+      <Paper withBorder p="md">
+        <Title order={4} mb="sm">
           업종 (미선택 시 전체)
         </Title>
         <IndustryTreeSelect
@@ -169,48 +194,9 @@ export default function SearchPage() {
         )}
       </Paper>
 
-      <Paper withBorder p="md">
-        <Title order={4} mb="sm">
-          공시 대상 기간
-        </Title>
-        <Group grow>
-          <DateInput
-            label="시작일"
-            value={bgnDe}
-            onChange={setBgnDe}
-            valueFormat="YYYY-MM-DD"
-          />
-          <DateInput
-            label="종료일"
-            value={endDe}
-            onChange={setEndDe}
-            valueFormat="YYYY-MM-DD"
-          />
-        </Group>
-      </Paper>
-
-      <Paper withBorder p="md">
-        <Title order={4} mb="sm">
-          재무 이력 조회 기간
-        </Title>
-        <Text size="sm" c="dimmed" mb="xs">
-          매출액 조건까지 통과한 최종 결과 회사에 한해, 최근 N년치 연도별 재무정보를
-          추가로 수집합니다. 감사보고서가 당기·전기 비교식으로 작성되어 짝수 연수만
-          선택할 수 있습니다.
-        </Text>
-        <SegmentedControl
-          value={String(historyYears)}
-          onChange={(v) => setHistoryYears(Number(v) as HistoryYears)}
-          data={HISTORY_YEARS_OPTIONS.map((opt) => ({
-            label: opt.label,
-            value: String(opt.value),
-          }))}
-        />
-      </Paper>
-
       <Group justify="flex-end">
         <Button size="md" loading={submitting} onClick={handleSubmit}>
-          수집 시작
+          후보 확정 시작
         </Button>
       </Group>
     </Stack>

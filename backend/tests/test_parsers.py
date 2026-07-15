@@ -77,6 +77,9 @@ def test_account_name_aliases_cover_combined_loss_labels():
         ("-", 0.0),  # 명시적 0 표기 (부채/자산 항목이 실제로 0원인 경우)
         ("", None),  # 이 그룹에서 안 쓰는 열(당기/전기 상세·합계 중 미사용)
         ("  ", None),
+        ("16,507,429,508 ===============", 16507429508.0),  # 총계 행 밑줄 괘선 제거(2012 실측)
+        ("(393,502,380)===", -393502380.0),  # 음수 총계에 괘선이 붙어도 부호 유지
+        ("===============", None),  # 괘선만 있는 셀은 값 없음(None)
     ],
 )
 def test_parse_won_amount(text, expected):
@@ -221,6 +224,57 @@ def test_parse_xml_financials_recovers_from_malformed_entities():
     assert parsed.values_cur["revenue"] is not None
 
 
+def test_parse_xml_financials_2012_manufacturing_full_values():
+    """2012년 원문(rcept_no=20120110000138), 적정의견, 제조업 완전 재무제표.
+
+    M5 수동 검수(2026-07-15)로 확보한 2012년 구서식 ground truth. 원문 TE 셀:
+    자산총계 "154,984,976,730"(당기, 글자 사이 공백 라벨 "자      산      총 계"),
+    비유동부채 전기값이 "-"(명시적 0), 손익계산서 매출액(Ⅰ.매출액(주석 2))/
+    매출원가(Ⅱ.매출원가)/판관비(Ⅳ.판매비와관리비(주석 19))/영업이익(Ⅴ.영업이익)/
+    당기순이익("X.당기순이익" — 아스키 로마숫자 X 접두어)이 모두 채워져 있다.
+    """
+    raw = _read_fixture("20120110000138")
+    parsed = parse_xml_financials(raw)
+
+    assert parsed.parse_status == "OK"
+    assert parsed.parse_note is None
+    assert parsed.values_cur["current_assets"] == 102_648_344_396
+    assert parsed.values_cur["noncurrent_assets"] == 52_336_632_334
+    assert parsed.values_cur["total_assets"] == 154_984_976_730
+    assert parsed.values_prv["total_assets"] == 128_803_193_386
+    assert parsed.values_cur["noncurrent_liab"] == 1_200_000_000
+    assert parsed.values_prv["noncurrent_liab"] == 0.0  # 원문 표기 "-"
+    assert parsed.values_cur["total_liab"] == 65_072_747_576
+    assert parsed.values_cur["total_equity"] == 89_912_229_154
+    assert parsed.values_cur["revenue"] == 325_582_993_892
+    assert parsed.values_cur["cogs"] == 279_317_000_150
+    assert parsed.values_cur["sga"] == 26_272_969_092
+    assert parsed.values_cur["operating_income"] == 19_993_024_650
+    assert parsed.values_cur["net_income"] == 15_401_175_106  # "X.당기순이익"(아스키 X)
+
+
+def test_parse_xml_financials_recovers_underlined_total_cell():
+    """2012년 원문(rcept_no=20120110000471) — 총계 행 밑줄이 "===" 괘선으로
+    금액 셀에 섞여 들어온 케이스(자산총계 "16,507,429,508 ===============").
+
+    M5 수동 검수(2026-07-15)에서 발견: 이 괘선을 제거하지 않으면 float 변환이
+    실패해 total_assets가 None으로 누락됐다(유동/비유동자산은 정상이라 더 눈에
+    띔). parse_won_amount가 괘선을 제거하도록 고쳐 총계가 복구되는지 확인한다.
+    이 회사는 "영업수익/영업비용" 서비스업 서식이라 cogs/sga는 구조적으로
+    없어 전체는 PARTIAL이 맞다(태보산업 케이스와 동일 원리).
+    """
+    raw = _read_fixture("20120110000471")
+    parsed = parse_xml_financials(raw)
+
+    assert parsed.values_cur["total_assets"] == 16_507_429_508  # 괘선 제거 후 복구
+    assert parsed.values_prv["total_assets"] == 12_788_614_554
+    assert parsed.values_cur["current_assets"] == 15_062_356_917
+    assert parsed.values_cur["revenue"] == 34_546_090_293  # Ⅰ.영업수익
+    assert parsed.values_cur.get("cogs") is None  # 서비스업 서식 — 구조적 부재
+    assert parsed.values_cur.get("sga") is None
+    assert parsed.parse_status == "PARTIAL"
+
+
 def test_parse_xml_financials_invalid_xml_returns_failed():
     parsed = parse_xml_financials(b"not xml at all &&&")
     assert parsed.parse_status == "FAILED"
@@ -238,6 +292,8 @@ def test_parse_xml_financials_invalid_xml_returns_failed():
         ("20260630000895", "한정"),  # 홈마리나속초호텔 — "...제외하고는...공정하게 표시하고 있습니다"
         ("20260630001111", "의견거절"),  # 시대산업 — 명시적 "의견거절" 마커 + 재무제표 미첨부
         ("20120110000251", "적정"),  # 2012년 구서식 — "적정하게 표시하고 있습니다"
+        ("20120110000138", "적정"),  # 2012년 구서식(제조업) — M5 검수 추가
+        ("20260630000634", "의견거절"),  # 아이알디앤씨(2026, 재무제표 미첨부) — M5 검수 추가
     ],
 )
 def test_extract_audit_opinion_from_real_fixtures(rcept_no, expected):

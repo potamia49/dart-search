@@ -25,16 +25,16 @@ export function summarizeJobConditions(job: JobResponse): string {
     parts.push(`매출 ${formatEok(revenue.min_krw)}~${formatEok(revenue.max_krw)}`)
   }
 
+  const totalAssets = job.cond_total_assets
+  if (totalAssets && (totalAssets.min_krw !== null || totalAssets.max_krw !== null)) {
+    parts.push(`총자산 ${formatEok(totalAssets.min_krw)}~${formatEok(totalAssets.max_krw)}`)
+  }
+
   const industry = job.cond_industry
   if (industry && industry.length > 0) {
     parts.push(`업종 ${industry.length}개`)
   } else {
     parts.push('업종 전체')
-  }
-
-  const period = job.cond_period
-  if (period) {
-    parts.push(`${period.bgn_de}~${period.end_de}`)
   }
 
   return parts.join(' · ')

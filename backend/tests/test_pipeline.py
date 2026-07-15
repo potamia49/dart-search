@@ -21,6 +21,7 @@ from app.core import pipeline
 from app.core.dart_client import DartApiError, QuotaExceededError
 from app.models.corp_profile import CorpProfile
 from app.models.financial_snapshot import FinancialSnapshot
+from app.models.fsc_corp_index import FscCorpIndex
 from app.models.job import Job, JobStatus
 from app.models.result import ParseStatus, Result
 from app.parsers.base import ParsedFinancials
@@ -178,6 +179,7 @@ def _make_job(
     *,
     cond_region: dict | None = None,
     cond_revenue: dict | None = None,
+    cond_total_assets: dict | None = None,
     cond_industry: list[str] | None = None,
     cond_period: dict | None = None,
     history_years: int = 4,
@@ -189,6 +191,7 @@ def _make_job(
             name="test job",
             cond_region=json.dumps(cond_region or {}, ensure_ascii=False),
             cond_revenue=json.dumps(cond_revenue or {}, ensure_ascii=False),
+            cond_total_assets=json.dumps(cond_total_assets or {}, ensure_ascii=False),
             cond_industry=json.dumps(cond_industry or [], ensure_ascii=False),
             cond_period=json.dumps(cond_period or {"bgn_de": "20260101", "end_de": "20260131"}),
             history_years=history_years,
@@ -1421,3 +1424,228 @@ async def test_run_job_quota_exceeded_during_step7_pauses_and_resumes(
     assert snapshots == {"2025", "2024", "2023"}  # older_rcept의 당기(2024, 이미 있음)+전기(2023, 신규)
     assert main_rcept not in resumed_client.document_calls  # STEP4 캐시 재사용 — 재다운로드 없음
     assert resumed_client.document_calls == [older_rcept]
+
+
+# ---------------------------------------------------------------------------
+# run_job_phase1 / run_job_phase2 — M6 아키텍처 재설계(§4-7/§4-7-1, 2026-07-15)
+# ---------------------------------------------------------------------------
+
+
+class FakePhase1FscClient:
+    """run_job_phase1 통합 테스트용 더블 — A3(get_summary_financial_stat)만 필요하다.
+
+    A1(get_corp_basic_info)은 run_job_phase1이 절대 호출하지 않으므로 구현하지
+    않는다(호출되면 AttributeError로 즉시 드러나야 한다 — 의도적으로 없음).
+    """
+
+    def __init__(self, fina_stats: dict[tuple[str, str], dict] | None = None) -> None:
+        self.fina_stats = fina_stats or {}
+        self.closed = False
+
+    async def get_summary_financial_stat(self, *, crno: str, biz_year: str) -> dict:
+        item = self.fina_stats.get((crno, biz_year))
+        if item is None:
+            return {"response": {"body": {"totalCount": 0, "items": {"item": []}}}}
+        return {"response": {"body": {"totalCount": 1, "items": {"item": [item]}}}}
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_run_job_phase1_inserts_candidates_and_marks_done(
+    monkeypatch, db_session_factory, patch_pipeline_env
+):
+    """A2(로컬 필터)~A4(corp_code 확정)를 거쳐 results에 후보가 선삽입되고
+    phase=CANDIDATES/status=DONE으로 멈추는지 확인. DART는 전혀 호출하지 않는다."""
+    job_id = _make_job(
+        db_session_factory,
+        cond_region={"sido": "경남", "sigungu": ["김해시"]},
+        cond_revenue={"min_krw": 6_000_000_000, "max_krw": 15_000_000_000},
+        cond_industry=["C25"],
+    )
+
+    this_year = str(datetime.now().year)
+    with db_session_factory() as db:
+        db.add(
+            FscCorpIndex(
+                crno="1000000000001",
+                fss_corp_unq_no="00099001",
+                corp_name="김해기계",
+                address="경상남도 김해시 어딘가 1",
+                sido="경상남도",
+                sigungu="김해시",
+                sic_name="금속가공제품 제조업(기계 및 가구 제외)",
+            )
+        )
+        db.commit()
+
+    fsc_client = FakePhase1FscClient(
+        fina_stats={
+            ("1000000000001", this_year): {
+                "enpSaleAmt": "10000000000",
+                "enpTastAmt": "20000000000",
+                "bizYear": this_year,
+            }
+        }
+    )
+    monkeypatch.setattr(pipeline, "FscCorpInfoClient", lambda **kwargs: fsc_client)
+
+    await pipeline.run_job_phase1(job_id)
+
+    job = _get_job(db_session_factory, job_id)
+    assert job.status == JobStatus.DONE
+    assert job.phase == "CANDIDATES"
+    assert fsc_client.closed is True
+
+    with db_session_factory() as db:
+        results = db.execute(select(Result).where(Result.job_id == job_id)).scalars().all()
+    assert len(results) == 1
+    assert results[0].corp_code == "00099001"
+    assert results[0].corp_name == "김해기계"
+    assert results[0].revenue_cur == 10_000_000_000
+    assert results[0].total_assets_cur == 20_000_000_000
+    assert results[0].parse_status is None  # 원문 파싱은 Phase 2 몫 — 아직 NULL
+
+
+@pytest.mark.asyncio
+async def test_run_job_phase1_excludes_candidates_outside_local_filter(
+    monkeypatch, db_session_factory, patch_pipeline_env
+):
+    """A2(지역 필터) 통과 못 한 후보는 애초에 A3/A4로 넘어가지 않아야 한다."""
+    job_id = _make_job(db_session_factory, cond_region={"sido": "경남", "sigungu": ["김해시"]})
+
+    with db_session_factory() as db:
+        db.add(
+            FscCorpIndex(
+                crno="2000000000002",
+                fss_corp_unq_no="A0000088",
+                corp_name="서울상사",
+                sido="서울특별시",
+                sigungu="강남구",
+            )
+        )
+        db.commit()
+
+    fsc_client = FakePhase1FscClient()
+    monkeypatch.setattr(pipeline, "FscCorpInfoClient", lambda **kwargs: fsc_client)
+
+    await pipeline.run_job_phase1(job_id)
+
+    job = _get_job(db_session_factory, job_id)
+    assert job.status == JobStatus.DONE
+    with db_session_factory() as db:
+        results = db.execute(select(Result).where(Result.job_id == job_id)).scalars().all()
+    assert results == []
+
+
+@pytest.mark.asyncio
+async def test_run_job_phase1_fails_when_fsc_index_empty(
+    monkeypatch, db_session_factory, patch_pipeline_env
+):
+    """fsc_corp_index가 아직 한 번도 크롤되지 않았으면(A1 미실행) Job은 FAILED로
+    안내 메시지와 함께 종료돼야 한다 — Job 실행 중 전수 크롤을 트리거하지 않는다."""
+    job_id = _make_job(db_session_factory)
+
+    fsc_client = FakePhase1FscClient()
+    monkeypatch.setattr(pipeline, "FscCorpInfoClient", lambda **kwargs: fsc_client)
+
+    await pipeline.run_job_phase1(job_id)
+
+    job = _get_job(db_session_factory, job_id)
+    assert job.status == JobStatus.FAILED
+    assert "fsc_corp_index" in (job.error_msg or "")
+
+
+@pytest.mark.asyncio
+async def test_run_job_phase2_reuses_step4_7_for_existing_results_only(
+    monkeypatch, db_session_factory, patch_pipeline_env
+):
+    """Phase 2는 STEP2/3(전국 후보 수집/company.json)을 전혀 호출하지 않고,
+    이미 results에 있는 corp_code만 대상으로 기존 STEP4~7을 재사용해야 한다."""
+    monkeypatch.setattr(pipeline, "parse_xml_financials", _fake_parse_xml_financials)
+
+    job_id = _make_job(
+        db_session_factory,
+        cond_revenue={"min_krw": 1_000, "max_krw": 10_000},
+        history_years=2,
+    )
+    with db_session_factory() as db:
+        db.add(Result(job_id=job_id, corp_code="A1", corp_name="테스트상사"))
+        db.commit()
+
+    rcept_no = "20260601000001"
+    disclosure_page = {
+        "status": "000",
+        "total_page": 1,
+        "list": [{"corp_code": "A1", "corp_name": "테스트상사", "rcept_no": rcept_no}],
+    }
+    doc_zip = _history_doc_zip(
+        "20251231", revenue_cur=5_000, revenue_prv=4_000, file_name=f"{rcept_no}.xml"
+    )
+    fake_client = FakeDartClient(
+        disclosure_pages_by_corp={"A1": [disclosure_page]},
+        documents={rcept_no: doc_zip},
+    )
+    monkeypatch.setattr(pipeline, "DartClient", lambda **kwargs: fake_client)
+
+    await pipeline.run_job_phase2(job_id)
+
+    job = _get_job(db_session_factory, job_id)
+    assert job.status == JobStatus.DONE
+    assert job.phase == "FINANCIALS"
+    assert fake_client.company_calls == []  # STEP3(company.json)는 전혀 호출되지 않음
+
+    with db_session_factory() as db:
+        result = db.execute(select(Result).where(Result.job_id == job_id)).scalar_one()
+        snapshots = {
+            s.fiscal_year
+            for s in db.execute(
+                select(FinancialSnapshot).where(FinancialSnapshot.result_id == result.id)
+            ).scalars().all()
+        }
+    assert result.rcept_no == rcept_no
+    assert result.revenue_cur == 5_000
+    assert result.excluded_by_revenue == 0
+    assert snapshots == {"2025", "2024"}
+
+
+@pytest.mark.asyncio
+async def test_run_job_phase2_applies_assets_filter(
+    monkeypatch, db_session_factory, patch_pipeline_env
+):
+    """B4가 매출액과 총자산을 나란히 최종 확정하는지 확인(§4-7-2)."""
+    monkeypatch.setattr(pipeline, "parse_xml_financials", _fake_parse_xml_financials)
+
+    job_id = _make_job(
+        db_session_factory,
+        cond_total_assets={"min_krw": 100_000, "max_krw": 200_000},
+        history_years=2,
+    )
+    with db_session_factory() as db:
+        db.add(Result(job_id=job_id, corp_code="A1", corp_name="테스트상사"))
+        db.commit()
+
+    rcept_no = "20260601000002"
+    disclosure_page = {
+        "status": "000",
+        "total_page": 1,
+        "list": [{"corp_code": "A1", "corp_name": "테스트상사", "rcept_no": rcept_no}],
+    }
+    # _fake_parse_xml_financials는 revenue만 채우므로 total_assets_cur는 None으로
+    # 남는다 — 총자산을 파싱 못 한 건은 제외하지 않는다는 §4-3/§4-7-2 원칙 확인.
+    doc_zip = _history_doc_zip(
+        "20251231", revenue_cur=5_000, revenue_prv=4_000, file_name=f"{rcept_no}.xml"
+    )
+    fake_client = FakeDartClient(
+        disclosure_pages_by_corp={"A1": [disclosure_page]},
+        documents={rcept_no: doc_zip},
+    )
+    monkeypatch.setattr(pipeline, "DartClient", lambda **kwargs: fake_client)
+
+    await pipeline.run_job_phase2(job_id)
+
+    with db_session_factory() as db:
+        result = db.execute(select(Result).where(Result.job_id == job_id)).scalar_one()
+    assert result.total_assets_cur is None
+    assert result.excluded_by_assets == 0  # 값을 모르면 제외하지 않는다

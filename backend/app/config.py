@@ -47,11 +47,19 @@ class Settings(BaseSettings):
     # --- 캐시 갱신 주기 (일) ---
     corp_cache_ttl_days: int = 7
     corp_profile_ttl_days: int = 180
+    # fsc_corp_index(§4-7 Phase 1 A1) 전역 인덱스 TTL. corp_profile_ttl_days와
+    # 같은 철학(180일)이지만 완전히 다른 캐시 테이블의 갱신 주기라 별도 설정으로 둔다.
+    fsc_index_ttl_days: int = 180
 
     # --- 외부 API Base URL (하드코딩 X 대상은 아니지만, 한 곳에서 관리) ---
     dart_base_url: str = "https://opendart.fss.or.kr/api"
     data_go_kr_fsc_corp_base_url: str = (
         "https://apis.data.go.kr/1160100/service/GetCorpBasicInfoService_V2"
+    )
+    # 금융위원회_기업 재무정보 API (§4-7 스파이크로 확인된 실제 base URL,
+    # 2026-07-15 — 기업기본정보(GetCorpBasicInfoService_V2)와는 별개 서비스).
+    data_go_kr_fsc_finstat_base_url: str = (
+        "https://apis.data.go.kr/1160100/service/GetFinaStatInfoService_V2"
     )
 
     def ensure_dirs(self) -> None:

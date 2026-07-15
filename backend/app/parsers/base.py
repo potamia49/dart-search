@@ -94,6 +94,12 @@ _FOOTNOTE_SUFFIX_RE = re.compile(r"\(\s*(?:주석|주)?[\s0-9,]*\)\s*$")
 # 금액 문자열에서 콤마/공백 제거용
 _AMOUNT_CLEAN_RE = re.compile(r"[,\s　]")
 
+# 총계 행의 밑줄(이중선)이 "===============" 같은 ASCII 괘선으로 금액 셀에 그대로
+# 섞여 들어오는 실측 사례가 있다(2012년 원문 20120110000471 자산총계
+# "16,507,429,508 ==============="). 이 괘선을 제거하지 않으면 float 변환이 실패해
+# 총계가 None으로 누락된다("=" 문자는 정상 금액에는 절대 나타나지 않으므로 안전).
+_RULE_CHARS = "=＝"
+
 # 빈 문자열: 당기/전기 그룹 내 "이 열은 안 쓰는 열"이라 값이 없음(None).
 # "-"류: 원문이 명시적으로 0을 표기하는 관용 표기(예: 당기 비유동부채가 0원인
 # 경우도 숫자 0 대신 "-"로 적는다) — None이 아니라 0.0으로 처리해야 한다.
@@ -127,6 +133,9 @@ def parse_won_amount(text: str) -> float | None:
     괄호 표기는 음수, "-"/빈 문자열은 값 없음(None)으로 처리한다.
     """
     raw = (text or "").strip()
+    if _RULE_CHARS[0] in raw or _RULE_CHARS[1] in raw:
+        # 총계 행 밑줄("16,507,429,508 ===============")의 괘선을 앞뒤에서 제거.
+        raw = raw.strip(_RULE_CHARS).strip()
     if raw in _BLANK_AMOUNT_VALUES:
         return None
     if raw in _ZERO_AMOUNT_VALUES:
