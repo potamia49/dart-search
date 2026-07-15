@@ -1649,3 +1649,38 @@ async def test_run_job_phase2_applies_assets_filter(
         result = db.execute(select(Result).where(Result.job_id == job_id)).scalar_one()
     assert result.total_assets_cur is None
     assert result.excluded_by_assets == 0  # 값을 모르면 제외하지 않는다
+
+
+@pytest.mark.asyncio
+async def test_backfill_marks_result_failed_when_no_disclosure_found(
+    monkeypatch, db_session_factory, patch_pipeline_env
+):
+    """감사보고서 공시를 하나도 못 찾은 후보는 parse_status=FAILED로 명시하고,
+    Phase 1의 A3 추정치(revenue_cur/total_assets_cur)를 지워야 한다 — 이 값이
+    확정치인 것처럼 남아 B4 필터에 쓰이면 안 된다(회귀 테스트)."""
+    job_id = _make_job(db_session_factory, cond_revenue={"min_krw": 0, "max_krw": 10**12})
+    with db_session_factory() as db:
+        db.add(
+            Result(
+                job_id=job_id,
+                corp_code="A1",
+                corp_name="테스트상사",
+                revenue_cur=999_999,  # Phase 1 A3 추정치(공시를 못 찾으면 지워져야 함)
+                total_assets_cur=888_888,
+            )
+        )
+        db.commit()
+
+    empty_page = {"status": "013", "list": [], "total_page": 1}
+    fake_client = FakeDartClient(disclosure_pages_by_corp={"A1": [empty_page]})
+    monkeypatch.setattr(pipeline, "DartClient", lambda **kwargs: fake_client)
+
+    await pipeline.run_job_phase2(job_id)
+
+    with db_session_factory() as db:
+        result = db.execute(select(Result).where(Result.job_id == job_id)).scalar_one()
+    assert result.rcept_no is None
+    assert result.parse_status == ParseStatus.FAILED
+    assert result.revenue_cur is None
+    assert result.total_assets_cur is None
+    assert result.excluded_by_revenue == 0  # 값을 모르면 제외하지 않는다(기존 원칙 그대로)

@@ -118,7 +118,7 @@ from app.models.corp_profile import CorpProfile
 from app.models.financial_snapshot import FinancialSnapshot
 from app.models.fsc_corp_index import FscCorpIndex
 from app.models.job import Job, JobPhase, JobStatus
-from app.models.result import Result
+from app.models.result import ParseStatus, Result
 from app.parsers.audit_opinion import extract_audit_opinion
 from app.parsers.base import DIRECT_FINANCIAL_FIELDS, STANDARD_FINANCIAL_FIELDS, ParsedFinancials
 from app.parsers.pdf_parser import parse_pdf_financials
@@ -1202,9 +1202,12 @@ def _insert_phase1_candidates_into_results(
     채우고, revenue_cur/total_assets_cur는 A3 스크리닝 추정치를 임시로
     채워둔다(§7-3 "phase=CANDIDATES Job의 결과는 후보 목록으로 표시 — A3
     스크리닝 추정치를 보여준다"에 대응) — Phase 2가 원문을 파싱하면
-    `_apply_parsed_result`(STEP 5)가 이 값을 확정치로 덮어쓴다. induty_code/
-    fiscal_date/audit_opinion/parse_status 등 원문 파싱으로만 알 수 있는
-    값은 그대로 NULL로 둔다.
+    `_apply_parsed_result`(STEP 5)가 이 값을 확정치로 덮어쓴다.
+    `induty_name`도 같은 이유로 `fsc_corp_index.sic_name`(A2가 업종 매칭에
+    쓰는 자유 텍스트, 느슨한 매칭이라 완벽하지 않음)을 임시 표시값으로 채워
+    후보 목록에서 업종을 확인할 수 있게 한다 — DART 표준 KSIC 코드
+    (`induty_code`)는 여전히 원문 파싱으로만 알 수 있으므로 NULL로 둔다.
+    fiscal_date/audit_opinion/parse_status 등 나머지 원문 전용 값도 NULL이다.
     """
     with session_factory() as db:
         existing_corp_codes = {
@@ -1227,6 +1230,7 @@ def _insert_phase1_candidates_into_results(
                     ceo_name=candidate.ceo_name,
                     revenue_cur=candidate.revenue_latest,
                     total_assets_cur=candidate.total_assets_latest,
+                    induty_name=candidate.sic_name,
                 )
             )
             existing_corp_codes.add(corp_code)
@@ -1385,6 +1389,7 @@ async def _backfill_latest_rcept_no_for_job(
 
     bgn_de, end_de = _history_window(history_years)
     done = 0
+    found = 0
     total = len(rows)
     for result_id, corp_code in rows:
         if done % _CHECKPOINT_INTERVAL == 0:
@@ -1394,21 +1399,25 @@ async def _backfill_latest_rcept_no_for_job(
         disclosures.sort(key=lambda item: item.get("rcept_no") or "", reverse=True)
         latest_rcept_no = disclosures[0].get("rcept_no") if disclosures else None
 
-        if latest_rcept_no:
-            with session_factory() as db:
-                result = db.get(Result, result_id)
-                if result is not None:
+        with session_factory() as db:
+            result = db.get(Result, result_id)
+            if result is not None:
+                if latest_rcept_no:
                     result.rcept_no = latest_rcept_no
-                    db.commit()
+                    found += 1
+                else:
+                    # 공시를 못 찾으면 Phase 1의 A3 추정치(revenue_cur/total_assets_cur)가
+                    # 확정치인 것처럼 영구히 남아 B4 필터에 쓰이는 것을 막는다 — FAILED로
+                    # 명시해 검수 필요 건으로 노출하고, 미확정 추정치는 지운다.
+                    result.parse_status = ParseStatus.FAILED
+                    result.parse_note = "최근 감사보고서 공시를 찾을 수 없음(Phase 1 추정치만 존재)"
+                    result.revenue_cur = None
+                    result.total_assets_cur = None
+                db.commit()
 
         done += 1
 
-    logger.info(
-        "Phase2 rcept_no 백필 완료: %s/%s개사 (job_id=%s)",
-        sum(1 for _rid, code in rows if code),
-        total,
-        job_id,
-    )
+    logger.info("Phase2 rcept_no 백필 완료: %s/%s개사 (job_id=%s)", found, total, job_id)
 
 
 async def run_job_phase2(job_id: int) -> None:

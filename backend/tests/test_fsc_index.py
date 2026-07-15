@@ -196,6 +196,28 @@ async def test_get_fsc_index_status_mid_crawl_reports_in_progress(db_session_fac
     assert status["is_stale"] is True
 
 
+@pytest.mark.asyncio
+async def test_get_fsc_index_status_reports_in_progress_during_second_crawl(db_session_factory):
+    """최초 완주 후 두 번째(증분) 크롤이 도는 중에도 crawl_in_progress=True여야 한다.
+
+    회귀 테스트 — 이전에는 첫 완주 시 남은 last_completed_at 때문에 두 번째
+    크롤부터는 실제로 몇 시간 동안 돌고 있어도 crawl_in_progress가 항상
+    False로 보고되는 버그가 있었다.
+    """
+    page = _wrap_items(total_count=1, items=[_item(crno="1111111111111", corpNm="A사")])
+    client = FakeFscIndexClient(pages=[page])
+    await fsc_index.crawl_fsc_index(client, db_session_factory, num_of_rows=1)
+    assert fsc_index.get_fsc_index_status(db_session_factory)["crawl_in_progress"] is False
+
+    page2 = _wrap_items(total_count=2, items=[_item(crno="2222222222222", corpNm="B사")])
+    client2 = FakeFscIndexClient(pages=[page2])
+    await fsc_index.crawl_fsc_index(client2, db_session_factory, force=True, max_pages=1, num_of_rows=1)
+
+    status = fsc_index.get_fsc_index_status(db_session_factory)
+    assert status["crawl_in_progress"] is True
+    assert status["last_completed_at"] is None
+
+
 # ---------------------------------------------------------------------------
 # A2 — 로컬 필터 (지역 + 업종, API 호출 없음)
 # ---------------------------------------------------------------------------

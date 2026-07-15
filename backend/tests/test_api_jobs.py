@@ -123,6 +123,19 @@ def test_create_job_rejects_invalid_history_years(monkeypatch):
         app_main.app.dependency_overrides.clear()
 
 
+def test_create_job_rejects_sigungu_without_sido(monkeypatch):
+    """sido 없이 sigungu만 지정하면 422 — filter_local_candidates가 sido 선필터
+    없이 fsc_corp_index 전체(최대 약 128만 행)를 메모리로 로드하는 것을 막는다."""
+    client, _calls, _phase2_calls = _build_test_client(monkeypatch)
+    try:
+        payload = _sample_payload()
+        payload["region"] = {"sido": None, "sigungu": ["김해시"]}
+        resp = client.post("/api/jobs", json=payload)
+        assert resp.status_code == 422
+    finally:
+        app_main.app.dependency_overrides.clear()
+
+
 def test_get_job_not_found_returns_404(monkeypatch):
     client, _calls, _phase2_calls = _build_test_client(monkeypatch)
     try:

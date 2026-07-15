@@ -26,8 +26,8 @@ from datetime import datetime
 from typing import Any, Literal
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
-from pydantic import BaseModel, Field
-from sqlalchemy import select
+from pydantic import BaseModel, Field, model_validator
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db
@@ -48,6 +48,17 @@ class RegionCondition(BaseModel):
 
     sido: str | None = None
     sigungu: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _sigungu_requires_sido(self) -> "RegionCondition":
+        # Phase 1 A2(`app/core/fsc_index.py::filter_local_candidates`)는 sido가
+        # 있어야만 SQL WHERE로 fsc_corp_index(최대 약 128만 행)를 먼저 좁힌다 —
+        # sigungu만 있고 sido가 없으면 전체 인덱스를 메모리로 로드하게 되어
+        # OOM/장시간 정지 위험이 있다. 프론트는 항상 sido와 함께 보내지만
+        # API를 직접 호출하는 경로까지 막기 위해 여기서 거부한다.
+        if self.sigungu and not self.sido:
+            raise ValueError("sigungu를 지정하려면 sido도 함께 지정해야 합니다.")
+        return self
 
 
 class RevenueCondition(BaseModel):
@@ -219,20 +230,34 @@ async def resume_job(
     `job.phase`에 따라 이어서 실행할 함수가 다르다 — `FINANCIALS`면 Phase 2
     (`run_job_phase2`), 그 외(`CANDIDATES`)면 Phase 1(`run_job_phase1`)을
     재실행한다(§4-7-1).
+
+    `start_financials`와 동일하게 상태 확인+전환을 조건부 `UPDATE` 하나로
+    묶어 거의 동시에 들어온 중복 resume 요청 중 하나만 실제로 백그라운드
+    태스크를 큐잉하도록 한다.
     """
     job = db.get(Job, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job을 찾을 수 없습니다.")
-    if job.status not in (JobStatus.PAUSED_QUOTA, JobStatus.FAILED):
+    phase = job.phase
+
+    result = db.execute(
+        update(Job)
+        .where(
+            Job.id == job_id,
+            Job.status.in_((JobStatus.PAUSED_QUOTA, JobStatus.FAILED)),
+        )
+        .values(status=JobStatus.PENDING)
+    )
+    db.commit()
+
+    job = db.get(Job, job_id)
+    if result.rowcount == 0:
         raise HTTPException(
             status_code=400,
             detail=f"resume 가능한 상태가 아닙니다 (현재 status={job.status}).",
         )
-    job.status = JobStatus.PENDING
-    db.commit()
-    db.refresh(job)
 
-    if job.phase == JobPhase.FINANCIALS:
+    if phase == JobPhase.FINANCIALS:
         background_tasks.add_task(run_job_phase2, job.id)
     else:
         background_tasks.add_task(run_job_phase1, job.id)
@@ -256,11 +281,27 @@ async def start_financials(
 
     사용자가 후보 목록(ResultPage "후보 목록" 뷰)을 검토한 뒤 수집기간(2/4/6/10년)을
     선택해 호출한다 — 그 외 상태의 Job은 400으로 거부한다(§4-7-1).
+
+    상태 확인과 전환을 단일 조건부 `UPDATE`로 묶어 원자적으로 처리한다 —
+    버튼 연타 등으로 거의 동시에 두 요청이 들어와도 `read(status==DONE 확인) →
+    write(FINANCIALS로 전환)` 사이에 경쟁이 끼어들 여지가 없다(둘 중 하나만
+    `rowcount==1`을 받고, 다른 하나는 이미 바뀐 상태를 보고 400을 받는다).
     """
+    result = db.execute(
+        update(Job)
+        .where(Job.id == job_id, Job.phase == JobPhase.CANDIDATES, Job.status == JobStatus.DONE)
+        .values(
+            history_years=payload.history_years,
+            phase=JobPhase.FINANCIALS,
+            status=JobStatus.PENDING,
+        )
+    )
+    db.commit()
+
     job = db.get(Job, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job을 찾을 수 없습니다.")
-    if job.phase != JobPhase.CANDIDATES or job.status != JobStatus.DONE:
+    if result.rowcount == 0:
         raise HTTPException(
             status_code=400,
             detail=(
@@ -269,12 +310,6 @@ async def start_financials(
                 "phase=CANDIDATES이고 status=DONE인 Job만 가능합니다."
             ),
         )
-
-    job.history_years = payload.history_years
-    job.phase = JobPhase.FINANCIALS
-    job.status = JobStatus.PENDING
-    db.commit()
-    db.refresh(job)
 
     background_tasks.add_task(run_job_phase2, job.id)
     return JobResponse.from_job(job)
@@ -290,7 +325,11 @@ async def retry_failed_results(
 
     STEP 1~4(후보 수집/필터/원문 다운로드)는 다시 하지 않는다 — 이미
     `results`/`DOCUMENT_CACHE_DIR`에 있는 데이터로 파싱만 재시도한다
-    (`app/core/pipeline.py::retry_failed_parsing`).
+    (`app/core/pipeline.py::retry_failed_parsing`). `rcept_no`가 없는 FAILED건
+    (Phase 2 `_backfill_latest_rcept_no_for_job`이 감사보고서 공시 자체를 못
+    찾은 경우 — 열어볼 원문이 아예 없음)은 리셋 대상에서 제외한다 — 포함하면
+    `_run_financial_parsing`이 `rcept_no IS NOT NULL` 조건 때문에 그 건을
+    다시 열지 않아 parse_status만 NULL로 되돌아간 채 영영 갇히게 된다.
     """
     job = db.get(Job, job_id)
     if job is None:
@@ -298,7 +337,11 @@ async def retry_failed_results(
 
     failed_results = (
         db.execute(
-            select(Result).where(Result.job_id == job_id, Result.parse_status == ParseStatus.FAILED)
+            select(Result).where(
+                Result.job_id == job_id,
+                Result.parse_status == ParseStatus.FAILED,
+                Result.rcept_no.is_not(None),
+            )
         )
         .scalars()
         .all()

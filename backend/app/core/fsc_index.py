@@ -140,7 +140,11 @@ def get_fsc_index_status(
 
     return {
         "row_count": row_count,
-        "last_completed_at": updated_at_raw,
+        # crawl_fsc_index()가 새 크롤 시작 시 체크포인트를 ""(빈 문자열)로 리셋해
+        # 두므로(위 crawl_in_progress 계산 참고), 완료 시각이 없는 상태는 항상
+        # None으로 정규화해 응답한다 — "" 그대로 노출하면 API 계약("완료된 적
+        # 없으면 null")과 어긋난다.
+        "last_completed_at": updated_at_raw or None,
         "ttl_days": ttl_days,
         "is_stale": is_stale,
         "crawl_in_progress": crawl_in_progress,
@@ -248,6 +252,14 @@ async def crawl_fsc_index(
     with session_factory() as db:
         last_page_raw = None if force else _get_meta(db, _META_KEY_LAST_PAGE)
     start_page = int(last_page_raw) + 1 if last_page_raw else 1
+
+    # 첫 완주 이후 두 번째부터의 크롤(증분 재개/force 전면 재구축)에서도
+    # `get_fsc_index_status()`의 `crawl_in_progress`가 이전 완주 시각이 남아있다는
+    # 이유만으로 계속 False를 보고하지 않도록, 이번 실행이 완료되기 전까지는
+    # "완료 시각 없음" 상태로 되돌려 둔다 — 실제 완료 시점(아래)에 다시 채워진다.
+    with session_factory() as db:
+        _set_meta(db, _META_KEY_UPDATED_AT, "")
+        db.commit()
 
     page_no = start_page
     processed_pages = 0

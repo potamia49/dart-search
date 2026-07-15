@@ -195,7 +195,12 @@ export default function SearchPage() {
       </Paper>
 
       <Group justify="flex-end">
-        <Button size="md" loading={submitting} onClick={handleSubmit}>
+        <Button
+          size="md"
+          loading={submitting}
+          disabled={fscIndexStatus?.row_count === 0}
+          onClick={handleSubmit}
+        >
           후보 확정 시작
         </Button>
       </Group>

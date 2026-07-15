@@ -76,8 +76,9 @@ export default function CandidatesView({ job }: CandidatesViewProps) {
   return (
     <Stack>
       <Alert color="blue" title="후보 확정 결과 (Phase 1)">
-        아직 감사보고서 원문을 파싱하지 않았습니다. 아래 매출액/총자산은 공공데이터(금융위
-        기업재무정보) 기준 <b>확정 전 추정치</b>입니다 — 재무 13항목 전체와 parse_status는
+        아직 감사보고서 원문을 파싱하지 않았습니다. 아래 표의 모든 항목(전화번호/대표자
+        포함)은 공공데이터(금융위 기업기본정보·기업재무정보) 기준 <b>확정 전 값</b>이며,
+        DART 원문과 다를 수 있습니다 — 재무 13항목 전체와 parse_status, 확정된 값은
         재무정보 수집(Phase 2) 완료 후에 채워집니다.
       </Alert>
 
@@ -96,6 +97,8 @@ export default function CandidatesView({ job }: CandidatesViewProps) {
             </Title>
             <Text size="sm" c="dimmed" mb="xs">
               확정된 후보 회사에 대해 최근 N년치 재무정보(다년치 이력)를 DART 원문에서 수집합니다.
+              후보 수와 회사당 공시 건수에 따라 수 분~수십 분 이상 걸릴 수 있습니다 — 시작 후
+              작업 목록 화면에서 진행률을 확인하세요.
             </Text>
             <SegmentedControl
               value={String(historyYears)}
@@ -126,8 +129,9 @@ export default function CandidatesView({ job }: CandidatesViewProps) {
                 <Table.Tr>
                   <Table.Th>회사명</Table.Th>
                   <Table.Th>주소</Table.Th>
-                  <Table.Th>전화번호</Table.Th>
-                  <Table.Th>대표자</Table.Th>
+                  <Table.Th>업종 (참고용)</Table.Th>
+                  <Table.Th>전화번호 (미확정)</Table.Th>
+                  <Table.Th>대표자 (미확정)</Table.Th>
                   <Table.Th>매출액 (추정)</Table.Th>
                   <Table.Th>총자산 (추정)</Table.Th>
                 </Table.Tr>
@@ -137,6 +141,7 @@ export default function CandidatesView({ job }: CandidatesViewProps) {
                   <Table.Tr key={row.id}>
                     <Table.Td>{row.corp_name ?? '-'}</Table.Td>
                     <Table.Td>{row.address ?? '-'}</Table.Td>
+                    <Table.Td>{row.induty_name ?? '-'}</Table.Td>
                     <Table.Td>{row.phone ?? '-'}</Table.Td>
                     <Table.Td>{row.ceo_name ?? '-'}</Table.Td>
                     <Table.Td>{formatNumber(row.revenue_cur)}</Table.Td>
