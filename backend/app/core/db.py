@@ -8,7 +8,7 @@
 from collections.abc import Generator
 from functools import lru_cache
 
-from sqlalchemy import Engine, create_engine
+from sqlalchemy import Engine, create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import Settings, get_settings
@@ -25,10 +25,26 @@ def _connect_args(database_url: str) -> dict:
 @lru_cache
 def get_engine(settings: Settings | None = None) -> Engine:
     settings = settings or get_settings()
-    return create_engine(
+    engine = create_engine(
         settings.database_url,
         connect_args=_connect_args(settings.database_url),
     )
+    if engine.dialect.name == "sqlite":
+        # A1 전수 크롤(fsc_corp_index, 약 128만 행 upsert)이 기본 저널 모드
+        # (journal_mode=DELETE, synchronous=FULL)에서는 커밋마다 fsync가 걸려
+        # 실측 약 3.4행/초로 병목이 됐다(2026-07-16) — WAL은 매 커밋마다
+        # 메인 DB 파일 전체를 동기화하지 않고 WAL 파일에 append만 하므로
+        # 훨씬 빠르다. synchronous=NORMAL은 WAL 모드에서 공식적으로 안전한
+        # 조합(OS 크래시 시에도 커밋된 데이터는 보존되며, 앱 크래시 시에는
+        # 애초에 fsync 여부와 무관)이라 데이터 정합성 저하 없이 채택했다.
+        @event.listens_for(engine, "connect")
+        def _set_sqlite_pragma(dbapi_conn, _record):
+            cursor = dbapi_conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.close()
+
+    return engine
 
 
 @lru_cache

@@ -160,8 +160,46 @@ def _to_optional_int(raw: Any) -> int | None:
         return None
 
 
-def _upsert_fsc_corp_index_item(session_factory: sessionmaker[Session], item: dict[str, Any]) -> None:
-    """FSC 응답 item 1건을 `crno` 기준으로 병합(merge) upsert.
+def _dedupe_batch_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """같은 페이지(최대 100건) 안에서 crno/fss_corp_unq_no가 같은 item을 메모리에서
+    미리 병합한다(§4-7 스파이크에서 관찰한 "유진금속공업 중복 3건"류 — 소스기관별
+    중복 레코드가 같은 페이지에 나타나는 경우).
+
+    2026-07-16: 페이지 단위 커밋 배칭 도입 전에는 item마다 별도 세션/커밋이라
+    직전 item이 이미 DB에 반영돼 있어 중복 조회가 자연히 맞았지만, 배칭 이후
+    같은 세션 안에서 처리하면 (autoflush=False라) 직전 item의 미반영 INSERT가
+    다음 item의 조회에 안 보여 같은 키로 두 번 INSERT를 시도해 UNIQUE 위반이
+    날 수 있다. item마다 `db.flush()`로 해결할 수도 있었지만 그러면 페이지당
+    100번 DB 왕복이 남아 배칭 효과가 거의 사라졌다(실측 write 7~8초/페이지) —
+    DB를 건드리기 전에 파이썬 dict로 먼저 병합해 페이지당 고유 키 수만큼만
+    DB 왕복하도록 한다. 병합 규칙은 `_upsert_fsc_corp_index_item`과 동일하게
+    "새 값이 있으면 나중 값으로 덮어쓴다"이며, crno/fss_corp_unq_no가 둘 다
+    없는 item은 병합 키가 없어(중복 판별 불가) 그대로 통과시킨다.
+    """
+    merged: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    standalone: list[dict[str, Any]] = []
+    for item in items:
+        crno_raw = (item.get("crno") or "").strip()
+        fss_raw = (item.get("fssCorpUnqNo") or "").strip()
+        valid_crno = crno_raw if crno_raw and crno_raw != "0000000000000" else None
+        valid_fss = fss_raw or None
+        key = valid_crno or valid_fss
+        if key is None:
+            standalone.append(item)
+            continue
+        if key not in merged:
+            merged[key] = dict(item)
+            order.append(key)
+        else:
+            for field_name, value in item.items():
+                if value not in (None, ""):
+                    merged[key][field_name] = value
+    return [merged[key] for key in order] + standalone
+
+
+def _upsert_fsc_corp_index_item(db: Session, item: dict[str, Any]) -> None:
+    """FSC 응답 item 1건을 `crno` 기준으로 병합(merge) upsert(호출부가 커밋 책임을 진다).
 
     같은 회사의 소스기관별 중복 레코드는 필드별로 "새 값이 있으면 채택, 없으면
     기존 값 유지"하는 방식으로 병합한다(§4-7 스파이크 결과 4번 — 예: 유진금속공업
@@ -193,34 +231,51 @@ def _upsert_fsc_corp_index_item(session_factory: sessionmaker[Session], item: di
     }
     employee_cnt = _to_optional_int(item.get("enpEmpeCnt"))
 
-    with session_factory() as db:
-        existing = None
-        if valid_crno:
-            existing = db.execute(
-                select(FscCorpIndex).where(FscCorpIndex.crno == valid_crno)
-            ).scalar_one_or_none()
-        if existing is None and valid_fss:
-            existing = db.execute(
-                select(FscCorpIndex).where(FscCorpIndex.fss_corp_unq_no == valid_fss)
-            ).scalar_one_or_none()
+    # `crno`/`fss_corp_unq_no`는 부분 UNIQUE 인덱스(NULL/더미값 제외)라, SQLite
+    # 쿼리 플래너가 `col = ?`만으로는 바인드 파라미터가 부분 인덱스 조건(NOT NULL/
+    # 더미 아님)을 만족하는지 정적으로 증명할 수 없어 인덱스를 쓰지 않고 매번
+    # 전체 테이블 스캔을 한다(실측 2026-07-16: 27만 행 기준 쿼리당 약 100ms,
+    # A1 전수 크롤 병목의 실제 원인 — `EXPLAIN QUERY PLAN`으로 확인). `valid_crno`/
+    # `valid_fss`는 이미 이 조건을 만족하도록 걸러진 값이므로, WHERE 절에 부분
+    # 인덱스와 동일한 조건을 명시적으로 반복해 플래너가 인덱스를 쓰도록 유도한다
+    # (같은 파일로 확인: 추가 후 `SEARCH ... USING INDEX`로 바뀜).
+    existing = None
+    if valid_crno:
+        existing = db.execute(
+            select(FscCorpIndex).where(
+                FscCorpIndex.crno == valid_crno,
+                FscCorpIndex.crno.isnot(None),
+                FscCorpIndex.crno != "0000000000000",
+            )
+        ).scalar_one_or_none()
+    if existing is None and valid_fss:
+        existing = db.execute(
+            select(FscCorpIndex).where(
+                FscCorpIndex.fss_corp_unq_no == valid_fss,
+                FscCorpIndex.fss_corp_unq_no.isnot(None),
+                FscCorpIndex.fss_corp_unq_no != "",
+            )
+        ).scalar_one_or_none()
 
-        if existing is None:
-            existing = FscCorpIndex(crno=valid_crno, fss_corp_unq_no=valid_fss)
-            db.add(existing)
-        else:
-            if existing.crno is None and valid_crno:
-                existing.crno = valid_crno
-            if not existing.fss_corp_unq_no and valid_fss:
-                existing.fss_corp_unq_no = valid_fss
+    if existing is None:
+        existing = FscCorpIndex(crno=valid_crno, fss_corp_unq_no=valid_fss)
+        db.add(existing)
+    else:
+        if existing.crno is None and valid_crno:
+            existing.crno = valid_crno
+        if not existing.fss_corp_unq_no and valid_fss:
+            existing.fss_corp_unq_no = valid_fss
 
-        for field_name, value in field_values.items():
-            if value not in (None, ""):
-                setattr(existing, field_name, value)
-        if employee_cnt is not None:
-            existing.employee_cnt = employee_cnt
+    for field_name, value in field_values.items():
+        if value not in (None, ""):
+            setattr(existing, field_name, value)
+    if employee_cnt is not None:
+        existing.employee_cnt = employee_cnt
 
-        existing.fetched_at = datetime.now().isoformat(timespec="seconds")
-        db.commit()
+    existing.fetched_at = datetime.now().isoformat(timespec="seconds")
+    # 페이지 내 중복은 호출부(crawl_fsc_index)가 `_dedupe_batch_items()`로 미리
+    # 병합해 두므로 여기서 flush할 필요가 없다 — 실제 커밋(디스크 fsync)은
+    # 호출부가 페이지 단위로 한 번만 한다.
 
 
 async def crawl_fsc_index(
@@ -277,28 +332,33 @@ async def crawl_fsc_index(
         if isinstance(item_list, dict):  # 단건 응답 시 dict로 오는 경우 대비
             item_list = [item_list]
 
-        for item in item_list:
-            if item.get("corpRegMrktDcd") == "E":
-                skipped_foreign += 1
-                continue
-            _upsert_fsc_corp_index_item(session_factory, item)
-            upserted += 1
+        is_last_page = not item_list or bool(total_count and page_no * num_of_rows >= total_count)
 
+        # 페이지(최대 100건) 전체를 세션 하나에 모아 커밋 1번으로 반영한다 —
+        # 건별 커밋(2026-07-16 이전)은 SQLite fsync가 건마다 걸려 실측
+        # 약 3.4행/초로 병목이었다(체크포인트도 같은 커밋에 실어 원자성 유지).
         with session_factory() as db:
-            _set_meta(db, _META_KEY_LAST_PAGE, str(page_no))
+            local_items = [item for item in item_list if item.get("corpRegMrktDcd") != "E"]
+            skipped_foreign += len(item_list) - len(local_items)
+            upserted += len(local_items)  # 페이지 내 병합 여부와 무관하게 "처리한 item 수"
+            for item in _dedupe_batch_items(local_items):
+                _upsert_fsc_corp_index_item(db, item)
+
+            # 같은 키를 같은 세션에서 두 번 _set_meta하면(autoflush=False라 첫 호출의
+            # pending insert가 두 번째 호출의 select에 보이지 않아) UNIQUE 위반이
+            # 난다 — 최종값을 먼저 정해 한 번만 쓴다.
+            if is_last_page and item_list:
+                # 전수를 다 돌았으면 다음 크롤을 위해 체크포인트를 리셋해 둔다.
+                _set_meta(db, _META_KEY_LAST_PAGE, "0")
+                _set_meta(db, _META_KEY_UPDATED_AT, datetime.now().isoformat(timespec="seconds"))
+            else:
+                _set_meta(db, _META_KEY_LAST_PAGE, str(page_no))
             db.commit()
 
         processed_pages += 1
         page_no += 1
 
-        if not item_list:
-            break
-        if total_count and (page_no - 1) * num_of_rows >= total_count:
-            # 전수를 다 돌았으면 다음 크롤을 위해 체크포인트를 리셋해 둔다.
-            with session_factory() as db:
-                _set_meta(db, _META_KEY_LAST_PAGE, "0")
-                _set_meta(db, _META_KEY_UPDATED_AT, datetime.now().isoformat(timespec="seconds"))
-                db.commit()
+        if is_last_page:
             break
 
     return {
