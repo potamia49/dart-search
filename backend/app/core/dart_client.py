@@ -298,6 +298,45 @@ class FscCorpInfoClient:
             )
         return self.settings.data_go_kr_api_key
 
+    async def _get_with_retry(self, url: str, params: dict[str, Any]) -> dict[str, Any]:
+        """GET + 지수 백오프 재시도(타임아웃/네트워크 오류/429/5xx 대상).
+
+        A1 전수 크롤(`crawl_fsc_index`)이 12,821페이지를 순차 호출하는 동안
+        ReadTimeout 1건에 크롤 태스크 전체가 조용히 죽는 문제를 실제로 겪어서
+        (2026-07-16) 추가했다 — `DartClient._request`와 동일한 정책
+        (`Settings.max_retries`, 지수 백오프)을 재사용한다.
+        """
+        last_exc: Exception | None = None
+        for attempt in range(1, self.settings.max_retries + 1):
+            try:
+                resp = await self._client.get(url, params=params)
+            except (httpx.TransportError, httpx.TimeoutException) as exc:
+                last_exc = exc
+                logger.warning("FSC 요청 실패(attempt=%s, url=%s): %s", attempt, url, exc)
+                if attempt < self.settings.max_retries:
+                    await asyncio.sleep(2 ** (attempt - 1))
+                    continue
+                raise DartApiError(f"{url} 요청 중 네트워크 오류: {exc}") from exc
+
+            if resp.status_code == 429 or resp.status_code >= 500:
+                last_exc = DartApiError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+                logger.warning(
+                    "FSC 요청 재시도 대상 상태코드(attempt=%s, url=%s): %s",
+                    attempt,
+                    url,
+                    resp.status_code,
+                )
+                if attempt < self.settings.max_retries:
+                    await asyncio.sleep(2 ** (attempt - 1))
+                    continue
+                raise last_exc
+
+            resp.raise_for_status()
+            return resp.json()
+
+        # 이론상 도달하지 않지만 안전망
+        raise DartApiError(f"{url} 요청 재시도 소진") from last_exc
+
     async def get_corp_basic_info(
         self, *, page_no: int = 1, num_of_rows: int = 100, corp_nm: str | None = None
     ) -> dict[str, Any]:
@@ -311,9 +350,7 @@ class FscCorpInfoClient:
         }
         if corp_nm:
             params["corpNm"] = corp_nm
-        resp = await self._client.get("/getCorpOutline_V2", params=params)
-        resp.raise_for_status()
-        return resp.json()
+        return await self._get_with_retry("/getCorpOutline_V2", params)
 
     async def get_summary_financial_stat(self, *, crno: str, biz_year: str) -> dict[str, Any]:
         """금융위원회_기업 재무정보 API(`GetFinaStatInfoService_V2`)의 `getSummFinaStat_V2`.
@@ -342,9 +379,7 @@ class FscCorpInfoClient:
             "pageNo": 1,
             "numOfRows": 10,
         }
-        resp = await self._client.get(url, params=params)
-        resp.raise_for_status()
-        return resp.json()
+        return await self._get_with_retry(url, params)
 
     async def validate_key(self) -> tuple[bool, str]:
         try:

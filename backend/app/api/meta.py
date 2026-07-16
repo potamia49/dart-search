@@ -27,6 +27,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Literal
 
@@ -141,6 +142,14 @@ async def validate_key(payload: ValidateKeyRequest) -> ValidateKeyResponse:
     return result
 
 
+# 전수 크롤(A1) 감독 재시도 정책 — 페이지 단위 요청 자체의 재시도는
+# `FscCorpInfoClient._get_with_retry`가 담당하고, 이 상수는 그 재시도까지
+# 소진된 뒤 크롤 태스크 전체가 죽었을 때 체크포인트에서 다시 살리는 바깥쪽
+# 루프(`_run_crawl`)용이다.
+_FSC_CRAWL_OUTER_RETRIES = 100
+_FSC_CRAWL_OUTER_BACKOFF_SEC = 30
+
+
 class FscIndexRefreshRequest(BaseModel):
     """`max_pages`를 지정하지 않으면(None) 전체 페이징(약 12,821페이지, 실측
     약 10.2시간 예상)을 시도한다 — 신중히 호출할 것(§4-7)."""
@@ -169,20 +178,38 @@ async def refresh_fsc_index(
     1페이지부터 다시 시작한다.
     """
 
+    outer_attempts = _FSC_CRAWL_OUTER_RETRIES if payload.max_pages is None else 1
+
     async def _run_crawl() -> None:
-        client = FscCorpInfoClient()
-        try:
-            result = await crawl_fsc_index(
-                client,
-                get_session_factory(),
-                max_pages=payload.max_pages,
-                force=payload.force,
-            )
-            logger.info("fsc_corp_index 갱신 완료: %s", result)
-        except Exception:  # noqa: BLE001 - 백그라운드 작업은 여기서 반드시 흡수해야 한다
-            logger.exception("fsc_corp_index 갱신 중 예외 발생")
-        finally:
-            await client.aclose()
+        """전수 크롤(`max_pages=None`)은 실행에 수십 시간 걸리는 장시간 작업이라
+        네트워크 일시 단절(DNS 실패, 타임아웃 등) 한 번에 통째로 죽으면 그때마다
+        사람이 상태를 확인해 수동으로 재트리거해야 했다(2026-07-16 실측, 약 4시간
+        사이 2회 발생). `crawl_fsc_index`가 체크포인트로 이어하기 가능하다는 점을
+        이용해, 예외 발생 시 일정 대기 후 자동으로 다시 호출하는 감독 루프를
+        추가했다. `max_pages`가 지정된 파일럿/테스트 호출은 의도적으로 부분
+        실행이므로 재시도하지 않는다(기존 동작 그대로 1회만 시도).
+        """
+        for attempt in range(1, outer_attempts + 1):
+            client = FscCorpInfoClient()
+            try:
+                result = await crawl_fsc_index(
+                    client,
+                    get_session_factory(),
+                    max_pages=payload.max_pages,
+                    # force는 최초 시도에만 적용한다 — 재시도는 이전 시도가 남긴
+                    # 체크포인트를 그대로 이어서 진행해야 하므로 항상 force=False.
+                    force=payload.force if attempt == 1 else False,
+                )
+                logger.info("fsc_corp_index 갱신 완료: %s", result)
+                return
+            except Exception:  # noqa: BLE001 - 백그라운드 작업은 여기서 반드시 흡수해야 한다
+                logger.exception(
+                    "fsc_corp_index 갱신 중 예외 발생(attempt=%s/%s)", attempt, outer_attempts
+                )
+                if attempt < outer_attempts:
+                    await asyncio.sleep(_FSC_CRAWL_OUTER_BACKOFF_SEC)
+            finally:
+                await client.aclose()
 
     background_tasks.add_task(_run_crawl)
     return FscIndexRefreshResponse(
