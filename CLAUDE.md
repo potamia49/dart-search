@@ -672,6 +672,45 @@ history_years=4)를 `POST /api/jobs/14/resume`으로 재개해 Phase 2(B1~B5,
 소진으로 스크리닝 없이 통과하는 상태였다는 점은 위 기록 참고 — 그래도
 결과 정확성은 Phase 2 B4가 실제 원문으로 보장한다).
 
+**우선순위 1 작은 개선 2건 반영(2026-07-17, 같은 세션 후속).** Job #13에서
+겪은 data.go.kr 쿼터 소진 문제와 "확정 결과 뷰"의 미확정 항목 노출 문제,
+두 가지 후속 조치를 처리했다.
+- **`getSummFinaStat_V2` 429(쿼터 소진) 즉시 통과 처리**: `FscCorpInfoClient.
+  _get_with_retry()`(`app/core/dart_client.py`)가 429 응답 본문에 "quota"
+  또는 "LIMITED_NUMBER_OF_SERVICE_REQUESTS" 문구가 있으면 백오프 재시도 없이
+  즉시 예외를 던지도록 고쳤다(`_is_quota_exceeded_response()` 헬퍼 추가) —
+  기존에는 매 요청마다 1초+2초 백오프 후 포기했는데(건당 최대 약 3초),
+  data.go.kr 자체 쿼터가 소진되면 이후 모든 호출이 반드시 같은 429를
+  반환하므로 재시도가 항상 무의미했다. `_fetch_financial_stat_with_retry()`
+  (`app/core/fsc_index.py`)는 이 예외를 그대로 받아 기존처럼 "조회 실패,
+  안전하게 통과"로 처리한다(호출부 로직은 변경 없음). 대규모 지역(예:
+  경남 전체, 24,869개사) 조건에서 쿼터가 도중에 소진되면 잔여 처리 시간이
+  수 시간 단위로 줄어들 것으로 기대된다(정확한 재실측은 다음 대규모 실행
+  때 확인). 재시도 로직은 timeout/네트워크 오류에는 여전히 기존 백오프를
+  그대로 적용한다 — 이번 변경은 "쿼터 소진임이 명백한 429"만 예외로 뺀
+  것이다. 이 프로젝트가 `_get_with_retry` 계열 로직에 신규 단위 테스트를
+  추가하지 않는 기존 관행(2026-07-16 재시도 로직 도입 시에도 동일하게
+  생략)을 따라 이번에도 전용 테스트는 추가하지 않았고, `pytest tests/ -q`
+  156 passed로 회귀만 재확인했다.
+- **phone/ceo_name/induty_name "미확정(FSC 기준)" 라벨 추가**: M6 QA 리뷰에서
+  남겨둔 설계 갭("확정 결과 뷰에서도 이 값들이 Phase 1(FSC) 추정치일 뿐이라는
+  게 전혀 표시되지 않는다") 중 옵션 (b)를 택해 처리했다 — Phase 2 B1에
+  `company.json` 확정 호출을 추가하는 옵션 (a)는 이번엔 하지 않았다(더 큰
+  판단이 필요해 보류). `frontend/src/util/resultColumns.ts`의
+  `BASIC_COLUMNS`에서 세 컬럼 라벨을 "전화번호 (미확정·FSC 기준)" 등으로
+  바꿨고, `backend/app/exporters/excel.py`의 `RESULT_COLUMN_LABELS`도 같은
+  취지로 "전화번호(미확정,FSC기준)" 등으로 맞췄다(Excel/CSV로 내려받아 실제
+  연락에 쓰일 수 있는 파일이라 화면과 동일하게 라벨링). CandidatesView(Phase 1
+  후보 목록 뷰)는 이미 "(미확정)"/"(참고용)" 라벨이 있었으므로 그대로 두고
+  건드리지 않았다. `pytest tests/ -q` 156 passed(export 테스트는
+  `RESULT_COLUMN_LABELS` dict 자체를 참조해 하드코딩 문자열에 의존하지 않아
+  라벨 문구 변경에 영향받지 않음), `npm run build`/`npm run lint` 통과.
+- **EUC-KR 등 비UTF-8 원문 재조사는 이번 세션에서 보류했다** — 사용자
+  판단으로 "당장 조치하지 않고 앞으로 몇 차례 실행에서 `parse_note`에 인코딩
+  관련 실패가 얼마나 쌓이는지 관찰"하기로 했다. 다음 세션에서 Job 실행 결과의
+  `parse_note`를 확인해 EUC-KR류 실패 빈도가 늘고 있으면 그때 `xml_parser.py`
+  인코딩 자동 감지/폴백 디코딩 추가를 재검토할 것.
+
 작업을 시작하기 전에 반드시 아래 두 문서를 먼저 읽으세요 —
 이 저장소의 유일한 진실 소스(source of truth)입니다.
 

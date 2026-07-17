@@ -260,6 +260,17 @@ class DartClient:
             return False, f"DART_API_KEY 검증 실패: {exc}"
 
 
+def _is_quota_exceeded_response(response_text: str) -> bool:
+    """data.go.kr 응답 본문이 일일 쿼터 소진을 뜻하는지 판단(재시도 스킵용).
+
+    실측(2026-07-17)한 응답 문구는 "API token quota exceeded"였고,
+    data.go.kr가 공통으로 쓰는 에러코드 22의 메시지
+    "LIMITED_NUMBER_OF_SERVICE_REQUESTS_EXCEEDS_ERROR"도 함께 흡수한다.
+    """
+    lowered = response_text.lower()
+    return "quota" in lowered or "limited_number_of_service_requests" in lowered
+
+
 class FscCorpInfoClient:
     """공공데이터포털 금융위원회_기업기본정보 API 클라이언트.
 
@@ -305,6 +316,15 @@ class FscCorpInfoClient:
         ReadTimeout 1건에 크롤 태스크 전체가 조용히 죽는 문제를 실제로 겪어서
         (2026-07-16) 추가했다 — `DartClient._request`와 동일한 정책
         (`Settings.max_retries`, 지수 백오프)을 재사용한다.
+
+        단, data.go.kr 자체의 **일일 쿼터 소진** 429는 재시도해도 절대 성공하지
+        않는다(2026-07-17 Job #13 실전 실행에서 확인 — `GetFinaStatInfoService_V2`가
+        DART 일일 20,000건 한도와 별개로 자체 쿼터를 갖고 있고, A3 스크리닝
+        24,869개사 처리 중 소진되면 이후 모든 호출이 이 429를 반환한다). 응답
+        본문에 "quota"/"LIMITED_NUMBER_OF_SERVICE_REQUESTS" 문구가 있으면
+        백오프 없이 즉시 예외를 던져 호출부(`_fetch_financial_stat_with_retry`)가
+        곧바로 "조회 실패, 안전하게 통과" 처리를 하도록 한다 — 건당 최대 3초
+        (1초+2초 백오프)를 아낀다.
         """
         last_exc: Exception | None = None
         for attempt in range(1, self.settings.max_retries + 1):
@@ -320,6 +340,13 @@ class FscCorpInfoClient:
 
             if resp.status_code == 429 or resp.status_code >= 500:
                 last_exc = DartApiError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+                if resp.status_code == 429 and _is_quota_exceeded_response(resp.text):
+                    logger.warning(
+                        "FSC 일일 쿼터 소진으로 판단, 재시도 없이 즉시 실패 처리(url=%s): %s",
+                        url,
+                        resp.text[:200],
+                    )
+                    raise last_exc
                 logger.warning(
                     "FSC 요청 재시도 대상 상태코드(attempt=%s, url=%s): %s",
                     attempt,

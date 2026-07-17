@@ -29,10 +29,10 @@ RESULT_COLUMN_LABELS: dict[str, str] = {
     # 기본정보 (PRD 3-1)
     "corp_name": "회사명",
     "address": "주소",
-    "phone": "전화번호",
-    "ceo_name": "대표자명",
+    "phone": "전화번호(미확정,FSC기준)",
+    "ceo_name": "대표자명(미확정,FSC기준)",
     "induty_code": "업종코드",
-    "induty_name": "업종명",
+    "induty_name": "업종명(미확정,FSC기준)",
     "fiscal_date": "결산기준일",
     "audit_opinion": "감사의견",
     # 요약 재무 (PRD 3-2) — 당기(_cur)/전기(_prv)
