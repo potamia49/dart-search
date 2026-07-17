@@ -740,6 +740,34 @@ UX를 SearchPage에 추가할지, (b) 그 사이 실행에서 `parse_note`에 EU
 실패가 더 쌓였는지 확인해 인코딩 자동 감지/폴백 디코딩 착수 여부 재검토,
 (c) 위 두 가지가 정리되면 제품 Phase 2(전단지 생성) 착수를 다시 검토.
 
+**→ (a) 같은 세션 후속으로 구현 완료(2026-07-17).** 사용자가 "너가 확인해봐"라고
+요청해, data.go.kr 로그인 없이도 공식 API 상세페이지(공개 정보)에서 확인 가능한
+`GetFinaStatInfoService_V2`의 **개발계정 기본값(일일 10,000건)**을 WebFetch로
+확인했다(운영계정으로 승급했는지는 여전히 미확인이라 "최소 보장 하한"으로
+다룸 — 실제 계정이 더 넉넉하면 경고가 보수적으로만 어긋나고 결과 정확도에는
+영향 없음). 이 숫자를 근거로 신규 API `POST /api/meta/candidates-preview`
+(§6, `app/api/meta.py`)를 추가했다 — Phase 1 A2(`filter_local_candidates`,
+로컬 DB 쿼리만 사용, 외부 API 호출 없음)만 실행해 후보 수를 즉시 계산하고,
+10,000건을 넘으면 `exceeds_daily_quota=true`+`estimated_days`(올림 나눗셈)를
+함께 반환한다. **M4 시점에는 이런 미리보기가 후보 전체의 DART company.json
+호출을 요구해 스코프 제외됐었는데(§7-1 원 계획), M6 재설계로 A2가 순수 로컬
+쿼리가 되면서 처음으로 실현 가능해졌다.** SearchPage(`frontend/src/pages/
+SearchPage.tsx`)가 시도/시군구/업종 선택 시 400ms 디바운스로 이 API를 호출해
+Alert로 "예상 후보 수 약 N개사"(+쿼터 초과 시 "약 D일에 걸쳐 나눠 진행될 수
+있습니다, 결과 정확도에는 영향 없음")를 실시간 표시한다. 실제 데이터로 검증
+(경남 전체 24,869개사 → 3일 경고, 김해시로 좁히면 7,160개사 → 정상 문구로
+전환)했고, Playwright로 실제 브라우저에서 두 경로 모두 콘솔 에러 없이 정상
+렌더링됨을 확인했다. 테스트 중 백엔드 프로세스가 이전 세션부터 계속 떠 있던
+구버전 코드 상태(port 8000, RUNNING/PENDING Job 없음 확인 후 재기동)였던 것을
+발견해 재기동했다 — 앞으로 코드 변경 후 스모크 테스트 시 이 점 주의(백엔드가
+장시간 켜져 있는 경우 `--reload` 없이 떠 있으면 재기동해야 새 코드가 반영됨).
+신규 단위 테스트 2건 추가(`test_api_meta.py`,
+`test_get_candidates_preview_counts_local_matches_without_quota_warning`/
+`test_get_candidates_preview_flags_quota_exceeded`) — `pytest tests/ -q`
+158 passed, `npm run build`/`npm run lint` 통과. (b) EUC-KR 재조사와
+(c) 제품 Phase 2 착수는 이번 세션에서 다루지 않았다 — 다음 세션에서 계속
+판단할 것.
+
 작업을 시작하기 전에 반드시 아래 두 문서를 먼저 읽으세요 —
 이 저장소의 유일한 진실 소스(source of truth)입니다.
 

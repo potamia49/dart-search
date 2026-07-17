@@ -11,13 +11,14 @@ import {
   TextInput,
   Title,
 } from '@mantine/core'
+import { useDebouncedValue } from '@mantine/hooks'
 import { notifications } from '@mantine/notifications'
 import RegionSelect from '../components/RegionSelect'
 import IndustryTreeSelect from '../components/IndustryTreeSelect'
 import FscIndexStatusNote from '../components/FscIndexStatusNote'
-import { getFscIndexStatus, getIndustries, getRegions } from '../api/meta'
+import { getCandidatesPreview, getFscIndexStatus, getIndustries, getRegions } from '../api/meta'
 import { createJob } from '../api/jobs'
-import type { FscIndexStatus, IndustryMeta, RegionMeta } from '../types'
+import type { CandidatesPreviewResponse, FscIndexStatus, IndustryMeta, RegionMeta } from '../types'
 
 const EOK = 100_000_000 // 1억원 = 100,000,000원
 
@@ -39,6 +40,11 @@ export default function SearchPage() {
   const [industryCodes, setIndustryCodes] = useState<string[]>([])
 
   const [submitting, setSubmitting] = useState(false)
+
+  const [preview, setPreview] = useState<CandidatesPreviewResponse | null>(null)
+  const [debouncedSido] = useDebouncedValue(sido, 400)
+  const [debouncedSigungu] = useDebouncedValue(sigungu, 400)
+  const [debouncedIndustryCodes] = useDebouncedValue(industryCodes, 400)
 
   useEffect(() => {
     let cancelled = false
@@ -69,6 +75,30 @@ export default function SearchPage() {
       cancelled = true
     }
   }, [])
+
+  // 시도를 고르기 전에는 지역 조건이 없어 fsc_corp_index 전체(약 63만 건)를
+  // 훑게 되므로 호출하지 않는다 — sido가 있어야 백엔드가 SQL WHERE로 먼저
+  // 좁힌다(app/core/fsc_index.py::filter_local_candidates).
+  useEffect(() => {
+    if (!debouncedSido) {
+      setPreview(null)
+      return
+    }
+    let cancelled = false
+    getCandidatesPreview({
+      region: { sido: debouncedSido, sigungu: debouncedSigungu },
+      industry: debouncedIndustryCodes,
+    })
+      .then((data) => {
+        if (!cancelled) setPreview(data)
+      })
+      .catch(() => {
+        if (!cancelled) setPreview(null)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [debouncedSido, debouncedSigungu, debouncedIndustryCodes])
 
   async function handleSubmit() {
     setSubmitting(true)
@@ -193,6 +223,15 @@ export default function SearchPage() {
           </Text>
         )}
       </Paper>
+
+      {preview && (
+        <Alert color={preview.exceeds_daily_quota ? 'yellow' : 'blue'} variant="light">
+          예상 후보 수: 약 {preview.candidate_count.toLocaleString()}개사
+          {preview.exceeds_daily_quota
+            ? ` — data.go.kr 일일 조회 한도(약 ${preview.daily_quota_assumed.toLocaleString()}건)를 넘어 매출액·총자산 사전 확인이 약 ${preview.estimated_days}일에 걸쳐 나눠 진행될 수 있습니다. 최종 결과 정확도에는 영향이 없습니다(재무제표 원문으로 항상 다시 확인합니다).`
+            : ' — 하루 안에 매출액·총자산 사전 확인까지 끝낼 수 있는 규모입니다.'}
+        </Alert>
+      )}
 
       <Group justify="flex-end">
         <Button

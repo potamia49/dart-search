@@ -158,6 +158,23 @@ export interface FscIndexStatus {
   crawl_in_progress: boolean
 }
 
+/** POST /api/meta/candidates-preview (2026-07-17 추가) — 지역/업종 조건만으로
+ * Phase 1 A2(로컬 DB 필터, API 호출 없음)를 미리 실행한 후보 수. `exceeds_daily_quota`가
+ * true면 A3(매출액/총자산 스크리닝)가 data.go.kr 일일 쿼터를 넘겨 하루 안에 끝나지
+ * 않을 수 있다는 뜻이다(결과 정확도에는 영향 없음 — Phase 2가 항상 DART 원문으로
+ * 최종 재검증). */
+export interface CandidatesPreviewRequest {
+  region: RegionCondition
+  industry: string[]
+}
+
+export interface CandidatesPreviewResponse {
+  candidate_count: number
+  daily_quota_assumed: number
+  exceeds_daily_quota: boolean
+  estimated_days: number
+}
+
 export interface KeyCheckResult {
   valid: boolean
   message: string

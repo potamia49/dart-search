@@ -1,5 +1,12 @@
 import { apiClient } from './client'
-import type { FscIndexStatus, IndustryMeta, QuotaResponse, RegionMeta } from '../types'
+import type {
+  CandidatesPreviewRequest,
+  CandidatesPreviewResponse,
+  FscIndexStatus,
+  IndustryMeta,
+  QuotaResponse,
+  RegionMeta,
+} from '../types'
 
 export async function getRegions(): Promise<RegionMeta[]> {
   const { data } = await apiClient.get<RegionMeta[]>('/meta/regions')
@@ -18,5 +25,15 @@ export async function getQuota(): Promise<QuotaResponse> {
 
 export async function getFscIndexStatus(): Promise<FscIndexStatus> {
   const { data } = await apiClient.get<FscIndexStatus>('/meta/fsc-index/status')
+  return data
+}
+
+export async function getCandidatesPreview(
+  payload: CandidatesPreviewRequest,
+): Promise<CandidatesPreviewResponse> {
+  const { data } = await apiClient.post<CandidatesPreviewResponse>(
+    '/meta/candidates-preview',
+    payload,
+  )
   return data
 }

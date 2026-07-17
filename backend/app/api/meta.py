@@ -14,6 +14,10 @@
                                           바로 보이게 추가했다 — 백엔드가
                                           TTL 초과를 자동으로 알려주지 않고
                                           로그에만 남기던 것의 보완.
+    POST /api/meta/candidates-preview    (2026-07-17 추가) 지역/업종 조건만으로
+                                          Phase 1 A2(로컬 DB 필터, API 호출 없음)를
+                                          미리 실행해 후보 수와 data.go.kr 일일
+                                          쿼터 초과 가능성을 Job 생성 전에 보여준다.
 
 `/api/meta/regions`/`/api/meta/industries`는 M4에서 추가됐다. 두 엔드포인트
 모두 정적 데이터(`app/core/region_data.py`/`app/core/industry_data.py`)를
@@ -32,11 +36,12 @@ import logging
 from typing import Literal
 
 from fastapi import APIRouter, BackgroundTasks
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
+from app.api.jobs import RegionCondition
 from app.core.dart_client import DartClient, FscCorpInfoClient
 from app.core.db import get_session_factory
-from app.core.fsc_index import crawl_fsc_index, get_fsc_index_status
+from app.core.fsc_index import crawl_fsc_index, filter_local_candidates, get_fsc_index_status
 from app.core.industry_data import INDUSTRIES
 from app.core.region_data import REGIONS
 
@@ -235,3 +240,57 @@ async def get_fsc_index_status_endpoint() -> FscIndexStatusResponse:
     SearchPage/JobsPage가 이 엔드포인트를 호출한다.
     """
     return FscIndexStatusResponse(**get_fsc_index_status())
+
+
+# data.go.kr GetFinaStatInfoService_V2(A3가 호출하는 금융위 재무정보 API)의
+# 일일 트래픽 허용량 — 2026-07-17 공식 API 상세페이지(data.go.kr)로 확인한
+# "개발계정" 기본값이다. 운영계정으로 승급하거나 트래픽 증가를 별도 신청하면
+# 더 늘어날 수 있어(§8 M6 QA 리뷰 이후 열려 있던 사안), 이 값은 "최소
+# 보장되는 하한"으로 다룬다 — 실제 계정이 더 넉넉하면 경고가 보수적으로(더
+# 자주) 뜨는 방향으로만 어긋나고, 결과 정확도 자체에는 영향이 없다(Phase 2
+# B4가 항상 DART 원문으로 최종 재검증하기 때문).
+_FSC_DAILY_QUOTA_ASSUMED = 10_000
+
+
+class CandidatesPreviewRequest(BaseModel):
+    region: RegionCondition = Field(default_factory=RegionCondition)
+    industry: list[str] = Field(default_factory=list)
+
+
+class CandidatesPreviewResponse(BaseModel):
+    candidate_count: int
+    daily_quota_assumed: int
+    exceeds_daily_quota: bool
+    estimated_days: int
+
+
+@router.post("/candidates-preview", response_model=CandidatesPreviewResponse)
+async def get_candidates_preview(payload: CandidatesPreviewRequest) -> CandidatesPreviewResponse:
+    """검색 조건(지역/업종) 제출 전에 후보 수와 예상 소요일을 미리 계산한다.
+
+    Phase 1 A2(`filter_local_candidates`)만 실행한다 — `fsc_corp_index`에 대한
+    로컬 DB 쿼리뿐이라 외부 API 호출이 전혀 없고, Job을 만들지 않고도 즉시
+    응답 가능하다(M4 시점에는 이런 미리보기가 후보 전체의 DART company.json
+    호출을 요구해 스코프 제외됐었으나, M6 재설계로 A2가 로컬 쿼리만 쓰게
+    되면서 가능해졌다). 여기 나오는 `candidate_count`는 Job 실행 시 A3가
+    `getSummFinaStat_V2`로 스크리닝해야 할 후보 수의 근사치이고, 이 값이
+    `daily_quota_assumed`를 넘으면 A3 스크리닝이 하루 안에 끝나지 않을 수
+    있다는 뜻이다(최종 결과 정확도에는 영향 없음 — Phase 2 B4가 항상 실제
+    DART 원문으로 재검증한다).
+    """
+    with get_session_factory()() as db:
+        candidates = filter_local_candidates(
+            db,
+            cond_region=payload.region.model_dump(),
+            cond_industry=payload.industry,
+        )
+    count = len(candidates)
+    estimated_days = (
+        (count + _FSC_DAILY_QUOTA_ASSUMED - 1) // _FSC_DAILY_QUOTA_ASSUMED if count else 0
+    )
+    return CandidatesPreviewResponse(
+        candidate_count=count,
+        daily_quota_assumed=_FSC_DAILY_QUOTA_ASSUMED,
+        exceeds_daily_quota=count > _FSC_DAILY_QUOTA_ASSUMED,
+        estimated_days=estimated_days,
+    )

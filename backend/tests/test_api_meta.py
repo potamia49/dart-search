@@ -3,6 +3,10 @@
 quota/validate-key는 DartClient/FscCorpInfoClient(네트워크 호출)를 타므로
 여기서 다루지 않는다 — regions/industries는 정적 데이터만 직렬화하므로
 DB/네트워크 의존 없이 바로 TestClient로 검증할 수 있다.
+
+candidates-preview(2026-07-17 추가)는 `fsc_corp_index` DB 의존이 있어
+`app.api.meta.get_session_factory`를 `db_session_factory` 픽스처(인메모리
+SQLite)로 monkeypatch해서 검증한다.
 """
 
 from __future__ import annotations
@@ -10,9 +14,11 @@ from __future__ import annotations
 from fastapi.testclient import TestClient
 
 from app import main as app_main
+from app.api import meta as meta_module
 from app.core.filters import SIDO_ALIASES
 from app.core.industry_data import INDUSTRIES
 from app.core.region_data import REGIONS
+from app.models.fsc_corp_index import FscCorpIndex
 
 
 def _client() -> TestClient:
@@ -66,3 +72,53 @@ def test_get_industries_manufacturing_has_children_codes():
     child_codes = {child["code"] for child in manufacturing["children"]}
     assert "10" in child_codes  # 식료품 제조업
     assert all(len(code) == 2 for code in child_codes)
+
+
+def test_get_candidates_preview_counts_local_matches_without_quota_warning(
+    db_session_factory, monkeypatch
+):
+    monkeypatch.setattr(meta_module, "get_session_factory", lambda: db_session_factory)
+    with db_session_factory() as db:
+        db.add_all(
+            [
+                FscCorpIndex(crno=str(i), corp_name=f"김해사{i}", sido="경상남도", sigungu="김해시")
+                for i in range(3)
+            ]
+        )
+        db.commit()
+
+    resp = _client().post(
+        "/api/meta/candidates-preview",
+        json={"region": {"sido": "경상남도", "sigungu": ["김해시"]}, "industry": []},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["candidate_count"] == 3
+    assert body["exceeds_daily_quota"] is False
+    assert body["estimated_days"] == 1
+
+
+def test_get_candidates_preview_flags_quota_exceeded(db_session_factory, monkeypatch):
+    monkeypatch.setattr(meta_module, "get_session_factory", lambda: db_session_factory)
+    monkeypatch.setattr(meta_module, "_FSC_DAILY_QUOTA_ASSUMED", 2)
+    with db_session_factory() as db:
+        db.add_all(
+            [
+                FscCorpIndex(crno=str(i), corp_name=f"김해사{i}", sido="경상남도", sigungu="김해시")
+                for i in range(5)
+            ]
+        )
+        db.commit()
+
+    resp = _client().post(
+        "/api/meta/candidates-preview",
+        json={"region": {"sido": "경상남도", "sigungu": ["김해시"]}, "industry": []},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["candidate_count"] == 5
+    assert body["daily_quota_assumed"] == 2
+    assert body["exceeds_daily_quota"] is True
+    assert body["estimated_days"] == 3
