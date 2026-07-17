@@ -756,18 +756,31 @@ async def _run_financial_parsing(
         else:
             raw_bytes = doc_path.read_bytes()
             suffix = doc_path.suffix.lower()
-            if suffix == ".xml":
-                parsed = parse_xml_financials(raw_bytes)
-                raw_text = raw_bytes.decode("utf-8", errors="ignore")
-            elif suffix == ".pdf":
-                parsed = parse_pdf_financials(raw_bytes)
-                raw_text = ""
-            else:
-                parsed = ParsedFinancials(parse_status="FAILED", parse_note=f"지원하지 않는 원문 형식: {suffix}")
-                raw_text = ""
+            try:
+                if suffix == ".xml":
+                    parsed = parse_xml_financials(raw_bytes)
+                    raw_text = raw_bytes.decode("utf-8", errors="ignore")
+                elif suffix == ".pdf":
+                    parsed = parse_pdf_financials(raw_bytes)
+                    raw_text = ""
+                else:
+                    parsed = ParsedFinancials(parse_status="FAILED", parse_note=f"지원하지 않는 원문 형식: {suffix}")
+                    raw_text = ""
 
-            opinion = extract_audit_opinion(raw_text) if raw_text else None
-            fiscal_date = _extract_fiscal_date(raw_text) if raw_text else None
+                opinion = extract_audit_opinion(raw_text) if raw_text else None
+                fiscal_date = _extract_fiscal_date(raw_text) if raw_text else None
+            except Exception as exc:  # noqa: BLE001 - 원문 서식은 회사마다 편차가 커서
+                # 예상 못한 파서 예외(예: EUC-KR 등 비UTF-8 인코딩 원문)가 이 건
+                # 하나 때문에 Job 전체(나머지 수백~수천 건)를 실패시키면 안 된다 —
+                # 이 건만 FAILED로 기록하고 계속 진행한다(CLAUDE.md "파싱은 100%
+                # 자동화되지 않는다" 원칙).
+                logger.warning(
+                    "STEP5 파싱 중 예외(건너뛰고 FAILED로 기록) result_id=%s rcept_no=%s: %s",
+                    result_id, rcept_no, exc,
+                )
+                parsed = ParsedFinancials(parse_status="FAILED", parse_note=f"파싱 중 예외 발생: {exc}")
+                opinion = None
+                fiscal_date = None
             _apply_parsed_result(session_factory, result_id, parsed, opinion, fiscal_date)
 
         done += 1
@@ -959,13 +972,21 @@ async def _collect_history_for_result(
 
         raw_bytes = doc_path.read_bytes()
         suffix = doc_path.suffix.lower()
-        if suffix == ".xml":
-            parsed = parse_xml_financials(raw_bytes)
-            raw_text = raw_bytes.decode("utf-8", errors="ignore")
-        elif suffix == ".pdf":
-            parsed = parse_pdf_financials(raw_bytes)
-            raw_text = ""
-        else:
+        try:
+            if suffix == ".xml":
+                parsed = parse_xml_financials(raw_bytes)
+                raw_text = raw_bytes.decode("utf-8", errors="ignore")
+            elif suffix == ".pdf":
+                parsed = parse_pdf_financials(raw_bytes)
+                raw_text = ""
+            else:
+                continue
+        except Exception as exc:  # noqa: BLE001 - _run_financial_parsing과 동일한 이유
+            # (예: EUC-KR 등 비UTF-8 원문) — 이 공시 1건만 건너뛰고 다른 연도
+            # 공시로 history_years를 채운다. Job 전체를 죽이면 안 된다.
+            logger.warning(
+                "STEP7 파싱 중 예외(건너뜀) result_id=%s rcept_no=%s: %s", result_id, rcept_no, exc
+            )
             continue
 
         fiscal_date = _extract_fiscal_date(raw_text) if raw_text else None
