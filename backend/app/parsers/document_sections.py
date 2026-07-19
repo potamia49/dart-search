@@ -20,6 +20,8 @@ from html import escape
 
 from lxml import etree
 
+from app.parsers.xml_parser import _decode_raw_xml
+
 # 프론트 버튼 4개와 1:1 대응하는 섹션 키 → 원문 TITLE 매칭 문자열(공백 제거 기준).
 SECTION_TITLE_MARKS: dict[str, str] = {
     "bs": "재무상태표",
@@ -27,6 +29,14 @@ SECTION_TITLE_MARKS: dict[str, str] = {
     "cf": "현금흐름표",
     "notes": "주석",
 }
+
+# DART 원문 표의 셀 태그. 실측상 커버 페이지는 TD/TH를 쓰지만 **재무제표 데이터
+# 행은 `<TE>`(헤더성 셀은 `<TU>`)** 를 쓴다 — xml_parser._row_values()가
+# `list(tr)`로 태그 무관하게 셀을 잡는 것과 달리, 렌더러는 화이트리스트라
+# 여기에 TE/TU를 빠뜨리면 데이터 행이 전부 빈 <tr></tr>로 렌더된다(§4-8 회귀).
+_DATA_CELL_TAGS = ("TD", "TE")
+_HEADER_CELL_TAGS = ("TH", "TU")
+_CELL_TAGS = _DATA_CELL_TAGS + _HEADER_CELL_TAGS
 
 
 def _local(el: etree._Element) -> str:
@@ -44,9 +54,9 @@ def _render_table(table: etree._Element) -> str:
         cells: list[str] = []
         for cell in tr:
             cl = _local(cell)
-            if cl not in ("TD", "TH"):
+            if cl not in _CELL_TAGS:
                 continue
-            tag = "th" if cl == "TH" else "td"
+            tag = "th" if cl in _HEADER_CELL_TAGS else "td"
             attrs = ""
             for attr in ("COLSPAN", "ROWSPAN"):
                 val = cell.get(attr)
@@ -96,6 +106,9 @@ def extract_section_html(raw_xml: bytes, section: str) -> tuple[bool, str]:
     if mark is None:
         raise ValueError(f"알 수 없는 섹션: {section!r}")
 
+    # 파서와 동일하게 인코딩을 UTF-8로 정규화한다 — 선언부는 utf-8이라 적고
+    # 실제 바이트는 EUC-KR/CP949인 원문(실측 약 4.4%)의 원문 열람도 살린다.
+    raw_xml = _decode_raw_xml(raw_xml)
     root = etree.fromstring(raw_xml, parser=etree.XMLParser(recover=True))
     if root is None:
         return False, ""

@@ -30,6 +30,7 @@ from app.exporters.excel import export_results
 from app.models.financial_snapshot import FinancialSnapshot
 from app.models.job import Job, JobPhase
 from app.models.result import Result
+from app.parsers.account_detail import parse_account_detail
 from app.parsers.document_sections import SECTION_TITLE_MARKS, extract_section_html
 
 router = APIRouter(prefix="/api/jobs", tags=["results"])
@@ -273,6 +274,10 @@ class FinancialSnapshotResponse(BaseModel):
 
     parse_status: str | None
     parse_note: str | None
+    # 1이면 이 연도를 **당기**로 하는 감사보고서에서 나온 값(= rcept_no를 열면
+    # 당기가 이 연도), 0이면 다음 연도 공시의 전기 열에서 채워진 값이다.
+    # 화면은 0인 연도의 "원문 보기"에 "전기 기준" 라벨을 붙인다(2026-07-20).
+    from_current_period: int
 
 
 @router.get(
@@ -328,6 +333,47 @@ def _pick_cached_xml(cache_dir: Path, rcept_no: str) -> Path | None:
     return xml_files[0] if xml_files else None
 
 
+def _resolve_target_rcept_no(
+    db: Session, job_id: int, result_id: int, rcept_no: str | None
+) -> str:
+    """원문 열람 대상 rcept_no를 결정하고 소속을 검증한다(원문 섹션/계정 상세 공유).
+
+    기본은 `results.rcept_no`(가장 최근 감사보고서)이고, `?rcept_no=`로 지정하면
+    해당 result의 이력 공시(`financial_snapshots.rcept_no`)여야만 허용한다 —
+    다른 회사의 원문을 임의 조회하지 못하게 막는다.
+    """
+    job = db.get(Job, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job을 찾을 수 없습니다.")
+
+    result = db.get(Result, result_id)
+    if result is None or result.job_id != job_id:
+        raise HTTPException(status_code=404, detail="해당 Job의 결과를 찾을 수 없습니다.")
+
+    if rcept_no is None:
+        target_rcept_no = result.rcept_no
+    else:
+        allowed = {result.rcept_no} | {
+            row[0]
+            for row in db.execute(
+                select(FinancialSnapshot.rcept_no).where(
+                    FinancialSnapshot.result_id == result_id
+                )
+            ).all()
+        }
+        allowed.discard(None)
+        if rcept_no not in allowed:
+            raise HTTPException(
+                status_code=404,
+                detail="해당 결과에 속한 공시(rcept_no)가 아닙니다.",
+            )
+        target_rcept_no = rcept_no
+
+    if not target_rcept_no:
+        raise HTTPException(status_code=404, detail="이 결과에는 원문 공시(rcept_no)가 없습니다.")
+    return target_rcept_no
+
+
 @router.get(
     "/{job_id}/results/{result_id}/document-sections/{section}",
     response_model=DocumentSectionResponse,
@@ -353,37 +399,7 @@ async def get_document_section(
             detail=f"지원하지 않는 섹션입니다: {section!r} (bs|is|cf|notes)",
         )
 
-    job = db.get(Job, job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="Job을 찾을 수 없습니다.")
-
-    result = db.get(Result, result_id)
-    if result is None or result.job_id != job_id:
-        raise HTTPException(status_code=404, detail="해당 Job의 결과를 찾을 수 없습니다.")
-
-    # 대상 rcept_no 결정 + 소속 검증. 기본은 결과의 최신 감사보고서, ?rcept_no=로
-    # 지정하면 이 result의 이력 공시(financial_snapshots) 중 하나여야 한다.
-    if rcept_no is None:
-        target_rcept_no = result.rcept_no
-    else:
-        allowed = {result.rcept_no} | {
-            row[0]
-            for row in db.execute(
-                select(FinancialSnapshot.rcept_no).where(
-                    FinancialSnapshot.result_id == result_id
-                )
-            ).all()
-        }
-        allowed.discard(None)
-        if rcept_no not in allowed:
-            raise HTTPException(
-                status_code=404,
-                detail="해당 결과에 속한 공시(rcept_no)가 아닙니다.",
-            )
-        target_rcept_no = rcept_no
-
-    if not target_rcept_no:
-        raise HTTPException(status_code=404, detail="이 결과에는 원문 공시(rcept_no)가 없습니다.")
+    target_rcept_no = _resolve_target_rcept_no(db, job_id, result_id, rcept_no)
 
     cache_dir = Path(get_settings().document_cache_dir)
     xml_path = _pick_cached_xml(cache_dir, target_rcept_no)
@@ -413,4 +429,71 @@ async def get_document_section(
         available=found,
         html=html,
         notice=notice,
+    )
+
+
+class AccountRowResponse(BaseModel):
+    """세부계정 1행 — 라벨(원문 그대로)/상대 레벨/당기·전기 값."""
+
+    label: str
+    level: int
+    cur: float | None = None
+    prv: float | None = None
+
+
+class AccountDetailResponse(BaseModel):
+    """요약 필드(current_assets 등) → 그 대분류의 세부계정 목록."""
+
+    rcept_no: str
+    fiscal_year_cur: str | None = None
+    accounts: dict[str, list[AccountRowResponse]] = {}
+    notice: str | None = None
+
+
+@router.get(
+    "/{job_id}/results/{result_id}/account-detail",
+    response_model=AccountDetailResponse,
+)
+async def get_account_detail(
+    job_id: int,
+    result_id: int,
+    rcept_no: str | None = None,
+    db: Session = Depends(get_db),
+) -> AccountDetailResponse:
+    """요약 13항목 대분류별 **세부계정 상세**를 반환한다.
+
+    요약 표에서 "유동자산"을 클릭하면 그 아래 세부계정을 인라인으로 펼치기 위한
+    데이터다. 원문 섹션 열람과 동일하게 로컬 문서 캐시만 읽으므로 추가 API
+    호출/쿼터가 0건이고, `?rcept_no=`로 다년치 이력의 특정 연도 공시도 조회할
+    수 있다. `fiscal_year_cur`는 그 원문의 당기 결산연도로, 재무이력 표가 어느
+    열(당기/전기)의 값을 써야 하는지 판정하는 데 쓴다.
+    """
+    target_rcept_no = _resolve_target_rcept_no(db, job_id, result_id, rcept_no)
+
+    cache_dir = Path(get_settings().document_cache_dir)
+    xml_path = _pick_cached_xml(cache_dir, target_rcept_no)
+    if xml_path is None:
+        target_dir = cache_dir / target_rcept_no
+        if target_dir.is_dir() and any(target_dir.rglob("*.pdf")):
+            # PDF 원문은 계층 파싱을 지원하지 않는다 — 에러가 아니라 빈 상세로 안내한다.
+            return AccountDetailResponse(
+                rcept_no=target_rcept_no,
+                notice="PDF 원문은 계정 상세를 지원하지 않습니다(XML 원문만 지원).",
+            )
+        raise HTTPException(
+            status_code=404,
+            detail="원문 캐시가 없습니다 — 재수집이 필요합니다.",
+        )
+
+    detail = parse_account_detail(xml_path.read_bytes())
+    return AccountDetailResponse(
+        rcept_no=target_rcept_no,
+        fiscal_year_cur=detail.fiscal_year_cur,
+        accounts={
+            field: [
+                AccountRowResponse(label=row.label, level=row.level, cur=row.cur, prv=row.prv)
+                for row in rows
+            ]
+            for field, rows in detail.accounts.items()
+        },
     )

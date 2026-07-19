@@ -381,6 +381,58 @@ def test_document_section_returns_assembled_html(client_with_db, monkeypatch, tm
     assert "현" in body["html"]  # 현금흐름표 제목/내용
 
 
+def test_document_section_renders_te_data_cells(client_with_db, monkeypatch, tmp_path):
+    """재무제표 데이터 셀은 TD가 아니라 <TE> 태그다 — 이를 셀로 처리하지 않으면
+    계정과목/금액이 전부 빈 <tr></tr>로 렌더된다(§4-8 회귀). 실제 금액 값과
+    계정과목이 HTML에 담기는지, 빈 행이 없는지 검증한다."""
+    import re
+
+    client, factory = client_with_db
+    job_id, result_id = _seed_result_with_rcept(factory, "20260630000641")
+    _point_cache_at_tmp(monkeypatch, tmp_path, "20260630000641", "20260630000641")
+
+    resp = client.get(f"/api/jobs/{job_id}/results/{result_id}/document-sections/bs")
+    assert resp.status_code == 200
+    html = resp.json()["html"]
+    # 금액 셀(1,234,567 형태)이 실제로 담겨 있어야 한다.
+    assert len(re.findall(r"[0-9]{1,3}(?:,[0-9]{3})+", html)) > 10
+    # 데이터 행이 빈 <tr></tr>로 렌더되면 안 된다.
+    assert "<tr></tr>" not in html
+    assert "자산총계" in html.replace(" ", "")
+
+
+def test_account_detail_returns_children_per_summary_field(client_with_db, monkeypatch, tmp_path):
+    """요약 대분류(유동자산 등)별 세부계정이 계층/값과 함께 반환되는지 검증."""
+    client, factory = client_with_db
+    job_id, result_id = _seed_result_with_rcept(factory, "20260630000641")
+    _point_cache_at_tmp(monkeypatch, tmp_path, "20260630000641", "20260630000641")
+
+    resp = client.get(f"/api/jobs/{job_id}/results/{result_id}/account-detail")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["rcept_no"] == "20260630000641"
+    assert body["fiscal_year_cur"] == "2026"  # 이력 표의 당기/전기 열 판정 근거
+
+    rows = body["accounts"]["current_assets"]
+    assert len(rows) > 5
+    # 세부계정은 라벨/레벨/당기·전기 값을 갖는다.
+    assert all(row["level"] >= 1 for row in rows)
+    assert any(row["cur"] is not None for row in rows)
+    # 총계 항목은 하위가 형제 대분류라 children이 비어 있다(토글 비활성 대상).
+    assert body["accounts"]["total_assets"] == []
+
+
+def test_account_detail_rejects_foreign_rcept_no(client_with_db, monkeypatch, tmp_path):
+    client, factory = client_with_db
+    job_id, result_id = _seed_result_with_rcept(factory, "20260630000641")
+    _point_cache_at_tmp(monkeypatch, tmp_path, "20260630000641", "20260630000641")
+
+    resp = client.get(
+        f"/api/jobs/{job_id}/results/{result_id}/account-detail?rcept_no=19990101000001"
+    )
+    assert resp.status_code == 404
+
+
 def test_document_section_invalid_section_returns_400(client_with_db, monkeypatch, tmp_path):
     client, factory = client_with_db
     job_id, result_id = _seed_result_with_rcept(factory, "20260630000641")

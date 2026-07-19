@@ -1168,14 +1168,24 @@ def _seed_result(session_factory, *, job_id: int, corp_code: str, excluded_by_re
 async def test_collect_history_for_result_stops_once_target_years_reached(
     db_session_factory, tmp_path, monkeypatch
 ):
-    """3건의 공시(각 당기·전기 비교)로 목표 4개 연도를 채우면, 더 오래된 4번째
-    공시는 다운로드하지 않아야 한다(쿼터 절감 — newest-first 조기 중단)."""
+    """목표 4개 연도가 각각 **자기 공시(당기)** 로 확정되면 더 오래된 공시는
+    다운로드하지 않아야 한다(2026-07-20 규칙 변경 — 조기 중단은 유지하되
+    "연도 수를 채우면 중단"이 아니라 "연도마다 당기 원문을 확보하면 중단").
+
+    각 연도 값도 그 연도를 당기로 하는 공시에서 나와야 한다 — 전기 열로 먼저
+    채워졌더라도 자기 공시를 열면 덮어쓴다."""
     monkeypatch.setattr(pipeline, "parse_xml_financials", _fake_parse_xml_financials)
     settings = Settings(document_cache_dir=str(tmp_path / "documents"))
     job_id = _make_job(db_session_factory)
     result_id = _seed_result(db_session_factory, job_id=job_id, corp_code="H1")
 
-    r1, r2, r3, r4 = "20260601000001", "20250601000002", "20240601000003", "20230601000004"
+    r1, r2, r3, r4, r5 = (
+        "20260601000001",
+        "20250601000002",
+        "20240601000003",
+        "20230601000004",
+        "20220601000005",
+    )
     disclosure_page = {
         "status": "000",
         "total_page": 1,
@@ -1184,19 +1194,22 @@ async def test_collect_history_for_result_stops_once_target_years_reached(
             {"corp_code": "H1", "corp_name": "이력회사", "rcept_no": r2},
             {"corp_code": "H1", "corp_name": "이력회사", "rcept_no": r3},
             {"corp_code": "H1", "corp_name": "이력회사", "rcept_no": r4},
+            {"corp_code": "H1", "corp_name": "이력회사", "rcept_no": r5},
         ],
     }
     documents = {
         r1: _history_doc_zip("20251231", revenue_cur=25_000_000, revenue_prv=24_000_000, file_name=f"{r1}.xml"),
         r2: _history_doc_zip("20241231", revenue_cur=24_999_999, revenue_prv=23_000_000, file_name=f"{r2}.xml"),
         r3: _history_doc_zip("20231231", revenue_cur=22_999_999, revenue_prv=22_000_000, file_name=f"{r3}.xml"),
-        # r4는 documents에 아예 없음 -> 만약 호출된다면 DartApiError로 드러난다.
+        r4: _history_doc_zip("20221231", revenue_cur=21_999_999, revenue_prv=21_000_000, file_name=f"{r4}.xml"),
+        # r5(2021년 당기)는 documents에 아예 없음 -> 호출되면 DartApiError로 드러난다.
     }
     client = FakeDartClient(disclosure_pages_by_corp={"H1": [disclosure_page]}, documents=documents)
 
     await pipeline._collect_history_for_result(client, db_session_factory, settings, result_id, "H1", 4)
 
-    assert client.document_calls == [r1, r2, r3]  # r4는 조기 중단으로 다운로드되지 않음
+    # 목표 4개 연도(2025~2022)의 당기 원문 4건까지만 — r5는 조기 중단으로 미다운로드.
+    assert client.document_calls == [r1, r2, r3, r4]
 
     with db_session_factory() as db:
         snapshots = {
@@ -1205,12 +1218,58 @@ async def test_collect_history_for_result_stops_once_target_years_reached(
                 select(FinancialSnapshot).where(FinancialSnapshot.result_id == result_id)
             ).scalars().all()
         }
-    assert set(snapshots) == {"2025", "2024", "2023", "2022"}
-    assert snapshots["2025"].revenue == 25_000_000  # r1 당기
-    assert snapshots["2024"].revenue == 24_000_000  # r1 전기 (r2 당기의 24,999,999가 아님 — newest-first 우선)
-    assert snapshots["2023"].revenue == 23_000_000  # r2 전기
-    assert snapshots["2022"].revenue == 22_000_000  # r3 전기
-    assert all(s.rcept_no in (r1, r2, r3) for s in snapshots.values())
+    assert set(snapshots) == {"2025", "2024", "2023", "2022"}  # r4의 전기(2021)는 추가하지 않는다
+    # 각 연도 값·rcept_no는 그 연도를 당기로 하는 공시에서 나온다.
+    assert (snapshots["2025"].revenue, snapshots["2025"].rcept_no) == (25_000_000, r1)
+    assert (snapshots["2024"].revenue, snapshots["2024"].rcept_no) == (24_999_999, r2)
+    assert (snapshots["2023"].revenue, snapshots["2023"].rcept_no) == (22_999_999, r3)
+    assert (snapshots["2022"].revenue, snapshots["2022"].rcept_no) == (21_999_999, r4)
+    assert all(s.from_current_period == 1 for s in snapshots.values())
+
+
+@pytest.mark.asyncio
+async def test_collect_history_marks_oldest_year_as_previous_period_when_own_report_missing(
+    db_session_factory, tmp_path, monkeypatch
+):
+    """자기 공시를 못 찾은 연도(대개 가장 오래된 연도)는 다음 연도 공시의 전기
+    열 값이 그대로 남고 `from_current_period=0`으로 표시된다 — 화면은 그 연도
+    버튼에 "전기 기준"을 붙여 당기 연도가 어긋난다는 걸 알린다."""
+    monkeypatch.setattr(pipeline, "parse_xml_financials", _fake_parse_xml_financials)
+    settings = Settings(document_cache_dir=str(tmp_path / "documents"))
+    job_id = _make_job(db_session_factory)
+    result_id = _seed_result(db_session_factory, job_id=job_id, corp_code="H4")
+
+    r1, r2 = "20260601000001", "20250601000002"
+    disclosure_page = {
+        "status": "000",
+        "total_page": 1,
+        "list": [
+            {"corp_code": "H4", "corp_name": "이력회사", "rcept_no": r1},
+            {"corp_code": "H4", "corp_name": "이력회사", "rcept_no": r2},
+        ],
+    }
+    documents = {
+        r1: _history_doc_zip("20251231", revenue_cur=5_000, revenue_prv=4_000, file_name=f"{r1}.xml"),
+        r2: _history_doc_zip("20241231", revenue_cur=4_500, revenue_prv=3_000, file_name=f"{r2}.xml"),
+    }
+    client = FakeDartClient(disclosure_pages_by_corp={"H4": [disclosure_page]}, documents=documents)
+
+    await pipeline._collect_history_for_result(client, db_session_factory, settings, result_id, "H4", 3)
+
+    with db_session_factory() as db:
+        snapshots = {
+            s.fiscal_year: s
+            for s in db.execute(
+                select(FinancialSnapshot).where(FinancialSnapshot.result_id == result_id)
+            ).scalars().all()
+        }
+    assert set(snapshots) == {"2025", "2024", "2023"}
+    assert snapshots["2025"].from_current_period == 1
+    assert snapshots["2024"].from_current_period == 1  # r1 전기로 채웠다가 r2 당기로 교정
+    assert snapshots["2024"].revenue == 4_500
+    # 2023년을 당기로 하는 공시는 없다 -> r2의 전기 값이 그대로 남는다.
+    assert snapshots["2023"].from_current_period == 0
+    assert (snapshots["2023"].revenue, snapshots["2023"].rcept_no) == (3_000, r2)
 
 
 @pytest.mark.asyncio
@@ -1243,13 +1302,25 @@ async def test_collect_history_for_result_insufficient_disclosures_does_not_fail
 
 @pytest.mark.asyncio
 async def test_collect_history_for_result_skips_api_when_already_sufficient(db_session_factory, tmp_path):
-    """이미 목표 연도수만큼 financial_snapshots가 있으면 list.json조차 호출하지 않는다(resume 핵심)."""
+    """이미 목표 연도수만큼 financial_snapshots가 있고 (가장 오래된 연도를 뺀)
+    나머지가 당기 유래로 확정돼 있으면 list.json조차 호출하지 않는다(resume 핵심).
+
+    가장 오래된 연도(여기서는 2024)는 자기 공시가 조회 기간 밖이라 전기 유래로
+    남는 것이 정상이므로, 그 연도만 0이어도 재조회하지 않는다."""
     settings = Settings(document_cache_dir=str(tmp_path / "documents"))
     job_id = _make_job(db_session_factory)
     result_id = _seed_result(db_session_factory, job_id=job_id, corp_code="H3")
     with db_session_factory() as db:
-        db.add(FinancialSnapshot(result_id=result_id, fiscal_year="2025", rcept_no="X"))
-        db.add(FinancialSnapshot(result_id=result_id, fiscal_year="2024", rcept_no="X"))
+        db.add(
+            FinancialSnapshot(
+                result_id=result_id, fiscal_year="2025", rcept_no="X", from_current_period=1
+            )
+        )
+        db.add(
+            FinancialSnapshot(
+                result_id=result_id, fiscal_year="2024", rcept_no="X", from_current_period=0
+            )
+        )
         db.commit()
 
     client = FakeDartClient()  # 응답을 아무것도 안 줌 -> 호출되면 즉시 실패

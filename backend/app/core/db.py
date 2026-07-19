@@ -82,6 +82,10 @@ _FINANCIAL_SNAPSHOTS_NEW_COLUMNS: dict[str, str] = {
     "cf_investing": "INTEGER",
     "cf_financing": "INTEGER",
     "cf_ending_cash": "INTEGER",
+    # 이 행의 수치·rcept_no가 "그 연도를 당기로 하는" 공시에서 나왔는지(1) 아니면
+    # 다음 연도 공시의 전기 열에서 임시로 채워졌는지(0). 기존 행은 후자일 수
+    # 있으므로 기본값 0으로 붙인다(연도별 원문 보기 라벨에 그대로 쓰인다).
+    "from_current_period": "INTEGER DEFAULT 0",
 }
 
 

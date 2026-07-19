@@ -1,5 +1,6 @@
 import { apiClient } from './client'
 import type {
+  AccountDetailResponse,
   DocumentSection,
   DocumentSectionResponse,
   ExportFormat,
@@ -90,6 +91,21 @@ export async function getDocumentSection(
 ): Promise<DocumentSectionResponse> {
   const { data } = await apiClient.get<DocumentSectionResponse>(
     `/jobs/${jobId}/results/${resultId}/document-sections/${section}`,
+    { params: rceptNo ? { rcept_no: rceptNo } : {} },
+  )
+  return data
+}
+
+/** 요약 표의 대분류(유동자산 등)를 펼칠 때 쓰는 세부계정 상세.
+ * 원문 섹션 열람과 마찬가지로 로컬 문서 캐시만 읽는다(추가 쿼터 0건).
+ * rcept_no를 지정하면 다년치 이력의 특정 연도 공시를 파싱한다. */
+export async function getAccountDetail(
+  jobId: number,
+  resultId: number,
+  rceptNo?: string,
+): Promise<AccountDetailResponse> {
+  const { data } = await apiClient.get<AccountDetailResponse>(
+    `/jobs/${jobId}/results/${resultId}/account-detail`,
     { params: rceptNo ? { rcept_no: rceptNo } : {} },
   )
   return data

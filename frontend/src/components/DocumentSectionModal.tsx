@@ -16,6 +16,9 @@ export interface DocumentSectionTarget {
   rceptNo?: string
   /** 화면 표시용 연도 라벨(있으면 제목에 함께 노출). */
   yearLabel?: string
+  /** 이 원문의 **당기**가 `yearLabel` 연도인지(2026-07-20). false면 그 연도를
+   *  전기로 담고 있는 다음 연도 보고서라는 뜻이라 제목에 그대로 밝힌다. */
+  fromCurrentPeriod?: boolean
 }
 
 interface DocumentSectionModalProps {
@@ -76,7 +79,17 @@ export default function DocumentSectionModal({
     }
   }, [jobId, resultId, section, rceptNo, target])
 
-  const yearSuffix = target?.yearLabel ? ` · ${target.yearLabel}년` : ''
+  // 연도별 원문은 "그 연도가 당기인 보고서"를 여는 것이 원칙이라, 제목에
+  // 당기·전기 연도를 함께 밝혀 표의 연도 열과 어긋나 보이지 않게 한다.
+  const yearSuffix = (() => {
+    const label = target?.yearLabel
+    if (!label) return ''
+    const year = Number(label)
+    if (!Number.isFinite(year)) return ` · ${label}년`
+    return target?.fromCurrentPeriod === false
+      ? ` · ${label}년(전기 기준 — 당기 ${year + 1}년 보고서)`
+      : ` · ${label}년(당기 ${year}년 · 전기 ${year - 1}년)`
+  })()
 
   return (
     <Modal

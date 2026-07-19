@@ -20,6 +20,8 @@
       sga                 INTEGER, operating_income     INTEGER, net_income   INTEGER,
       parse_status        TEXT,   -- OK / PARTIAL / FAILED (results.parse_status와 동일 의미)
       parse_note          TEXT,
+      from_current_period INTEGER,-- 1: 이 연도를 당기로 하는 공시에서 나온 값
+                                  -- 0: 다음 연도 공시의 전기 열에서 임시로 채운 값
       UNIQUE(result_id, fiscal_year)
     );
 
@@ -30,10 +32,12 @@ PERIODTO 연도로, 전기의 fiscal_year를 "당기 연도 - 1"로 계산한다
 정기 감사가 기본 전제라는 실무적 가정, 상세개발계획.md §4-6 참고).
 
 `(result_id, fiscal_year)` 유니크 제약으로 같은 회사의 같은 회계연도는 한
-행만 유지한다 — STEP 7이 최신 rcept_no(정정 포함)를 우선 처리하도록
-설계되어 있어(더 최근에 접수된 공시가 그 연도 값을 먼저 채운다), 이후
-더 오래된 공시에서 같은 연도가 다시 나와도 "이미 있으면 건너뜀"으로
-자연히 최신 값이 유지된다(pipeline.py `_collect_history_for_result`).
+행만 유지한다. 어느 공시의 값을 그 연도의 값으로 삼을지는
+`from_current_period`가 결정한다(2026-07-20 변경) — **그 연도를 당기로 하는
+공시(1차 자료)를 항상 우선**하고, 아직 그런 공시를 못 연 연도만 다음 연도
+공시의 전기 열로 임시(`from_current_period=0`)로 채운 뒤 자기 공시를 열게
+되면 덮어쓴다(pipeline.py `_collect_history_for_result`). 정정 공시가 있으면
+newest-first 순회 덕분에 정정본이 먼저 그 연도를 확정한다.
 """
 
 from __future__ import annotations
@@ -76,3 +80,13 @@ class FinancialSnapshot(Base):
 
     parse_status: Mapped[str | None] = mapped_column(String, nullable=True)  # OK/PARTIAL/FAILED
     parse_note: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    # 이 행의 수치·rcept_no 출처가 "그 연도를 **당기**로 하는" 감사보고서인지(1),
+    # 아니면 다음 연도 공시의 **전기** 열에서 임시로 채워진 값인지(0).
+    # 2026-07-20 추가 — 화면의 연도별 "원문 보기" 버튼이 "당기가 그 연도인 원문"을
+    # 열어야 한다는 요구에서 나왔다. STEP 7이 newest-first로 순회하며 전기 열로
+    # 먼저 채운 연도를 나중에 그 연도의 자기 공시로 덮어쓰는데, 이 플래그가
+    # "아직 전기 유래(임시)"인 연도를 구분해 준다(pipeline.py STEP 7 참고).
+    # 이 컬럼 도입 이전에 수집된 기존 행은 전부 0이며(실제로는 당기 유래일 수도
+    # 있다), 화면은 0인 연도의 버튼에 "전기 기준" 라벨을 붙인다.
+    from_current_period: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")

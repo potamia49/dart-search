@@ -1,8 +1,33 @@
-import { Fragment, useEffect, useState } from 'react'
-import { Anchor, Badge, Button, Drawer, Group, Loader, SimpleGrid, Stack, Table, Text, Title } from '@mantine/core'
-import type { FinancialSnapshotResponse, ResultResponse } from '../types'
-import { getResultHistory } from '../api/results'
-import { BASIC_COLUMNS, FINANCIAL_GROUPS, formatCell } from '../util/resultColumns'
+import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
+import {
+  Anchor,
+  Badge,
+  Button,
+  Drawer,
+  Group,
+  Loader,
+  SimpleGrid,
+  Stack,
+  Table,
+  Text,
+  Title,
+  Tooltip,
+  UnstyledButton,
+} from '@mantine/core'
+import type {
+  AccountDetailResponse,
+  FinancialSnapshotResponse,
+  ResultResponse,
+} from '../types'
+import { getAccountDetail, getResultHistory } from '../api/results'
+import {
+  BASIC_COLUMNS,
+  FINANCIAL_GROUPS,
+  formatCell,
+  formatNumber,
+  type FinancialGroup,
+  type FinancialItem,
+} from '../util/resultColumns'
 import DocumentSectionModal, { type DocumentSectionTarget } from './DocumentSectionModal'
 
 interface ResultDetailDrawerProps {
@@ -13,32 +38,256 @@ interface ResultDetailDrawerProps {
 
 const DART_ORIGINAL_DOC_BASE = 'https://dart.fss.or.kr/dsaf001/main.do?rcpNo='
 
-// §4-8 원문 보기 버튼 4개.
-const DOC_SECTION_BUTTONS: { section: DocumentSectionTarget['section']; label: string }[] = [
-  { section: 'bs', label: '재무상태표' },
-  { section: 'is', label: '손익계산서' },
-  { section: 'cf', label: '현금흐름표' },
-  { section: 'notes', label: '주석' },
-]
+/** 세부계정 상세를 펼칠 수 있는 항목인지 — 현금흐름표와 계산값(매출총이익율)은
+ * 원문에 대응하는 대분류가 없어 하위계정이 존재하지 않는다. */
+function canExpand(group: FinancialGroup, item: FinancialItem): boolean {
+  if (group.section === 'cf') return false
+  return item.snapKey !== 'gross_margin'
+}
+
+/** 연도 간 계정 매칭 키 — 각주 번호("(주석3)")나 항목 번호("1.")는 연도마다
+ * 달라질 수 있어 제거한 뒤 비교한다. 표시는 원문 라벨을 그대로 쓴다. */
+function accountKey(label: string): string {
+  return label
+    .replace(/\([^)]*\)/g, '')
+    .replace(/^[0-9IVXivx]+[.)]\s*/, '')
+    .replace(/\s+/g, '')
+}
+
+/** rcept_no별 계정 상세 캐시 — 같은 원문을 여러 번 내려받지 않는다.
+ * 상세는 로컬 문서 캐시만 읽으므로 DART 쿼터를 쓰지 않는다. */
+function useAccountDetails(jobId: number, resultId: number | null) {
+  const [byRcept, setByRcept] = useState<Record<string, AccountDetailResponse>>({})
+  const [loading, setLoading] = useState(false)
+  const pending = useRef<Set<string>>(new Set())
+
+  // 다른 회사를 열면 캐시를 비운다(원문이 회사마다 다르므로 재사용 불가).
+  useEffect(() => {
+    setByRcept({})
+    pending.current.clear()
+  }, [resultId])
+
+  const ensure = useCallback(
+    async (rceptNos: (string | null | undefined)[]) => {
+      if (resultId === null) return
+      const targets = Array.from(
+        new Set(rceptNos.filter((r): r is string => Boolean(r))),
+      ).filter((r) => !pending.current.has(r))
+      if (targets.length === 0) return
+      targets.forEach((r) => pending.current.add(r))
+      setLoading(true)
+      try {
+        const loaded = await Promise.all(
+          targets.map(async (r) => {
+            try {
+              return [r, await getAccountDetail(jobId, resultId, r)] as const
+            } catch {
+              return null // 원문 캐시 없음 등 — 해당 연도만 빈 상세로 둔다.
+            }
+          }),
+        )
+        const entries = loaded.filter((e): e is readonly [string, AccountDetailResponse] => e !== null)
+        if (entries.length > 0) {
+          setByRcept((prev) => ({ ...prev, ...Object.fromEntries(entries) }))
+        }
+      } finally {
+        setLoading(false)
+      }
+    },
+    [jobId, resultId],
+  )
+
+  return { byRcept, ensure, loading }
+}
+
+/** 항목 라벨 셀 — 펼치기 가능한 항목이면 ▸/▾ 토글 버튼으로 렌더한다. */
+function ItemLabelCell({
+  item,
+  expandable,
+  expanded,
+  onToggle,
+}: {
+  item: FinancialItem
+  expandable: boolean
+  expanded: boolean
+  onToggle: () => void
+}) {
+  if (!expandable) return <>{item.label}</>
+  return (
+    <UnstyledButton onClick={onToggle} style={{ fontSize: 'inherit' }}>
+      <Group gap={4} wrap="nowrap">
+        <Text span c="dimmed" size="xs">
+          {expanded ? '▾' : '▸'}
+        </Text>
+        <Text span style={{ textDecoration: 'underline dotted' }}>
+          {item.label}
+        </Text>
+      </Group>
+    </UnstyledButton>
+  )
+}
+
+/** 펼쳐진 세부계정이 없을 때 안내 행. */
+function EmptyDetailRow({ colSpan }: { colSpan: number }) {
+  return (
+    <Table.Tr>
+      <Table.Td colSpan={colSpan}>
+        <Text size="xs" c="dimmed" pl="md">
+          이 항목의 세부 내역이 원문에 없습니다.
+        </Text>
+      </Table.Td>
+    </Table.Tr>
+  )
+}
+
+/** 당기·전기 표 — 대분류를 클릭하면 그 아래 세부계정을 인라인으로 펼친다. */
+function CurrentPrevTable({
+  result,
+  details,
+}: {
+  result: ResultResponse
+  details: ReturnType<typeof useAccountDetails>
+}) {
+  const [expanded, setExpanded] = useState<Set<string>>(new Set())
+  const { byRcept, ensure, loading } = details
+  const detail = result.rcept_no ? byRcept[result.rcept_no] : undefined
+
+  const toggle = (field: string) => {
+    setExpanded((prev) => {
+      const next = new Set(prev)
+      if (next.has(field)) next.delete(field)
+      else {
+        next.add(field)
+        void ensure([result.rcept_no])
+      }
+      return next
+    })
+  }
+
+  return (
+    <Table striped highlightOnHover withTableBorder>
+      <Table.Thead>
+        <Table.Tr>
+          <Table.Th>항목</Table.Th>
+          <Table.Th>당기</Table.Th>
+          <Table.Th>전기</Table.Th>
+        </Table.Tr>
+      </Table.Thead>
+      <Table.Tbody>
+        {FINANCIAL_GROUPS.map((group) => (
+          <Fragment key={group.section}>
+            <Table.Tr>
+              <Table.Td colSpan={3}>
+                <Text span fw={600} size="sm" c="dimmed">{group.title}</Text>
+              </Table.Td>
+            </Table.Tr>
+            {group.items.map((item) => {
+              const field = item.snapKey as string
+              const expandable = canExpand(group, item)
+              const isOpen = expanded.has(field)
+              const children = detail?.accounts[field] ?? []
+              return (
+                <Fragment key={item.curKey}>
+                  <Table.Tr>
+                    <Table.Td>
+                      <ItemLabelCell
+                        item={item}
+                        expandable={expandable}
+                        expanded={isOpen}
+                        onToggle={() => toggle(field)}
+                      />
+                    </Table.Td>
+                    <Table.Td>{item.format(result[item.curKey])}</Table.Td>
+                    <Table.Td>{item.format(result[item.prvKey])}</Table.Td>
+                  </Table.Tr>
+                  {isOpen && loading && !detail && (
+                    <Table.Tr>
+                      <Table.Td colSpan={3}><Loader size="xs" /></Table.Td>
+                    </Table.Tr>
+                  )}
+                  {/* 원문(rcept_no)이 아예 없는 결과도 조용히 비어 있지 않고 안내가 나오게 한다. */}
+                  {isOpen && !loading && children.length === 0 && <EmptyDetailRow colSpan={3} />}
+                  {isOpen &&
+                    children.map((row, idx) => (
+                      <Table.Tr key={`${field}-${idx}`}>
+                        <Table.Td style={{ paddingLeft: 12 + row.level * 14 }}>
+                          <Text span size="xs" c="dimmed">{row.label}</Text>
+                        </Table.Td>
+                        <Table.Td>
+                          <Text span size="xs" c="dimmed">{formatNumber(row.cur)}</Text>
+                        </Table.Td>
+                        <Table.Td>
+                          <Text span size="xs" c="dimmed">{formatNumber(row.prv)}</Text>
+                        </Table.Td>
+                      </Table.Tr>
+                    ))}
+                </Fragment>
+              )
+            })}
+          </Fragment>
+        ))}
+      </Table.Tbody>
+    </Table>
+  )
+}
+
+/** 재무이력 표에서 특정 대분류의 세부계정 행 목록을 만든다.
+ * 연도마다 원문(rcept_no)이 다르고 계정 구성도 달라질 수 있어, 최신 연도부터
+ * 훑으며 계정 키의 합집합을 만들고 표시 라벨은 최신 연도의 것을 쓴다. */
+function buildHistoryChildRows(
+  field: string,
+  history: FinancialSnapshotResponse[],
+  byRcept: Record<string, AccountDetailResponse>,
+): { key: string; label: string; level: number }[] {
+  const seen = new Map<string, { key: string; label: string; level: number }>()
+  for (const snap of [...history].reverse()) {
+    const detail = snap.rcept_no ? byRcept[snap.rcept_no] : undefined
+    for (const row of detail?.accounts[field] ?? []) {
+      const key = accountKey(row.label)
+      if (!seen.has(key)) seen.set(key, { key, label: row.label, level: row.level })
+    }
+  }
+  return Array.from(seen.values())
+}
+
+/** 해당 연도 열에 쓸 값 — 원문의 당기 결산연도와 같으면 당기값, 아니면 전기값이다
+ * (한 원문이 당기·전기 2개 연도를 담고 있어 연도별로 열을 골라야 한다). */
+function historyCellValue(
+  snap: FinancialSnapshotResponse,
+  field: string,
+  key: string,
+  byRcept: Record<string, AccountDetailResponse>,
+): number | null {
+  const detail = snap.rcept_no ? byRcept[snap.rcept_no] : undefined
+  if (!detail) return null
+  const row = (detail.accounts[field] ?? []).find((r) => accountKey(r.label) === key)
+  if (!row) return null
+  return detail.fiscal_year_cur === snap.fiscal_year ? row.cur : row.prv
+}
 
 /** STEP 7(최근 N년 재무이력) 표 — Drawer가 열릴 때(선택된 result가 바뀔 때)만 lazy fetch한다. */
 function FinancialHistorySection({
   jobId,
   resultId,
+  details,
   onOpenDocument,
 }: {
   jobId: number
   resultId: number
+  details: ReturnType<typeof useAccountDetails>
   onOpenDocument: (target: DocumentSectionTarget) => void
 }) {
   const [history, setHistory] = useState<FinancialSnapshotResponse[] | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [expanded, setExpanded] = useState<Set<string>>(new Set())
+  const { byRcept, ensure, loading: detailLoading } = details
 
   useEffect(() => {
     let cancelled = false
     setHistory(null)
     setError(null)
+    setExpanded(new Set())
     setLoading(true)
     getResultHistory(jobId, resultId)
       .then((data) => {
@@ -55,6 +304,19 @@ function FinancialHistorySection({
     }
   }, [jobId, resultId])
 
+  const toggle = (field: string) => {
+    setExpanded((prev) => {
+      const next = new Set(prev)
+      if (next.has(field)) next.delete(field)
+      else {
+        next.add(field)
+        // 연도마다 원문이 다르므로 이력에 등장하는 모든 공시를 확보한다.
+        void ensure((history ?? []).map((s) => s.rcept_no))
+      }
+      return next
+    })
+  }
+
   if (loading) return <Loader size="sm" />
   if (error) return <Text c="red" size="sm">{error}</Text>
   if (!history || history.length === 0) {
@@ -65,6 +327,9 @@ function FinancialHistorySection({
       </Text>
     )
   }
+
+  const colSpan = 1 + history.length
+  const detailsReady = history.some((s) => s.rcept_no && byRcept[s.rcept_no])
 
   return (
     <Table.ScrollContainer minWidth={400}>
@@ -77,19 +342,33 @@ function FinancialHistorySection({
                 <Stack gap={2}>
                   <Text span fw={600} size="sm">{snap.fiscal_year}</Text>
                   {snap.rcept_no && (
-                    <Button
-                      size="compact-xs"
-                      variant="light"
-                      onClick={() =>
-                        onOpenDocument({
-                          section: 'bs',
-                          rceptNo: snap.rcept_no ?? undefined,
-                          yearLabel: snap.fiscal_year,
-                        })
+                    <Tooltip
+                      multiline
+                      w={260}
+                      label={
+                        snap.from_current_period
+                          ? `당기가 ${snap.fiscal_year}년(전기 ${Number(snap.fiscal_year) - 1}년)인 감사보고서 원문을 엽니다.`
+                          : `${snap.fiscal_year}년을 당기로 하는 감사보고서를 찾지 못해, 이 연도를 전기로 담고 있는 ${Number(snap.fiscal_year) + 1}년 보고서를 엽니다.`
                       }
                     >
-                      원문 보기
-                    </Button>
+                      <Button
+                        size="compact-xs"
+                        variant="light"
+                        onClick={() =>
+                          onOpenDocument({
+                            section: 'bs',
+                            rceptNo: snap.rcept_no ?? undefined,
+                            yearLabel: snap.fiscal_year,
+                            fromCurrentPeriod: Boolean(snap.from_current_period),
+                          })
+                        }
+                      >
+                        원문 보기
+                      </Button>
+                    </Tooltip>
+                  )}
+                  {snap.rcept_no && !snap.from_current_period && (
+                    <Text size="10px" c="dimmed">전기 기준</Text>
                   )}
                 </Stack>
               </Table.Th>
@@ -100,18 +379,56 @@ function FinancialHistorySection({
           {FINANCIAL_GROUPS.map((group) => (
             <Fragment key={group.section}>
               <Table.Tr>
-                <Table.Td colSpan={1 + history.length}>
+                <Table.Td colSpan={colSpan}>
                   <Text span fw={600} size="sm" c="dimmed">{group.title}</Text>
                 </Table.Td>
               </Table.Tr>
-              {group.items.map((item) => (
-                <Table.Tr key={item.snapKey}>
-                  <Table.Td>{item.label}</Table.Td>
-                  {history.map((snap) => (
-                    <Table.Td key={snap.fiscal_year}>{item.format(snap[item.snapKey])}</Table.Td>
-                  ))}
-                </Table.Tr>
-              ))}
+              {group.items.map((item) => {
+                const field = item.snapKey as string
+                const expandable = canExpand(group, item)
+                const isOpen = expanded.has(field)
+                const childRows = isOpen ? buildHistoryChildRows(field, history, byRcept) : []
+                return (
+                  <Fragment key={item.snapKey}>
+                    <Table.Tr>
+                      <Table.Td>
+                        <ItemLabelCell
+                          item={item}
+                          expandable={expandable}
+                          expanded={isOpen}
+                          onToggle={() => toggle(field)}
+                        />
+                      </Table.Td>
+                      {history.map((snap) => (
+                        <Table.Td key={snap.fiscal_year}>{item.format(snap[item.snapKey])}</Table.Td>
+                      ))}
+                    </Table.Tr>
+                    {isOpen && detailLoading && !detailsReady && (
+                      <Table.Tr>
+                        <Table.Td colSpan={colSpan}><Loader size="xs" /></Table.Td>
+                      </Table.Tr>
+                    )}
+                    {isOpen && !detailLoading && childRows.length === 0 && (
+                      <EmptyDetailRow colSpan={colSpan} />
+                    )}
+                    {isOpen &&
+                      childRows.map((child) => (
+                        <Table.Tr key={`${field}-${child.key}`}>
+                          <Table.Td style={{ paddingLeft: 12 + child.level * 14 }}>
+                            <Text span size="xs" c="dimmed">{child.label}</Text>
+                          </Table.Td>
+                          {history.map((snap) => (
+                            <Table.Td key={snap.fiscal_year}>
+                              <Text span size="xs" c="dimmed">
+                                {formatNumber(historyCellValue(snap, field, child.key, byRcept))}
+                              </Text>
+                            </Table.Td>
+                          ))}
+                        </Table.Tr>
+                      ))}
+                  </Fragment>
+                )
+              })}
             </Fragment>
           ))}
           <Table.Tr>
@@ -129,6 +446,7 @@ function FinancialHistorySection({
 /** 행 클릭 시 당기·전기 전 항목 + DART 원문 링크를 보여주는 상세 패널 (상세개발계획.md §7-3). */
 export default function ResultDetailDrawer({ jobId, result, onClose }: ResultDetailDrawerProps) {
   const [docTarget, setDocTarget] = useState<DocumentSectionTarget | null>(null)
+  const details = useAccountDetails(jobId, result?.id ?? null)
 
   // Drawer가 닫히거나 다른 result로 바뀌면 열려 있던 원문 모달도 닫는다.
   useEffect(() => {
@@ -179,52 +497,16 @@ export default function ResultDetailDrawer({ jobId, result, onClose }: ResultDet
           </SimpleGrid>
 
           <Title order={5}>재무정보 (당기 · 전기)</Title>
-          <Table striped highlightOnHover withTableBorder>
-            <Table.Thead>
-              <Table.Tr>
-                <Table.Th>항목</Table.Th>
-                <Table.Th>당기</Table.Th>
-                <Table.Th>전기</Table.Th>
-              </Table.Tr>
-            </Table.Thead>
-            <Table.Tbody>
-              {FINANCIAL_GROUPS.map((group) => (
-                <Fragment key={group.section}>
-                  <Table.Tr>
-                    <Table.Td colSpan={3}>
-                      <Text span fw={600} size="sm" c="dimmed">{group.title}</Text>
-                    </Table.Td>
-                  </Table.Tr>
-                  {group.items.map((item) => (
-                    <Table.Tr key={item.curKey}>
-                      <Table.Td>{item.label}</Table.Td>
-                      <Table.Td>{item.format(result[item.curKey])}</Table.Td>
-                      <Table.Td>{item.format(result[item.prvKey])}</Table.Td>
-                    </Table.Tr>
-                  ))}
-                </Fragment>
-              ))}
-            </Table.Tbody>
-          </Table>
-
-          <Title order={5}>원문 보기</Title>
-          <Group gap="xs">
-            {DOC_SECTION_BUTTONS.map((btn) => (
-              <Button
-                key={btn.section}
-                size="xs"
-                variant="light"
-                onClick={() => setDocTarget({ section: btn.section })}
-              >
-                {btn.label}
-              </Button>
-            ))}
-          </Group>
+          <Text size="xs" c="dimmed">
+            밑줄 친 항목을 클릭하면 원문의 세부계정을 펼쳐 볼 수 있습니다.
+          </Text>
+          <CurrentPrevTable result={result} details={details} />
 
           <Title order={5}>재무 이력 (최근 N년)</Title>
           <FinancialHistorySection
             jobId={jobId}
             resultId={result.id}
+            details={details}
             onOpenDocument={setDocTarget}
           />
 

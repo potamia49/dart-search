@@ -228,6 +228,9 @@ export interface FinancialSnapshotResponse {
 
   parse_status: ParseStatus | null
   parse_note: string | null
+  /** 1이면 이 연도를 당기로 하는 감사보고서에서 나온 값(원문 보기 = 당기가 이 연도),
+   *  0이면 다음 연도 공시의 전기 열에서 채워진 값이다(2026-07-20). */
+  from_current_period: number
 }
 
 /** §4-8 원문 섹션 열람 — GET .../document-sections/{section}. */
@@ -238,5 +241,24 @@ export interface DocumentSectionResponse {
   rcept_no: string
   available: boolean
   html: string
+  notice: string | null
+}
+
+/** 계정 상세 1행 — 원문 라벨(각주 포함)/상대 계층 레벨/당기·전기 값. */
+export interface AccountRow {
+  label: string
+  level: number
+  cur: number | null
+  prv: number | null
+}
+
+/** 요약 표에서 대분류(유동자산 등)를 펼칠 때 쓰는 세부계정 상세.
+ * `accounts`의 키는 요약 항목의 snapKey(current_assets 등)와 동일하다.
+ * `fiscal_year_cur`는 그 원문의 당기 결산연도 — 재무이력 표가 연도별로
+ * 당기/전기 중 어느 값을 써야 하는지 판정하는 데 쓴다. */
+export interface AccountDetailResponse {
+  rcept_no: string
+  fiscal_year_cur: string | null
+  accounts: Record<string, AccountRow[]>
   notice: string | null
 }

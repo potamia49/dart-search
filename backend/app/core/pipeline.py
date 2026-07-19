@@ -40,6 +40,17 @@ Job.status를 PAUSED_QUOTA로 전환하고 그 시점까지의 진행 상태를 
   기능 취지에 반한다). newest-first로 훑어야 항상 최근 연도부터 확정되고,
   중복되는 연도(정정 공시 포함)는 "이미 있으면 건너뜀" 규칙으로 자동으로
   최신 rcept_no 값이 유지된다.
+- **연도별 값은 "그 연도를 당기로 하는" 공시를 우선한다 (2026-07-20 변경)** —
+  newest-first 순회에서 어떤 연도는 다음 연도 공시의 **전기** 열로 먼저 채워지는데,
+  그 상태로 두면 화면의 연도별 "원문 보기"가 여는 원문(그 행의 rcept_no)의 당기가
+  표시 연도와 어긋난다(예: 2024년 열의 원문을 열면 당기가 2025년). 그래서 전기
+  유래 값은 `from_current_period=0`으로 표시해 두고, 이후 그 연도의 자기 공시를
+  열면 값·rcept_no·parse_status를 통째로 덮어쓴다. 결과적으로 목표 N개 연도마다
+  자기 공시 1건씩(총 N건 안팎)을 내려받게 된다 — 변경 전(N-1건)보다 문서
+  다운로드가 회사당 최대 1건 늘지만, 표시 수치와 원문이 항상 같은 연도를 가리킨다.
+  가장 오래된 연도처럼 자기 공시를 끝내 못 찾은 연도는 전기 유래 값이 그대로
+  남고(화면에 "전기 기준" 표시), 목표 연도를 다 채운 뒤 더 오래된 공시만 남으면
+  즉시 중단해 헛다운로드를 막는다.
 - **회계연도(fiscal_year) 판정**: 원문에는 당기 결산기준일(PERIODTO)만 있고
   전기 결산기준일은 별도 마커가 없다 — 당기 연도는 PERIODTO 연도 그대로,
   전기 연도는 "당기 연도 - 1"로 계산한다(연 1회 정기감사 가정,
@@ -904,14 +915,14 @@ def _upsert_financial_snapshot(
     values: dict[str, float | None],
     parse_status: str,
     parse_note: str | None,
+    from_current_period: bool,
 ) -> None:
     """회사(result_id)-회계연도 단위로 financial_snapshots를 upsert.
 
-    이미 그 연도의 행이 있으면 갱신한다 — 다만 호출부(`_collect_history_for_result`)가
-    newest-first로 순회하며 "이미 확보한 연도는 건너뛴다"는 규칙을 적용하므로,
-    실제로 같은 연도가 두 번 upsert되는 경우는 이 STEP 실행 1회 안에서는
-    일어나지 않는다(재실행/resume 시에는 이전에 이미 기록된 연도라 애초에
-    호출부에서 걸러진다).
+    이미 그 연도의 행이 있으면 갱신한다 — 호출부(`_collect_history_for_result`)가
+    "전기 열로 임시로 채워둔 연도(`from_current_period=0`)를 나중에 그 연도의
+    자기 공시(당기)로 덮어쓴다"는 규칙을 쓰기 때문에 같은 연도가 두 번
+    upsert될 수 있다(그 외의 중복 upsert는 호출부에서 걸러진다).
     """
     with session_factory() as db:
         existing = db.execute(
@@ -928,6 +939,7 @@ def _upsert_financial_snapshot(
             setattr(existing, f, values.get(f))
         existing.parse_status = parse_status
         existing.parse_note = parse_note
+        existing.from_current_period = 1 if from_current_period else 0
         db.commit()
 
 
@@ -941,18 +953,35 @@ async def _collect_history_for_result(
 ) -> None:
     """회사(result) 1건에 대해 최근 `history_years`개 회계연도를 채운다.
 
+    **연도별 1차 자료 우선 규칙(2026-07-20)**: 각 연도는 "그 연도를 당기로 하는"
+    감사보고서에서 값을 가져오는 것이 원칙이다(`from_current_period=1`) — 화면의
+    연도별 "원문 보기"가 여는 원문(= 그 행의 `rcept_no`)과 그 열에 표시된 수치의
+    당기가 항상 같은 연도여야 한다는 요구에서 나온 규칙이다. newest-first 순회
+    특성상 어떤 연도는 다음 연도 공시의 **전기** 열로 먼저 채워지는데, 이는
+    임시(`from_current_period=0`)로 두고 나중에 그 연도의 자기 공시를 열면
+    덮어쓴다. 자기 공시가 끝내 없으면(가장 오래된 연도에서 흔함) 전기 유래 값이
+    그대로 남고, 화면은 그 연도 버튼에 "전기 기준"이라고 표시한다.
+
     이미 `financial_snapshots`에 history_years개 이상의 distinct fiscal_year가
-    있으면 아무 API도 호출하지 않고 즉시 반환한다(resume의 핵심).
+    채워져 있고 **가장 오래된 연도를 뺀 나머지가 전부 당기 유래**면 아무 API도
+    호출하지 않고 즉시 반환한다(resume의 핵심). 가장 오래된 연도를 예외로 두는
+    것은 그 연도의 자기 공시가 조회 기간 밖이라 끝내 못 여는 게 정상이기
+    때문이다 — 이 예외가 없으면 resume 때마다 헛되이 list.json을 다시 부른다.
+    반대로 이 규칙 도입(2026-07-20) 이전에 수집돼 전부 전기 유래(0)로 남아 있는
+    기존 데이터는 다음 resume 때 한 번 다시 훑어 당기 유래로 교정된다.
     """
     with session_factory() as db:
-        existing_years = {
-            row[0]
-            for row in db.execute(
-                select(FinancialSnapshot.fiscal_year).where(FinancialSnapshot.result_id == result_id)
-            ).all()
-        }
+        existing_rows = db.execute(
+            select(FinancialSnapshot.fiscal_year, FinancialSnapshot.from_current_period).where(
+                FinancialSnapshot.result_id == result_id
+            )
+        ).all()
+    existing_years = {year for year, _flag in existing_rows}
+    own_years = {year for year, flag in existing_rows if flag}
     if len(existing_years) >= history_years:
-        return
+        pending = existing_years - own_years - {min(existing_years)}
+        if not pending:
+            return
 
     bgn_de, end_de = _history_window(history_years)
     disclosures = await _fetch_all_disclosures_for_corp(dart_client, corp_code, bgn_de, end_de)
@@ -963,7 +992,8 @@ async def _collect_history_for_result(
 
     collected_years = set(existing_years)
     for item in disclosures:
-        if len(collected_years) >= history_years:
+        if len(collected_years) >= history_years and collected_years <= own_years:
+            # 목표 연도를 다 모았고 전부 자기 공시(당기)로 확정됐다 — 더 볼 필요 없다.
             break
         rcept_no = item.get("rcept_no")
         if not rcept_no:
@@ -1004,16 +1034,44 @@ async def _collect_history_for_result(
         fiscal_year_cur = fiscal_date[:4]
         fiscal_year_prv = str(int(fiscal_year_cur) - 1)
 
-        for fiscal_year, values in (
-            (fiscal_year_cur, parsed.values_cur),
-            (fiscal_year_prv, parsed.values_prv),
+        if len(collected_years) >= history_years and fiscal_year_cur not in collected_years:
+            # 목표 연도는 다 모았는데 이 공시의 당기는 그중에 없다 = 더 오래된
+            # 공시만 남았다는 뜻(newest-first). 남은 미확정 연도를 채워줄 공시는
+            # 이제 없으므로 헛다운로드를 막기 위해 여기서 중단한다.
+            break
+
+        # 당기: 그 연도의 1차 자료다. 전기 열로 임시로 채워둔 연도(from_current_period=0)면
+        # 덮어쓰고, 아직 목표 연도 여유가 있으면 새로 추가한다.
+        if fiscal_year_cur not in own_years and (
+            fiscal_year_cur in collected_years or len(collected_years) < history_years
         ):
-            if fiscal_year in collected_years:
-                continue
             _upsert_financial_snapshot(
-                session_factory, result_id, rcept_no, fiscal_year, values, parsed.parse_status, parsed.parse_note
+                session_factory,
+                result_id,
+                rcept_no,
+                fiscal_year_cur,
+                parsed.values_cur,
+                parsed.parse_status,
+                parsed.parse_note,
+                from_current_period=True,
             )
-            collected_years.add(fiscal_year)
+            collected_years.add(fiscal_year_cur)
+            own_years.add(fiscal_year_cur)
+
+        # 전기: 아직 아무 자료도 없는 연도만 임시로 채운다(자기 공시를 나중에
+        # 열게 되면 위 분기가 덮어쓴다).
+        if fiscal_year_prv not in collected_years and len(collected_years) < history_years:
+            _upsert_financial_snapshot(
+                session_factory,
+                result_id,
+                rcept_no,
+                fiscal_year_prv,
+                parsed.values_prv,
+                parsed.parse_status,
+                parsed.parse_note,
+                from_current_period=False,
+            )
+            collected_years.add(fiscal_year_prv)
 
 
 async def _run_history_collection(
