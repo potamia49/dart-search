@@ -4,6 +4,9 @@ export interface ResultColumn {
   key: keyof ResultResponse
   label: string
   format?: (value: ResultResponse[keyof ResultResponse]) => string
+  /** 값 하나만으로 표기를 정할 수 없는 컬럼용(예: 파싱상태는 rcept_no 유무에 따라
+   * "실패"와 "공시 없음"을 구분해야 한다). 지정되면 format보다 우선한다. */
+  formatRow?: (row: ResultResponse) => string
 }
 
 /** 재무제표 구분 — 재무상태표(bs) / 손익계산서(is) / 현금흐름표(cf). */
@@ -110,7 +113,17 @@ export const CASH_FLOW_COLUMNS: ResultColumn[] = itemsToColumns(
 )
 
 export const STATUS_COLUMNS: ResultColumn[] = [
-  { key: 'parse_status', label: '파싱상태' },
+  {
+    key: 'parse_status',
+    label: '파싱상태',
+    // FAILED인데 rcept_no가 없으면 파서가 실패한 게 아니라 DART에 감사보고서
+    // 공시 자체가 없는 것이다(상장사·외감 대상 제외 등) — 검수 대상이 아니므로
+    // 다른 문구로 구분해 보여준다(2026-07-20).
+    formatRow: (row) => {
+      if (row.parse_status === 'FAILED' && !row.rcept_no) return '감사보고서 없음'
+      return row.parse_status ?? '-'
+    },
+  },
 ]
 
 export const ALL_COLUMNS: ResultColumn[] = [
@@ -132,6 +145,7 @@ export const DEFAULT_VISIBLE_KEYS: (keyof ResultResponse)[] = [
 ]
 
 export function formatCell(column: ResultColumn, row: ResultResponse): string {
+  if (column.formatRow) return column.formatRow(row)
   const value = row[column.key]
   if (column.format) return column.format(value)
   if (value === null || value === undefined || value === '') return '-'

@@ -450,6 +450,31 @@ def test_resolve_candidates_prefers_fss_then_name_match_then_drops(db_session_fa
     assert corp_codes == ["00998877", "00112233"]
 
 
+def test_resolve_candidates_excludes_listed_companies(db_session_factory):
+    """상장사(corp_cache.stock_code가 채워진 회사)는 후보에서 제외한다.
+
+    fsc_corp_index는 금융위 전체 기업 DB라 상장사가 섞여 들어오는데, 상장사는
+    감사보고서를 별도 공시(pblntf_ty=F)로 내지 않아 Phase 2에서 전부 FAILED가
+    된다(2026-07-20 Job #21 실측). 타깃도 비상장 외감법인이다.
+    """
+    with db_session_factory() as db:
+        db.add(CorpCache(corp_code="00580056", corp_name="상장상사", stock_code="099440"))
+        db.add(CorpCache(corp_code="00112233", corp_name="비상장상사", stock_code=""))
+        db.commit()
+
+    candidates = [
+        # fss_corp_unq_no 직접 매칭 경로도 상장사면 걸러져야 한다.
+        FscCorpIndex(corp_name="상장상사", fss_corp_unq_no="00580056"),
+        # 이름 매칭 경로.
+        FscCorpIndex(corp_name="(주)비상장상사", fss_corp_unq_no=""),
+    ]
+
+    with db_session_factory() as db:
+        corp_codes = fsc_index.resolve_candidates(db, candidates)
+
+    assert corp_codes == ["00112233"]
+
+
 def test_resolve_candidates_ignores_non_8_digit_fss_corp_unq_no(db_session_factory):
     """fss_corp_unq_no가 있어도 8자리 숫자가 아니면 이름 매칭 안전망을 탄다."""
     with db_session_factory() as db:

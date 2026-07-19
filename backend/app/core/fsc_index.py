@@ -617,6 +617,27 @@ def _build_corp_cache_name_index(db: Session) -> dict[str, str]:
     return index
 
 
+def _build_listed_corp_codes(db: Session) -> set[str]:
+    """corpCode.xml 캐시에서 **상장사**(stock_code가 채워진 회사)의 corp_code 집합.
+
+    `fsc_corp_index`는 금융위 전체 기업 DB(약 128만 건)라 상장사도 함께 들어 있다.
+    상장사는 감사보고서를 별도 공시(`pblntf_ty="F"`)로 제출하지 않고 사업보고서에
+    첨부하므로, Phase 2 B1(`_backfill_latest_rcept_no_for_job`)이 공시를 0건으로
+    찾아 전부 FAILED로 끝난다(2026-07-20 Job #21 실측: 실패 35건 중 9건이 이 경우).
+    애초에 이 프로젝트의 타깃은 **비상장** 외감법인이므로 A4에서 후보 단계에 걸러낸다.
+
+    stock_code가 비어 있는 행이 압도적 다수라(전체 약 118,000건 중 상장사 수천 건)
+    상장사만 조회한다 — 전체 스캔이 필요한 이름 인덱스와 달리 가볍다.
+    """
+    rows = db.execute(
+        select(CorpCache.corp_code).where(
+            CorpCache.stock_code.is_not(None),
+            func.trim(CorpCache.stock_code) != "",
+        )
+    ).all()
+    return {corp_code for (corp_code,) in rows}
+
+
 def resolve_candidate_pairs(
     db: Session, candidates: list[FscCorpIndex]
 ) -> list[tuple[FscCorpIndex, str]]:
@@ -632,24 +653,35 @@ def resolve_candidate_pairs(
        `normalize_corp_name()` 이름 매칭을 시도한다.
     3. 그래도 안 되면 그 후보는 버린다(company.json 직접 확정 안전망은
        이번 스코프 밖 — §4-7-1 관련 지시사항 참고).
+    4. 확정된 corp_code가 **상장사**면 후보에서 제외한다(2026-07-20 추가) —
+       `_build_listed_corp_codes()` 참고. 타깃이 비상장 외감법인이고, 상장사는
+       Phase 2에서 감사보고서 공시를 못 찾아 어차피 전부 FAILED가 된다.
     """
     name_index: dict[str, str] | None = None
+    listed_codes = _build_listed_corp_codes(db)
     pairs: list[tuple[FscCorpIndex, str]] = []
+    skipped_listed = 0
 
     for candidate in candidates:
         fss = (candidate.fss_corp_unq_no or "").strip()
         if fss and len(fss) == 8 and fss.isdigit():
-            pairs.append((candidate, fss))
-            continue
+            corp_code: str | None = fss
+        else:
+            if name_index is None:
+                name_index = _build_corp_cache_name_index(db)
+            norm_name = normalize_corp_name(candidate.corp_name or "")
+            corp_code = name_index.get(norm_name) if norm_name else None
 
-        if name_index is None:
-            name_index = _build_corp_cache_name_index(db)
-
-        norm_name = normalize_corp_name(candidate.corp_name or "")
-        corp_code = name_index.get(norm_name) if norm_name else None
-        if corp_code:
-            pairs.append((candidate, corp_code))
         # 매칭 실패 시 조용히 버린다 — Job 전체를 실패시키지 않는다.
+        if not corp_code:
+            continue
+        if corp_code in listed_codes:
+            skipped_listed += 1
+            continue
+        pairs.append((candidate, corp_code))
+
+    if skipped_listed:
+        logger.info("A4: 상장사 %s개사를 후보에서 제외했습니다(비상장 외감법인 대상).", skipped_listed)
 
     return pairs
 

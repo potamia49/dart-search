@@ -125,6 +125,45 @@ def test_list_results_returns_seeded_rows(client_with_db):
     assert len(body["items"]) == 2
 
 
+def test_list_results_splits_failed_by_has_disclosure(client_with_db):
+    """FAILED 중 "파싱 실패"(rcept_no 있음)와 "감사보고서 없음"(rcept_no 없음)을
+    `has_disclosure`로 구분할 수 있어야 한다(2026-07-20 추가)."""
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+
+    db = factory()
+    try:
+        db.add(
+            Result(
+                job_id=job_id,
+                corp_code="00100003",
+                rcept_no=None,
+                corp_name="㈜공시없음테스트",
+                parse_status=ParseStatus.FAILED,
+                parse_note="최근 감사보고서 공시를 찾을 수 없음(Phase 1 추정치만 존재)",
+                excluded_by_revenue=0,
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    all_failed = client.get(f"/api/jobs/{job_id}/results", params={"parse_status": "FAILED"})
+    assert all_failed.json()["total"] == 2
+
+    to_review = client.get(
+        f"/api/jobs/{job_id}/results",
+        params={"parse_status": "FAILED", "has_disclosure": True},
+    )
+    assert [r["corp_name"] for r in to_review.json()["items"]] == ["㈜실패테스트"]
+
+    no_disclosure = client.get(
+        f"/api/jobs/{job_id}/results",
+        params={"parse_status": "FAILED", "has_disclosure": False},
+    )
+    assert [r["corp_name"] for r in no_disclosure.json()["items"]] == ["㈜공시없음테스트"]
+
+
 def test_list_results_not_found_returns_404(client_with_db):
     client, _factory = client_with_db
     resp = client.get("/api/jobs/9999/results")

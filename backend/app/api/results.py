@@ -41,11 +41,18 @@ def _build_results_query(
     parse_status: str | None = None,
     excluded_by_revenue: bool | None = None,
     excluded_by_assets: bool | None = None,
+    has_disclosure: bool | None = None,
 ) -> Select:
     """`results` 조회 쿼리 빌더 — `/results`(페이징)와 `/export`(전체)가 공유한다."""
     stmt = select(Result).where(Result.job_id == job_id)
     if parse_status is not None:
         stmt = stmt.where(Result.parse_status == parse_status)
+    if has_disclosure is not None:
+        # rcept_no IS NULL == Phase 2 B1이 감사보고서 공시를 못 찾은 건. 파싱 실패가
+        # 아니라 "열어볼 원문이 애초에 없음"이라 검수 대상이 아니다(2026-07-20 추가).
+        stmt = stmt.where(
+            Result.rcept_no.is_not(None) if has_disclosure else Result.rcept_no.is_(None)
+        )
     if excluded_by_revenue is not None:
         stmt = stmt.where(Result.excluded_by_revenue == (1 if excluded_by_revenue else 0))
     if excluded_by_assets is not None:
@@ -127,6 +134,7 @@ async def list_results(
     parse_status: str | None = None,
     excluded_by_revenue: bool | None = None,
     excluded_by_assets: bool | None = None,
+    has_disclosure: bool | None = None,
     db: Session = Depends(get_db),
 ) -> ResultListResponse:
     """결과 목록 페이징 조회.
@@ -135,12 +143,17 @@ async def list_results(
     - `excluded_by_revenue`: true/false — 매출액 사후 필터로 제외된 건만/제외되지 않은 건만.
     - `excluded_by_assets`: true/false — 총자산 사후 필터로 제외된 건만/제외되지 않은 건만
       (§4-7-2, 2026-07-15 추가).
+    - `has_disclosure`: true/false — 감사보고서 공시를 찾은 건만/못 찾은 건만
+      (`rcept_no` 유무, 2026-07-20 추가). `parse_status=FAILED`와 함께 쓰면
+      "실제 파싱 실패(검수 필요)"와 "원문 자체가 없음"을 구분할 수 있다.
     """
     job = db.get(Job, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job을 찾을 수 없습니다.")
 
-    stmt = _build_results_query(job_id, parse_status, excluded_by_revenue, excluded_by_assets)
+    stmt = _build_results_query(
+        job_id, parse_status, excluded_by_revenue, excluded_by_assets, has_disclosure
+    )
 
     total = db.execute(select(func.count()).select_from(stmt.subquery())).scalar_one()
 
@@ -215,12 +228,13 @@ async def export_job_results(
     parse_status: str | None = None,
     excluded_by_revenue: bool | None = None,
     excluded_by_assets: bool | None = None,
+    has_disclosure: bool | None = None,
     db: Session = Depends(get_db),
 ) -> Response:
     """결과 파일 다운로드 (xlsx/csv, 페이징 없이 필터를 통과한 전체 결과).
 
-    `parse_status`/`excluded_by_revenue`/`excluded_by_assets`는 `/results`와
-    동일한 필터 의미다. `format`이 xlsx/csv가 아니면 400.
+    `parse_status`/`excluded_by_revenue`/`excluded_by_assets`/`has_disclosure`는
+    `/results`와 동일한 필터 의미다. `format`이 xlsx/csv가 아니면 400.
     """
     if format not in _EXPORT_CONTENT_TYPES:
         raise HTTPException(
@@ -232,7 +246,9 @@ async def export_job_results(
     if job is None:
         raise HTTPException(status_code=404, detail="Job을 찾을 수 없습니다.")
 
-    stmt = _build_results_query(job_id, parse_status, excluded_by_revenue, excluded_by_assets)
+    stmt = _build_results_query(
+        job_id, parse_status, excluded_by_revenue, excluded_by_assets, has_disclosure
+    )
     rows = db.execute(stmt.order_by(Result.id.asc())).scalars().all()
 
     content = export_results(rows, format)

@@ -16,6 +16,9 @@ export interface ListResultsParams {
   parse_status?: ParseStatus
   excluded_by_revenue?: boolean
   excluded_by_assets?: boolean
+  /** 감사보고서 공시(rcept_no)를 찾은 건만(true)/못 찾은 건만(false).
+   * parse_status='FAILED'와 함께 써서 "파싱 실패"와 "원문 없음"을 구분한다. */
+  has_disclosure?: boolean
 }
 
 export async function listResults(

@@ -22,20 +22,35 @@ import ColumnToggle from '../components/ColumnToggle'
 import ResultDetailDrawer from '../components/ResultDetailDrawer'
 import CandidatesView from '../components/CandidatesView'
 
-type FilterTab = 'ALL' | 'OK' | 'PARTIAL' | 'FAILED' | 'EXCLUDED_REVENUE' | 'EXCLUDED_ASSETS'
+type FilterTab =
+  | 'ALL'
+  | 'OK'
+  | 'PARTIAL'
+  | 'FAILED'
+  | 'NO_DISCLOSURE'
+  | 'EXCLUDED_REVENUE'
+  | 'EXCLUDED_ASSETS'
 
 const PAGE_SIZE = 50
 
-function tabToParams(
-  tab: FilterTab,
-): { parse_status?: ParseStatus; excluded_by_revenue?: boolean; excluded_by_assets?: boolean } {
+function tabToParams(tab: FilterTab): {
+  parse_status?: ParseStatus
+  excluded_by_revenue?: boolean
+  excluded_by_assets?: boolean
+  has_disclosure?: boolean
+} {
   switch (tab) {
     case 'OK':
       return { parse_status: 'OK' }
     case 'PARTIAL':
       return { parse_status: 'PARTIAL' }
+    // FAILED 중에서도 원문을 실제로 열어본 건만 "검수 필요"다. 원문 자체가 없는
+    // 건(rcept_no IS NULL)은 파서 문제가 아니라 DART에 감사보고서가 없는 것이라
+    // 별도 탭으로 분리한다(2026-07-20).
     case 'FAILED':
-      return { parse_status: 'FAILED' }
+      return { parse_status: 'FAILED', has_disclosure: true }
+    case 'NO_DISCLOSURE':
+      return { parse_status: 'FAILED', has_disclosure: false }
     case 'EXCLUDED_REVENUE':
       return { excluded_by_revenue: true }
     case 'EXCLUDED_ASSETS':
@@ -105,7 +120,8 @@ function FinancialsResultsView({ jobId }: { jobId: number }) {
             <Tabs.Tab value="ALL">전체</Tabs.Tab>
             <Tabs.Tab value="OK">파싱 성공</Tabs.Tab>
             <Tabs.Tab value="PARTIAL">부분 성공</Tabs.Tab>
-            <Tabs.Tab value="FAILED">실패 (검수 필요)</Tabs.Tab>
+            <Tabs.Tab value="FAILED">파싱 실패 (검수 필요)</Tabs.Tab>
+            <Tabs.Tab value="NO_DISCLOSURE">감사보고서 없음</Tabs.Tab>
             <Tabs.Tab value="EXCLUDED_REVENUE">매출액 제외 건</Tabs.Tab>
             <Tabs.Tab value="EXCLUDED_ASSETS">총자산 제외 건</Tabs.Tab>
           </Tabs.List>
@@ -123,6 +139,14 @@ function FinancialsResultsView({ jobId }: { jobId: number }) {
       </Group>
 
       {error && <Alert color="red">{error}</Alert>}
+
+      {tab === 'NO_DISCLOSURE' && (
+        <Alert color="gray">
+          DART에서 감사보고서 공시를 찾지 못한 회사입니다 — 파싱 실패가 아니라 열어볼 원문이
+          없는 경우로, <b>검수 대상이 아닙니다</b>. 외부감사 대상에서 빠졌거나(과거에만 제출),
+          조회 기간(재무 이력 연수) 밖에 마지막 보고서가 있는 경우가 대부분입니다.
+        </Alert>
+      )}
 
       {loading && <Loader />}
 
