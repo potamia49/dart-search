@@ -789,6 +789,98 @@ PRD.md/상세개발계획.md/CLAUDE.md 전반의 "Phase 1(현재 범위)/Phase 2
 그 자체로 유용한 재무 데이터이므로 계속 유지한다(Phase 2 대비용이라는 설계
 근거만 제거했을 뿐 필드 자체는 삭제하지 않았다).
 
+**Phase 1 업종(A2) 필터 회귀 발견·수정(2026-07-18) — 중분류 단독 선택 시
+0건, 대분류 포함 시 사실상 무필터라는 이중 버그.** 사용자가 실제 화면에서
+"경상남도 창원시 + 업종 1개(식료품 제조업, 코드 "10")"로 Job #15를 만들었더니
+후보가 0건이었고, 반면 "경상남도 창원시 + 업종 26개(대분류 "C" 포함)"로 만든
+Job #16은 227건이 나왔다 — 둘 다 정상이 아니었다. 원인은
+`app/core/fsc_index.py::_industry_labels_for_codes()`/`_sic_name_matches()`가
+FSC `sic_name`을 `industry_data.py`의 KSIC **중분류** 라벨("식료품 제조업")과
+그대로 부분 문자열 매칭한다는 점인데, 실측해보니 FSC의 `sic_name`은 그보다
+훨씬 세분화된 텍스트("곡물 도정업", "배합 사료 제조업", "떡류 제조업" 등)라
+중분류 라벨이 문자 그대로 등장하는 경우가 거의 없었다(창원시 5,691개사 중
+"식료품 제조업" 문자열을 포함하는 곳 0개, 직접 쿼리로 실측 확인). 반대로
+대분류("C")가 선택되면 그 이름 "제조업"이 라벨에 포함되는데, 이 라벨은
+거의 모든 제조업 회사의 `sic_name`에 부분 문자열로 걸려 사실상 업종
+필터가 무력화된다. **수정**: `_industry_labels_for_codes()`가 자식(중분류)
+코드가 매칭될 때 그 자식의 구체적 라벨뿐 아니라 소속 대분류의 라벨도 함께
+추가하도록 고쳤다 — 대분류를 직접 선택했을 때와 동일하게 "해당 대분류
+전체"로 느슨하게 통과시켜, 중분류 단독 선택도 최소한 대분류 수준에서는
+일관되게 동작한다(문서 docstring에 이미 명시된 "정밀 확정이 아닌 1차
+스크리닝" 원칙 안에서의 수정 — 정밀 확정은 여전히 Phase 2가 담당해야
+하지만, 아래 문단에서 보듯 Phase 2도 현재는 이를 하지 않는다). 회귀 테스트
+추가: `backend/tests/test_fsc_index.py::
+test_filter_local_candidates_matches_narrow_industry_selection_against_fine_grained_sic_name`.
+`pytest tests/ -q` 163 passed(신규 1건 포함). 코드 변경 반영을 위해 port
+8000 백엔드 프로세스를 재기동했다(RUNNING Job 없음을 확인한 뒤 진행).
+**남은 한계(이번엔 고치지 않음, 다음 세션 판단 필요)**: 이 수정으로도
+**중분류 단위의 실제 정밀 필터링은 여전히 불가능하다** — 이제는 어떤
+중분류를 선택하든 결과적으로 "해당 대분류 전체"가 통과한다(예: "식료품
+제조업"만 선택해도 "아파트 건설업"은 제외되지만 "곡물 도정업"/"자동차
+부품 제조업" 등 다른 제조업 세부업종도 모두 함께 통과) — 사용자가 세부
+업종으로 좁혀 선택하는 UI 자체의 실효성이 대분류 수준으로 제한된다는
+뜻이다. `_industry_labels_for_codes()`의 docstring이 이미 "정밀 확정은
+Phase 2 B1의 DART company.json이 담당"이라고 명시하고 있지만, 실제로는
+Phase 2(B1~B5, `run_job_phase2`)가 `company.json`을 호출하지 않고
+`corp_code`로 바로 감사보고서 원문을 내려받을 뿐이라 이 약속이 지켜지고
+있지 않다(M6 QA 리뷰에서 남겨둔 phone/ceo_name/induty_name "미확정" 갭과
+같은 뿌리). 다음 세션에서 판단할 것: (a) Phase 1이 A2/A3 통과 후 확정한
+소규모 후보 집합(수백~수천 건 수준, 이미 STEP3 병목 문제와 무관한 규모)에
+한해 `company.json`을 호출해 실제 `induty_code`로 정밀 재검증하고
+`excluded_by_industry` 컬럼을 신설할지, (b) 중분류 선택은 애초에 "대분류
+수준의 참고용 좁히기"일 뿐이라고 화면에 명시하고 현재 동작을 그대로
+받아들일지.
+
+**CandidatesView(Phase 1 후보 목록) "선택 취소" 기능 추가(2026-07-18).** 사용자
+요청으로, 후보 확정(Phase 1) 후 재무정보 수집(Phase 2)을 시작하기 전에 특정
+회사를 후보에서 제외할 수 있는 기능을 추가했다. `results.excluded_manually`
+컬럼(신규, `excluded_by_revenue`/`excluded_by_assets`와 동일한 int 0/1 패턴)을
+추가하고, `PATCH /api/jobs/{id}/results/{result_id}/exclude`(body:
+`{excluded: bool}`)로 자유롭게 켰다 껐다 토글할 수 있게 했다 — `job.phase !=
+CANDIDATES`면 400으로 거부한다(이미 확정 처리에 들어간 결과를 건드리지
+못하게). **실제 삭제는 토글 시점이 아니라 `POST /api/jobs/{id}/start-financials`
+호출 시점에 일괄 수행**하도록 설계했다(`db.execute(delete(Result).where(...
+excluded_manually == 1))`를 상태 전환 UPDATE 직후에 추가) — 이 시점엔 아직
+`financial_snapshots`가 생기지 않아 results만 지우면 되고, 무엇보다 Phase 2
+파이프라인(B1~B5, `_backfill_latest_rcept_no_for_job`/`_run_document_download`/
+`_run_financial_parsing`/`_run_history_collection`)을 전혀 수정할 필요가
+없다는 게 이 설계의 핵심 — 남은 `results`만 대상으로 기존 로직이 그대로
+동작한다. 프론트 `CandidatesView.tsx`는 후보 목록 표에 "포함" 체크박스
+컬럼을 추가해(기본 체크됨) 체크 해제 시 `setResultExcluded()`로 즉시 토글
+API를 호출하고, 낙관적으로 해당 행만 로컬 state에서 갱신한다(dimmed +
+취소선으로 표시, 페이지 이동해도 서버에 저장된 상태라 유지됨). 신규 테스트:
+`backend/tests/test_api_results.py`(토글 성공/phase=FINANCIALS 거부/404 3종),
+`backend/tests/test_api_jobs.py::test_start_financials_deletes_manually_excluded_results`.
+`pytest tests/ -q` 167 passed, `npm run build`/`npm run lint` 통과. 실제
+port 8000 백엔드(RUNNING/PENDING Job 없음 확인 후 재기동, 스키마 마이그레이션은
+기존 `_ensure_columns()` ad-hoc 방식 그대로 재사용) + 기존 실제 Job #16(238건
+확정 후보)으로 Playwright 스모크 테스트를 수행해 체크박스 토글 → 행 표시
+변경 → 원복까지 콘솔 에러 없이 정상 동작함을 확인했다(테스트 후 원 상태로
+복원, DB에 잔여 변경 없음).
+
+**현금흐름표 파싱 + 원문 섹션 열람 확장 — 설계 확정·문서화 완료(2026-07-19,
+설계만, 구현 전).** 사용자가 "현금흐름표(주석 포함)도 DART에서 제공할 수
+있잖아?"라고 물어 fixtures 30건을 실측 확인한 결과, **이미 STEP 4/B2에서
+내려받는 `document.xml` 안에 현금흐름표 본표(`ACLASS="FINANCE"` 테이블,
+영업/투자/재무활동 구조)와 주석 구간이 함께 들어 있어 추가 API 호출/쿼터
+0건으로 확장 가능**함을 확인했다(주석이 아예 없는 원문도 실측 존재 —
+`20260630001111` "주석을 제시하지 아니함", 정상 케이스로 처리해야 함).
+사용자가 범위를 확정했다: ① 현금흐름표 4항목(`cf_operating`/`cf_investing`/
+`cf_financing`/`cf_ending_cash`) 당기·전기 파싱, ② 다년치 이력
+(`financial_snapshots`)에도 동일 4항목 포함, ③ 주석 원문 통째 보기, ④
+재무상태표/손익계산서/현금흐름표 원문 보기. 핵심 설계 판단: CF는
+`determine_parse_status()` 판정에 반영하지 않는 best-effort 항목(기존 완료
+Job의 OK/PARTIAL 재분류 방지), 원문 열람은 신규 API
+`GET .../document-sections/{section}`(bs|is|cf|notes)이 로컬 문서 캐시에서
+on-demand로 섹션을 잘라 서버 조립 HTML(이스케이프 처리)로 반환하는 방식
+(DART 뷰어 섹션 딥링크는 rcept_no만으로 조립 불가라 자체 렌더링 채택, 기존
+DART 전체 보고서 링크는 유지). **이번 세션에서는 사용자 지시("일단 수정은
+하지 말고 개발계획에 반영")에 따라 문서만 갱신했고 코드 변경은 없다** —
+상세 설계는 [상세개발계획.md §4-8](상세개발계획.md)(열린 질문 3건 포함:
+CF alias 실측 범위/기존 완료 Job 소급 재파싱/손상 원문 표시), 구현
+체크리스트는 §8 M7(전체 미완료), 스키마 주석은 §5, API 표는 §6, 화면
+설계는 §7-3, PRD.md §2/§3-2에도 같은 취지로 반영했다.
+
 작업을 시작하기 전에 반드시 아래 두 문서를 먼저 읽으세요 —
 이 저장소의 유일한 진실 소스(source of truth)입니다.
 

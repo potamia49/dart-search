@@ -119,6 +119,7 @@ export interface ResultResponse {
   parse_note: string | null
   excluded_by_revenue: number
   excluded_by_assets: number
+  excluded_manually: number
 }
 
 export interface ResultListResponse {

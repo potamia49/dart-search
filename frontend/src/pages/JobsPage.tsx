@@ -11,7 +11,7 @@ import {
   Title,
 } from '@mantine/core'
 import { notifications } from '@mantine/notifications'
-import { cancelJob, listJobs, resumeJob, retryFailedJob } from '../api/jobs'
+import { cancelJob, deleteJob, listJobs, resumeJob, retryFailedJob } from '../api/jobs'
 import { getFscIndexStatus, getQuota } from '../api/meta'
 import type { FscIndexStatus, JobResponse, QuotaResponse } from '../types'
 import JobStatusBadge from '../components/JobStatusBadge'
@@ -96,6 +96,19 @@ export default function JobsPage() {
     }
   }
 
+  async function handleDelete(id: number) {
+    if (!window.confirm(`작업 #${id}을 삭제하시겠습니까? 수집된 결과도 함께 삭제되며 되돌릴 수 없습니다.`)) {
+      return
+    }
+    try {
+      await deleteJob(id)
+      notifications.show({ message: `작업 #${id}을 삭제했습니다.` })
+      refresh()
+    } catch {
+      notifications.show({ color: 'red', message: '삭제에 실패했습니다.' })
+    }
+  }
+
   return (
     <Stack maw={960} mx="auto">
       <Group justify="space-between">
@@ -177,6 +190,11 @@ export default function JobsPage() {
                         파싱 재시도
                       </Button>
                     </>
+                  )}
+                  {job.status !== 'RUNNING' && job.status !== 'PENDING' && (
+                    <Button size="xs" color="red" variant="outline" onClick={() => handleDelete(job.id)}>
+                      삭제
+                    </Button>
                   )}
                 </Group>
               </Stack>

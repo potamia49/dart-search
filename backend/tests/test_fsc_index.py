@@ -262,6 +262,46 @@ def test_filter_local_candidates_applies_region_and_industry(db_session_factory)
     assert [c.corp_name for c in candidates] == ["김해기계"]
 
 
+def test_filter_local_candidates_matches_narrow_industry_selection_against_fine_grained_sic_name(
+    db_session_factory,
+):
+    """회귀 테스트 — 중분류 코드 하나만 선택했을 때 FSC의 세분류 수준
+    `sic_name`("떡류 제조업")이 중분류 라벨("식료품 제조업")과 글자 그대로는
+    겹치지 않아도 대분류("제조업") 단위로는 통과해야 한다. 이전에는 중분류
+    라벨만으로 매칭해 실제 회사가 있어도 0건으로 걸러지는 버그가 있었다
+    (2026-07-18 실제 운영 중 발견).
+    """
+    with db_session_factory() as db:
+        db.add_all(
+            [
+                FscCorpIndex(
+                    crno="1",
+                    corp_name="김해떡공장",
+                    sido="경상남도",
+                    sigungu="김해시",
+                    sic_name="떡류 제조업",
+                ),
+                FscCorpIndex(
+                    crno="2",
+                    corp_name="김해건설",
+                    sido="경상남도",
+                    sigungu="김해시",
+                    sic_name="아파트 건설업",
+                ),
+            ]
+        )
+        db.commit()
+
+    with db_session_factory() as db:
+        candidates = fsc_index.filter_local_candidates(
+            db,
+            cond_region={"sido": "경남", "sigungu": ["김해시"]},
+            cond_industry=["10"],
+        )
+
+    assert [c.corp_name for c in candidates] == ["김해떡공장"]
+
+
 def test_filter_local_candidates_no_conditions_returns_all(db_session_factory):
     with db_session_factory() as db:
         db.add_all(

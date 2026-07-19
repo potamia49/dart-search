@@ -9,6 +9,8 @@
     POST /api/jobs/{id}/retry-failed      파싱 실패 건만 재시도
     POST /api/jobs/{id}/start-financials  (§4-7-1, 2026-07-15 추가) Phase 1 확정 후보에 대해
                                            Phase 2(B1~B5, 재무정보 수집) 시작
+    DELETE /api/jobs/{id}                 (2026-07-18 추가) 과거 Job 기록 삭제 (results/
+                                           financial_snapshots 포함). RUNNING/PENDING은 거부.
 
 **M6 재설계(2026-07-15)로 `POST /api/jobs`가 실행하는 백그라운드 작업이
 `run_job()`(구 STEP 1~7 전체)에서 `run_job_phase1()`(A2~A4, 후보 확정까지만)로
@@ -27,11 +29,12 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel, Field, model_validator
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db
 from app.core.pipeline import retry_failed_parsing, run_job_phase1, run_job_phase2
+from app.models.financial_snapshot import FinancialSnapshot
 from app.models.job import Job, JobPhase, JobStatus
 from app.models.result import ParseStatus, Result
 
@@ -311,6 +314,13 @@ async def start_financials(
             ),
         )
 
+    # "선택 취소"(excluded_manually)로 표시된 후보는 Phase 2 시작 시점에 일괄
+    # 삭제한다 — 아직 원문을 연 적이 없어(phase=CANDIDATES) financial_snapshots가
+    # 없으므로 results만 지우면 된다. Phase 2 파이프라인(B1~B5)은 남은 results만
+    # 대상으로 그대로 동작하므로 수정할 필요가 없다.
+    db.execute(delete(Result).where(Result.job_id == job_id, Result.excluded_manually == 1))
+    db.commit()
+
     background_tasks.add_task(run_job_phase2, job.id)
     return JobResponse.from_job(job)
 
@@ -353,3 +363,28 @@ async def retry_failed_results(
 
     background_tasks.add_task(retry_failed_parsing, job_id)
     return JobResponse.from_job(job)
+
+
+@router.delete("/{job_id}", status_code=204, response_model=None)
+async def delete_job(job_id: int, db: Session = Depends(get_db)) -> None:
+    """과거 Job 기록을 삭제한다 (딸린 results/financial_snapshots까지 함께 삭제).
+
+    RUNNING/PENDING인 Job은 백그라운드 태스크(run_job_phase1/2)가 여전히 이
+    job_id를 참조하며 DB에 쓰는 중일 수 있어 삭제를 막는다 — 먼저 취소
+    (`POST /api/jobs/{id}/cancel`)한 뒤 삭제해야 한다.
+    """
+    job = db.get(Job, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job을 찾을 수 없습니다.")
+    if job.status in (JobStatus.RUNNING, JobStatus.PENDING):
+        raise HTTPException(
+            status_code=400,
+            detail="실행 중인 작업은 삭제할 수 없습니다. 먼저 취소한 뒤 삭제하세요.",
+        )
+
+    result_ids = db.execute(select(Result.id).where(Result.job_id == job_id)).scalars().all()
+    if result_ids:
+        db.execute(delete(FinancialSnapshot).where(FinancialSnapshot.result_id.in_(result_ids)))
+        db.execute(delete(Result).where(Result.job_id == job_id))
+    db.delete(job)
+    db.commit()

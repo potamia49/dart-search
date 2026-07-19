@@ -64,6 +64,12 @@ class Result(Base):
     # 패턴. total_assets_cur(원문 파싱으로 확보되는 값) 기준 사후 확정 판정이며,
     # Phase 1의 사전 스크리닝(app/core/fsc_index.py A3) 성공 여부와 무관하게
     # 항상 정확히 동작한다.
+    excluded_manually: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # 2026-07-18 추가 — CandidatesView(Phase 1 후보 목록)에서 사용자가 자유롭게
+    # 켰다 껐다 할 수 있는 "선택 취소" 토글(`PATCH .../results/{id}/exclude`).
+    # excluded_by_revenue/assets(사후 확정 필터)와 달리 이 값은 확정 판정이
+    # 아니라 사용자 의사 표시일 뿐이라 phase=CANDIDATES 동안은 계속 뒤집을 수
+    # 있다 — 실제 제외(행 삭제)는 start-financials 호출 시점에 일괄 반영된다.
 
 
 class ParseStatus:

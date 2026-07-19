@@ -131,6 +131,54 @@ def test_list_results_not_found_returns_404(client_with_db):
     assert resp.status_code == 404
 
 
+def test_set_result_excluded_toggles_flag(client_with_db):
+    """CandidatesView "선택 취소" — phase=CANDIDATES(기본값)에서는 자유롭게 토글 가능."""
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+
+    db = factory()
+    try:
+        result_id = db.execute(select(Result.id).where(Result.job_id == job_id)).scalars().first()
+    finally:
+        db.close()
+
+    resp = client.patch(f"/api/jobs/{job_id}/results/{result_id}/exclude", json={"excluded": True})
+    assert resp.status_code == 200
+    assert resp.json()["excluded_manually"] == 1
+
+    resp = client.patch(f"/api/jobs/{job_id}/results/{result_id}/exclude", json={"excluded": False})
+    assert resp.status_code == 200
+    assert resp.json()["excluded_manually"] == 0
+
+
+def test_set_result_excluded_rejects_when_phase_financials(client_with_db):
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+
+    db = factory()
+    try:
+        job = db.get(Job, job_id)
+        job.phase = "FINANCIALS"
+        db.commit()
+        result_id = db.execute(select(Result.id).where(Result.job_id == job_id)).scalars().first()
+    finally:
+        db.close()
+
+    resp = client.patch(f"/api/jobs/{job_id}/results/{result_id}/exclude", json={"excluded": True})
+    assert resp.status_code == 400
+
+
+def test_set_result_excluded_not_found_returns_404(client_with_db):
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+
+    resp = client.patch(f"/api/jobs/{job_id}/results/999999/exclude", json={"excluded": True})
+    assert resp.status_code == 404
+
+    resp = client.patch("/api/jobs/9999/results/1/exclude", json={"excluded": True})
+    assert resp.status_code == 404
+
+
 def test_export_xlsx_returns_valid_workbook_with_korean_headers(client_with_db):
     client, factory = client_with_db
     job_id = _seed_job_with_results(factory)

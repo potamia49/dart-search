@@ -15,8 +15,8 @@ import {
 } from '@mantine/core'
 import { notifications } from '@mantine/notifications'
 import { startFinancials } from '../api/jobs'
-import { listResults } from '../api/results'
-import type { HistoryYears, JobResponse, ResultListResponse } from '../types'
+import { listResults, setResultExcluded } from '../api/results'
+import type { HistoryYears, JobResponse, ResultListResponse, ResultResponse } from '../types'
 import { formatNumber } from '../util/resultColumns'
 
 const HISTORY_YEARS_OPTIONS: { label: string; value: HistoryYears }[] = [
@@ -46,6 +46,7 @@ export default function CandidatesView({ job }: CandidatesViewProps) {
   const [error, setError] = useState<string | null>(null)
   const [historyYears, setHistoryYears] = useState<HistoryYears>(4)
   const [starting, setStarting] = useState(false)
+  const [updatingIds, setUpdatingIds] = useState<Set<number>>(new Set())
 
   useEffect(() => {
     setLoading(true)
@@ -71,7 +72,28 @@ export default function CandidatesView({ job }: CandidatesViewProps) {
     }
   }
 
+  async function handleToggleIncluded(row: ResultResponse, included: boolean) {
+    setUpdatingIds((prev) => new Set(prev).add(row.id))
+    try {
+      const updated = await setResultExcluded(job.id, row.id, !included)
+      setData((prev) =>
+        prev
+          ? { ...prev, items: prev.items.map((item) => (item.id === row.id ? updated : item)) }
+          : prev,
+      )
+    } catch {
+      notifications.show({ color: 'red', message: '선택 변경에 실패했습니다.' })
+    } finally {
+      setUpdatingIds((prev) => {
+        const next = new Set(prev)
+        next.delete(row.id)
+        return next
+      })
+    }
+  }
+
   const totalPages = data ? Math.max(1, Math.ceil(data.total / data.page_size)) : 1
+  const excludedOnPage = data ? data.items.filter((row) => row.excluded_manually === 1).length : 0
 
   return (
     <Stack>
@@ -98,7 +120,8 @@ export default function CandidatesView({ job }: CandidatesViewProps) {
             <Text size="sm" c="dimmed" mb="xs">
               확정된 후보 회사에 대해 최근 N년치 재무정보(다년치 이력)를 DART 원문에서 수집합니다.
               후보 수와 회사당 공시 건수에 따라 수 분~수십 분 이상 걸릴 수 있습니다 — 시작 후
-              작업 목록 화면에서 진행률을 확인하세요.
+              작업 목록 화면에서 진행률을 확인하세요. 아래 표에서 "삭제" 버튼을 누른 회사는
+              수집 대상에서 제외됩니다("복원" 버튼으로 다시 취소할 수 있습니다).
             </Text>
             <SegmentedControl
               value={String(historyYears)}
@@ -120,13 +143,21 @@ export default function CandidatesView({ job }: CandidatesViewProps) {
 
       {!loading && data && (
         <>
-          <Text size="sm" c="dimmed">
-            총 {data.total.toLocaleString()}건
-          </Text>
+          <Group justify="space-between">
+            <Text size="sm" c="dimmed">
+              총 {data.total.toLocaleString()}건
+            </Text>
+            {excludedOnPage > 0 && (
+              <Text size="sm" c="dimmed">
+                이 페이지에서 제외 선택: {excludedOnPage}건 (체크박스를 다시 켜면 취소됩니다)
+              </Text>
+            )}
+          </Group>
           <Table.ScrollContainer minWidth={800}>
             <Table striped highlightOnHover withTableBorder>
               <Table.Thead>
                 <Table.Tr>
+                  <Table.Th>관리</Table.Th>
                   <Table.Th>회사명</Table.Th>
                   <Table.Th>주소</Table.Th>
                   <Table.Th>업종 (참고용)</Table.Th>
@@ -137,17 +168,44 @@ export default function CandidatesView({ job }: CandidatesViewProps) {
                 </Table.Tr>
               </Table.Thead>
               <Table.Tbody>
-                {data.items.map((row) => (
-                  <Table.Tr key={row.id}>
-                    <Table.Td>{row.corp_name ?? '-'}</Table.Td>
-                    <Table.Td>{row.address ?? '-'}</Table.Td>
-                    <Table.Td>{row.induty_name ?? '-'}</Table.Td>
-                    <Table.Td>{row.phone ?? '-'}</Table.Td>
-                    <Table.Td>{row.ceo_name ?? '-'}</Table.Td>
-                    <Table.Td>{formatNumber(row.revenue_cur)}</Table.Td>
-                    <Table.Td>{formatNumber(row.total_assets_cur)}</Table.Td>
-                  </Table.Tr>
-                ))}
+                {data.items.map((row) => {
+                  const excluded = row.excluded_manually === 1
+                  return (
+                    <Table.Tr key={row.id} style={excluded ? { opacity: 0.5 } : undefined}>
+                      <Table.Td>
+                        {excluded ? (
+                          <Button
+                            size="xs"
+                            variant="outline"
+                            loading={updatingIds.has(row.id)}
+                            onClick={() => handleToggleIncluded(row, true)}
+                          >
+                            복원
+                          </Button>
+                        ) : (
+                          <Button
+                            size="xs"
+                            color="red"
+                            variant="outline"
+                            loading={updatingIds.has(row.id)}
+                            onClick={() => handleToggleIncluded(row, false)}
+                          >
+                            삭제
+                          </Button>
+                        )}
+                      </Table.Td>
+                      <Table.Td style={excluded ? { textDecoration: 'line-through' } : undefined}>
+                        {row.corp_name ?? '-'}
+                      </Table.Td>
+                      <Table.Td>{row.address ?? '-'}</Table.Td>
+                      <Table.Td>{row.induty_name ?? '-'}</Table.Td>
+                      <Table.Td>{row.phone ?? '-'}</Table.Td>
+                      <Table.Td>{row.ceo_name ?? '-'}</Table.Td>
+                      <Table.Td>{formatNumber(row.revenue_cur)}</Table.Td>
+                      <Table.Td>{formatNumber(row.total_assets_cur)}</Table.Td>
+                    </Table.Tr>
+                  )
+                })}
               </Table.Tbody>
             </Table>
           </Table.ScrollContainer>

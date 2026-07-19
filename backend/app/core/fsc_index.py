@@ -384,6 +384,16 @@ def _industry_labels_for_codes(codes: list[str]) -> list[str]:
     prefix 매칭(§4-2)과 스킴이 다르다 — 여기서는 완벽한 매칭이 아니라 1차
     스크리닝 용도의 느슨한 텍스트 포함 매칭 라벨만 뽑는다(정밀 확정은 Phase 2
     B1의 DART `company.json`이 담당, §4-7 열린 질문 5).
+
+    실측(2026-07-18) 결과 FSC `sic_name`은 KSIC 세분류 수준의 매우 구체적인
+    텍스트("곡물 도정업", "배합 사료 제조업" 등)라 중분류 라벨("식료품
+    제조업")과 그대로는 거의 겹치지 않는다 — 중분류 코드만 선택하면 실제
+    회사가 있어도 0건으로 걸러지는 회귀가 있었다. 자식(중분류) 코드가
+    매칭되면 그 대분류(letter) 라벨도 함께 추가해, 대분류를 직접 선택했을
+    때와 동일하게 "해당 대분류 전체"를 느슨하게 통과시킨다 — 이 A2 단계는
+    docstring에 이미 명시된 대로 정밀 확정이 아닌 1차 스크리닝이므로,
+    중분류 단위의 정밀도를 보장하지 못하더라도 대분류 단위로는 일관되게
+    동작하는 쪽을 택했다.
     """
     labels: list[str] = []
     for raw_code in codes:
@@ -396,6 +406,7 @@ def _industry_labels_for_codes(codes: list[str]) -> list[str]:
             for child in entry.get("children", []):
                 if code.endswith(child["code"]):
                     labels.append(child["name"])
+                    labels.append(entry["name"])
     return labels
 
 

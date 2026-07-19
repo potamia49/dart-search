@@ -25,7 +25,7 @@ from sqlalchemy.orm import Session
 from app.core.db import get_db
 from app.exporters.excel import export_results
 from app.models.financial_snapshot import FinancialSnapshot
-from app.models.job import Job
+from app.models.job import Job, JobPhase
 from app.models.result import Result
 
 router = APIRouter(prefix="/api/jobs", tags=["results"])
@@ -96,6 +96,7 @@ class ResultResponse(BaseModel):
     parse_note: str | None
     excluded_by_revenue: int
     excluded_by_assets: int
+    excluded_manually: int
 
 
 class ResultListResponse(BaseModel):
@@ -146,6 +147,46 @@ async def list_results(
         page_size=page_size,
         items=[ResultResponse.model_validate(r) for r in rows],
     )
+
+
+class ExcludeResultRequest(BaseModel):
+    excluded: bool
+
+
+@router.patch("/{job_id}/results/{result_id}/exclude", response_model=ResultResponse)
+async def set_result_excluded(
+    job_id: int,
+    result_id: int,
+    payload: ExcludeResultRequest,
+    db: Session = Depends(get_db),
+) -> ResultResponse:
+    """후보 목록(Phase 1, CandidatesView)에서 특정 회사를 재무정보 수집 대상에서
+    제외/재포함한다 — "선택 취소" 기능(2026-07-18 추가).
+
+    `excluded_manually` 플래그만 토글하므로 phase=CANDIDATES인 동안은 자유롭게
+    다시 켤 수 있다. 실제 삭제(행 제거)는 하지 않고, `POST
+    /api/jobs/{id}/start-financials` 호출 시점에 제외 표시된 행을 일괄 삭제한다
+    (`app/api/jobs.py::start_financials`) — Phase 2 파이프라인(B1~B5)은 전혀
+    수정할 필요가 없다. phase=FINANCIALS로 전환된 뒤(이미 확정 처리에 들어간
+    결과)에는 의미가 없으므로 400으로 거부한다.
+    """
+    job = db.get(Job, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job을 찾을 수 없습니다.")
+    if job.phase != JobPhase.CANDIDATES:
+        raise HTTPException(
+            status_code=400,
+            detail="후보 확정(Phase 1) 단계에서만 선택을 변경할 수 있습니다.",
+        )
+
+    result = db.get(Result, result_id)
+    if result is None or result.job_id != job_id:
+        raise HTTPException(status_code=404, detail="해당 Job의 결과를 찾을 수 없습니다.")
+
+    result.excluded_manually = 1 if payload.excluded else 0
+    db.commit()
+    db.refresh(result)
+    return ResultResponse.model_validate(result)
 
 
 _EXPORT_CONTENT_TYPES = {

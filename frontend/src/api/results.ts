@@ -1,5 +1,11 @@
 import { apiClient } from './client'
-import type { ExportFormat, FinancialSnapshotResponse, ParseStatus, ResultListResponse } from '../types'
+import type {
+  ExportFormat,
+  FinancialSnapshotResponse,
+  ParseStatus,
+  ResultListResponse,
+  ResultResponse,
+} from '../types'
 
 export interface ListResultsParams {
   page?: number
@@ -42,6 +48,21 @@ export async function exportResults(
   link.click()
   link.remove()
   window.URL.revokeObjectURL(blobUrl)
+}
+
+/** CandidatesView "선택 취소" — 후보 목록에서 특정 회사를 재무정보 수집 대상에서
+ * 제외/재포함한다(phase=CANDIDATES 동안만 가능, 실제 삭제는 start-financials
+ * 호출 시점에 백엔드가 일괄 처리). */
+export async function setResultExcluded(
+  jobId: number,
+  resultId: number,
+  excluded: boolean,
+): Promise<ResultResponse> {
+  const { data } = await apiClient.patch<ResultResponse>(
+    `/jobs/${jobId}/results/${resultId}/exclude`,
+    { excluded },
+  )
+  return data
 }
 
 /** STEP 7(최근 N년 재무이력) — 회사 1건의 연도별 재무 이력(오래된 연도 → 최신 연도 순).

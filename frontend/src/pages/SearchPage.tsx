@@ -166,6 +166,22 @@ export default function SearchPage() {
 
       <Paper withBorder p="md">
         <Title order={4} mb="sm">
+          업종 (미선택 시 전체)
+        </Title>
+        <IndustryTreeSelect
+          industries={industries}
+          selected={industryCodes}
+          onChange={setIndustryCodes}
+        />
+        {industryCodes.length > 0 && (
+          <Text size="sm" c="dimmed" mt={4}>
+            선택됨: {industryCodes.length}건
+          </Text>
+        )}
+      </Paper>
+
+      <Paper withBorder p="md">
+        <Title order={4} mb="sm">
           매출액 범위 (억원, 미입력 시 무제한)
         </Title>
         <Group grow>
@@ -206,22 +222,6 @@ export default function SearchPage() {
             onChange={(v) => setMaxAssetsEok(v === '' ? '' : Number(v))}
           />
         </Group>
-      </Paper>
-
-      <Paper withBorder p="md">
-        <Title order={4} mb="sm">
-          업종 (미선택 시 전체)
-        </Title>
-        <IndustryTreeSelect
-          industries={industries}
-          selected={industryCodes}
-          onChange={setIndustryCodes}
-        />
-        {industryCodes.length > 0 && (
-          <Text size="sm" c="dimmed" mt={4}>
-            선택됨: {industryCodes.length}건
-          </Text>
-        )}
       </Paper>
 
       {preview && (

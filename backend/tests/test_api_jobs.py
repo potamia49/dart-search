@@ -17,7 +17,9 @@ from app import main as app_main
 from app.api import jobs as jobs_api
 from app.core.db import get_db
 from app.models import Base
+from app.models.financial_snapshot import FinancialSnapshot
 from app.models.job import Job, JobPhase, JobStatus
+from app.models.result import Result
 
 
 def _build_test_client(monkeypatch):
@@ -291,6 +293,112 @@ def test_start_financials_succeeds_when_candidates_done(monkeypatch):
         assert body["status"] == JobStatus.PENDING
         assert body["history_years"] == 6
         assert phase2_calls == [job_id]
+    finally:
+        app_main.app.dependency_overrides.clear()
+
+
+def test_start_financials_deletes_manually_excluded_results(monkeypatch):
+    """excluded_manually=1로 표시된 후보는 Phase 2 시작 시점에 삭제되고, 나머지는 남는다."""
+    client, _calls, phase2_calls = _build_test_client(monkeypatch)
+    try:
+        created = client.post("/api/jobs", json=_sample_payload()).json()
+        job_id = created["id"]
+
+        with _direct_session() as db:
+            job = db.get(Job, job_id)
+            job.status = JobStatus.DONE
+            job.phase = JobPhase.CANDIDATES
+            keep = Result(job_id=job_id, corp_code="00164742", corp_name="유지회사")
+            drop = Result(job_id=job_id, corp_code="00126380", corp_name="제외회사", excluded_manually=1)
+            db.add_all([keep, drop])
+            db.commit()
+            db.refresh(keep)
+            db.refresh(drop)
+            keep_id, drop_id = keep.id, drop.id
+
+        resp = client.post(f"/api/jobs/{job_id}/start-financials", json={"history_years": 4})
+        assert resp.status_code == 200
+
+        with _direct_session() as db:
+            assert db.get(Result, keep_id) is not None
+            assert db.get(Result, drop_id) is None
+        assert phase2_calls == [job_id]
+    finally:
+        app_main.app.dependency_overrides.clear()
+
+
+# ---------------------------------------------------------------------------
+# DELETE /api/jobs/{id} (2026-07-18 추가)
+# ---------------------------------------------------------------------------
+
+
+def test_delete_job_removes_job_and_cascades_results_and_snapshots(monkeypatch):
+    client, _calls, _phase2_calls = _build_test_client(monkeypatch)
+    try:
+        created = client.post("/api/jobs", json=_sample_payload()).json()
+        job_id = created["id"]
+
+        with _direct_session() as db:
+            job = db.get(Job, job_id)
+            job.status = JobStatus.DONE
+            result = Result(job_id=job_id, corp_code="00164742", corp_name="테스트회사")
+            db.add(result)
+            db.commit()
+            db.refresh(result)
+            snapshot = FinancialSnapshot(result_id=result.id, fiscal_year="2025")
+            db.add(snapshot)
+            db.commit()
+            result_id = result.id
+
+        resp = client.delete(f"/api/jobs/{job_id}")
+        assert resp.status_code == 204
+
+        with _direct_session() as db:
+            assert db.get(Job, job_id) is None
+            assert db.get(Result, result_id) is None
+            assert (
+                db.query(FinancialSnapshot).filter(FinancialSnapshot.result_id == result_id).first() is None
+            )
+    finally:
+        app_main.app.dependency_overrides.clear()
+
+
+def test_delete_job_rejects_running_status(monkeypatch):
+    client, _calls, _phase2_calls = _build_test_client(monkeypatch)
+    try:
+        created = client.post("/api/jobs", json=_sample_payload()).json()
+        job_id = created["id"]
+
+        with _direct_session() as db:
+            job = db.get(Job, job_id)
+            job.status = JobStatus.RUNNING
+            db.commit()
+
+        resp = client.delete(f"/api/jobs/{job_id}")
+        assert resp.status_code == 400
+
+        with _direct_session() as db:
+            assert db.get(Job, job_id) is not None
+    finally:
+        app_main.app.dependency_overrides.clear()
+
+
+def test_delete_job_rejects_pending_status(monkeypatch):
+    """생성 직후(run_job_phase1이 스텁이라 여전히 PENDING)에는 삭제가 거부돼야 한다."""
+    client, _calls, _phase2_calls = _build_test_client(monkeypatch)
+    try:
+        created = client.post("/api/jobs", json=_sample_payload()).json()
+        resp = client.delete(f"/api/jobs/{created['id']}")
+        assert resp.status_code == 400
+    finally:
+        app_main.app.dependency_overrides.clear()
+
+
+def test_delete_job_not_found_returns_404(monkeypatch):
+    client, _calls, _phase2_calls = _build_test_client(monkeypatch)
+    try:
+        resp = client.delete("/api/jobs/9999")
+        assert resp.status_code == 404
     finally:
         app_main.app.dependency_overrides.clear()
 

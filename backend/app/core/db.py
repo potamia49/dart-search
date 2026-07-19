@@ -64,6 +64,7 @@ _JOBS_NEW_COLUMNS: dict[str, str] = {
 }
 _RESULTS_NEW_COLUMNS: dict[str, str] = {
     "excluded_by_assets": "INTEGER DEFAULT 0",
+    "excluded_manually": "INTEGER DEFAULT 0",
 }
 
 
