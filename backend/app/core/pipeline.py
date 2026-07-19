@@ -114,6 +114,7 @@ from app.core.fsc_index import (
     is_fsc_index_stale,
     resolve_candidate_pairs,
 )
+from app.models.corp_cache import CorpCache
 from app.models.corp_profile import CorpProfile
 from app.models.financial_snapshot import FinancialSnapshot
 from app.models.fsc_corp_index import FscCorpIndex
@@ -1384,6 +1385,90 @@ async def run_job_phase1(job_id: int) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _build_corp_cache_name_multimap(db: Session) -> dict[str, list[str]]:
+    """corp_cache를 정규화 회사명 → [corp_code, ...] 다중매핑으로 만든다.
+
+    A4의 `_build_corp_cache_name_index`(이름 1개당 corp_code 1개만 보관)와 달리,
+    같은 이름을 가진 corp_code를 **전부** 모은다 — B1의 동명이인 재해석
+    (아래 `_resolve_alternative_corp_code`)이 후보군 전체를 훑어야 하기 때문이다.
+    각 리스트는 `modify_date` 내림차순(최근 갱신 우선)으로 정렬해, 활성 법인이
+    앞에 오도록 한다(company.json 호출 횟수를 줄이는 최적화 — 정확성은 주소
+    대조가 보장한다).
+    """
+    rows = db.execute(
+        select(CorpCache.corp_code, CorpCache.corp_name, CorpCache.modify_date)
+    ).all()
+    multimap: dict[str, list[tuple[str, str]]] = {}
+    for corp_code, corp_name, modify_date in rows:
+        norm = normalize_corp_name(corp_name or "")
+        if norm and corp_code:
+            multimap.setdefault(norm, []).append((corp_code, modify_date or ""))
+    result: dict[str, list[str]] = {}
+    for norm, entries in multimap.items():
+        entries.sort(key=lambda t: t[1], reverse=True)
+        result[norm] = [corp_code for corp_code, _md in entries]
+    return result
+
+
+async def _resolve_alternative_corp_code(
+    dart_client: DartClient,
+    *,
+    assigned_corp_code: str,
+    corp_name: str | None,
+    want_sido: str | None,
+    want_sigungu: str | None,
+    cond_region: dict | None,
+    used_codes: set[str],
+    name_multimap: dict[str, list[str]],
+    bgn_de: str,
+    end_de: str,
+) -> tuple[str, str] | None:
+    """B1 폴백: 배정된 corp_code에 감사보고서 공시가 0건일 때, 같은 정규화 이름을
+    가진 **다른** corp_code 중 "실제 감사보고서가 있고 주소(시도/시군구)가 일치"하는
+    것을 찾아 `(corp_code, latest_rcept_no)`로 돌려준다.
+
+    동명이인 충돌(예: corpCode.xml에 '유성정밀'이 여러 개 — 그중 하나는 이미 폐지돼
+    공시가 0건) 때문에 A4 이름 매칭이 죽은 법인에 후보를 붙이는 문제를 바로잡는다.
+    주소 대조 기준은 이 후보의 FSC 주소(`want_sido`/`want_sigungu`)를 우선 쓰고,
+    FSC 주소를 못 파싱했으면 Job의 지역 조건(`region_matches`)으로 폴백한다.
+    이미 이 Job의 다른 결과가 쓰고 있는 corp_code(`used_codes`)는 중복 방지를 위해
+    건너뛴다. 값비싼 company.json 호출은 공시가 실제로 있는 후보에만 한다.
+    """
+    norm = normalize_corp_name(corp_name or "")
+    if not norm:
+        return None
+    for alt_code in name_multimap.get(norm, []):
+        if alt_code == assigned_corp_code or alt_code in used_codes:
+            continue
+
+        disclosures = await _fetch_all_disclosures_for_corp(dart_client, alt_code, bgn_de, end_de)
+        if not disclosures:
+            continue
+
+        try:
+            company = await dart_client.get_company(alt_code)
+        except QuotaExceededError:
+            raise
+        except DartApiError as exc:
+            logger.warning("B1 대체 corp_code company.json 조회 실패 %s: %s", alt_code, exc)
+            continue
+
+        alt_sido, alt_sigungu = parse_address((company.get("adres") or "").strip() or None)
+        if want_sido is not None:
+            if alt_sido != want_sido:
+                continue
+            if want_sigungu is not None and alt_sigungu != want_sigungu:
+                continue
+        elif not region_matches(alt_sido, alt_sigungu, cond_region):
+            continue
+
+        disclosures.sort(key=lambda item: item.get("rcept_no") or "", reverse=True)
+        latest = disclosures[0].get("rcept_no")
+        if latest:
+            return alt_code, latest
+    return None
+
+
 async def _backfill_latest_rcept_no_for_job(
     dart_client: DartClient,
     session_factory: sessionmaker[Session],
@@ -1400,35 +1485,79 @@ async def _backfill_latest_rcept_no_for_job(
     만들지 않고** 이미 STEP 7이 쓰는 `_fetch_all_disclosures_for_corp()`(corp_code
     지정 list.json 페이징, 기간 제한 없음 실측)를 그대로 재사용해 후보 회사의
     공시 목록만 가볍게 조회한다 — 실제 원문 다운로드는 뒤이은 STEP 4가 담당한다.
+
+    A4 이름 매칭이 동명이인 중 폐지된 corp_code(공시 0건)를 붙일 수 있어, 배정된
+    corp_code로 공시가 0건이면 `_resolve_alternative_corp_code()`로 같은 이름의
+    다른 corp_code 중 주소가 일치하고 실제 공시가 있는 것으로 **교체**한 뒤
+    rcept_no를 채운다(교체 시 `results.corp_code`도 갱신 — 이후 STEP 4/5/7이 그
+    corp_code로 동작한다). 그래도 못 찾으면 기존처럼 FAILED로 남긴다.
     """
     with session_factory() as db:
         rows = db.execute(
-            select(Result.id, Result.corp_code).where(
+            select(Result.id, Result.corp_code, Result.corp_name, Result.address).where(
                 Result.job_id == job_id,
                 Result.corp_code.is_not(None),
                 Result.rcept_no.is_(None),
             )
         ).all()
+        job = db.get(Job, job_id)
+        cond_region: dict[str, Any] = (
+            json.loads(job.cond_region) if job is not None and job.cond_region else {}
+        )
+        used_codes: set[str] = {
+            code
+            for (code,) in db.execute(
+                select(Result.corp_code).where(
+                    Result.job_id == job_id, Result.corp_code.is_not(None)
+                )
+            ).all()
+        }
 
     if not rows:
         return
 
     bgn_de, end_de = _history_window(history_years)
+    name_multimap: dict[str, list[str]] | None = None
     done = 0
     found = 0
     total = len(rows)
-    for result_id, corp_code in rows:
+    for result_id, corp_code, corp_name, address in rows:
         if done % _CHECKPOINT_INTERVAL == 0:
             _raise_if_cancelled(session_factory, job_id)
 
         disclosures = await _fetch_all_disclosures_for_corp(dart_client, corp_code, bgn_de, end_de)
         disclosures.sort(key=lambda item: item.get("rcept_no") or "", reverse=True)
         latest_rcept_no = disclosures[0].get("rcept_no") if disclosures else None
+        resolved_corp_code = corp_code
+
+        if latest_rcept_no is None:
+            # 배정된 corp_code에 공시가 없다 — 동명이인 폐지 법인일 수 있으므로
+            # 같은 이름의 다른 corp_code(주소 일치)로 재해석을 시도한다.
+            if name_multimap is None:
+                with session_factory() as db:
+                    name_multimap = _build_corp_cache_name_multimap(db)
+            want_sido, want_sigungu = parse_address(address)
+            alt = await _resolve_alternative_corp_code(
+                dart_client,
+                assigned_corp_code=corp_code,
+                corp_name=corp_name,
+                want_sido=want_sido,
+                want_sigungu=want_sigungu,
+                cond_region=cond_region,
+                used_codes=used_codes,
+                name_multimap=name_multimap,
+                bgn_de=bgn_de,
+                end_de=end_de,
+            )
+            if alt is not None:
+                resolved_corp_code, latest_rcept_no = alt
+                used_codes.add(resolved_corp_code)
 
         with session_factory() as db:
             result = db.get(Result, result_id)
             if result is not None:
                 if latest_rcept_no:
+                    result.corp_code = resolved_corp_code
                     result.rcept_no = latest_rcept_no
                     found += 1
                 else:

@@ -961,6 +961,51 @@ CF alias 실측 범위/기존 완료 Job 소급 재파싱/손상 원문 표시),
   "안 함"으로 정한 전례와 동일) — 신규 Job 실행분부터 자동으로 이 51건류가 살아난다.
   백엔드 프로세스 재기동은 다음 실제 Job 실행 시 하면 된다(이번엔 코드/테스트만).
 
+**동명이인 corp_code 오매칭 버그 발견·수정 — B1에 주소 기반 재해석 추가(2026-07-20).**
+사용자가 Job #20에서 "유성정밀은 DART에 감사보고서가 멀쩡히 있는데 왜 FAILED냐"고
+물어 추적한 결과, DART 데이터 부재가 아니라 **Phase 1 A4가 후보를 폐지된 동명이인
+corp_code에 묶은 것**이 원인이었다. 실측 경위:
+- 결과 행의 `parse_note`는 "최근 감사보고서 공시를 찾을 수 없음", `rcept_no=NULL`
+  — B1(`_backfill_latest_rcept_no_for_job`)이 공시를 못 찾아 FAILED 처리한 것.
+- 배정된 `corp_code=00433989`로 list.json(F, 2022~2026)을 실제 조회하니 `status=013`
+  (**공시 0건**, `modify_date=20170630`인 폐지 추정 법인)이었다.
+- 원인은 A4의 이름 매칭 폴백: FSC 레코드에 `fss_corp_unq_no`가 없으면
+  `_build_corp_cache_name_index`로 회사명 매칭을 하는데, 이 인덱스는 **같은 이름당
+  corp_code를 하나만**(`norm not in index`, 먼저 만난 것) 보관한다. corpCode.xml에
+  '유성정밀'이 3개(`00433989` 폐지 / `00840383` 부산 사상구 / `01647297` 경남 사천시)
+  라 하필 폐지 법인이 채택됐다.
+- **수정(사용자가 옵션 (a) 선택)**: B1에서 배정 corp_code의 공시가 0건이면
+  `_resolve_alternative_corp_code()`로 같은 정규화 이름의 **다른** corp_code 중
+  "실제 감사보고서가 있고 주소(시도/시군구)가 일치"하는 것을 찾아 **교체**한다
+  (`results.corp_code`도 갱신 — 이후 STEP 4/5/7이 그 코드로 동작). 주소 대조 기준은
+  후보의 FSC 주소를 우선 쓰고, 못 파싱하면 Job의 `cond_region`(`region_matches`)으로
+  폴백한다. 같은 Job의 다른 결과가 이미 쓰는 corp_code는 중복 방지로 건너뛴다.
+  company.json은 **공시가 실제로 있는 후보에만** 호출해 쿼터 낭비를 막는다.
+  이름 다중매핑은 신규 `_build_corp_cache_name_multimap()`(A4의 단일 인덱스와 달리
+  같은 이름의 corp_code를 전부 보관, `modify_date` 내림차순)이 담당한다.
+- **실제 API로 검증**: 이 로직이 `01647297`(경남 사천시 사남면 외국기업로 21 — 결과
+  행의 FSC 주소와 정확히 일치)을 골라 rcept_no `20260331003150`을 찾아냈다.
+  **부산의 동명이인 `00840383`은 주소 대조로 정확히 탈락했다** — 만약 옵션 (b)
+  "최신 갱신(modify_date) 우선"으로 골랐다면 부산 회사를 잘못 채택했을 것이므로,
+  주소 대조를 판정 기준으로 삼은 것이 결정적이었다.
+- 신규 회귀 테스트 2종(`test_pipeline.py`): 주소 대조로 동명이인/폐지 코드를 가르는
+  케이스, FSC 주소가 없을 때 `cond_region`으로 폴백하는 케이스. 후자는 구현 중 실제로
+  잡은 버그를 잠근다 — `Job.cond_region`은 DB에 **JSON 문자열**로 저장되므로
+  `json.loads`로 파싱해 넘겨야 하는데(기존 코드의 관행), 원시 문자열을 넘기면
+  `region_matches`가 AttributeError로 터진다.
+- **기존 Job #20 데이터는 자동 복구되지 않는다**: `retry-failed`는 `rcept_no IS NULL`
+  건을 명시적으로 제외하고(M6 QA에서 의도적으로 넣은 조건), `resume`은
+  PAUSED_QUOTA/FAILED만 허용하는데 Job #20은 DONE이다. 이 수정은 **신규 Phase 2
+  실행분부터** 적용된다(소급 재파싱을 안 하는 M7 CF/EUC-KR 전례와 동일).
+- **주의(이번 세션 관찰)**: 작업 중 같은 워킹트리에서 다른 세션이
+  `financial_snapshots.from_current_period`(연도별 1차 자료 우선 규칙) 기능을 동시에
+  편집하고 있었다 — 그 미커밋 작업 때문에
+  `test_collect_history_for_result_stops_once_target_years_reached`/
+  `..._skips_api_when_already_sufficient` 2건이 실패 상태다(스냅샷 fixture가
+  `from_current_period=1`을 설정하지 않아 short-circuit이 안 됨). **이 2건은 위
+  동명이인 수정과 무관하며 건드리지 않았다** — 해당 기능 작성자가 테스트를 갱신해야
+  한다. 이 2건을 제외하면 `pytest tests/ -q` 189 passed(신규 2 포함).
+
 작업을 시작하기 전에 반드시 아래 두 문서를 먼저 읽으세요 —
 이 저장소의 유일한 진실 소스(source of truth)입니다.
 

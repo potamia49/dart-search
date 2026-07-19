@@ -19,6 +19,7 @@ from sqlalchemy import select
 from app.config import Settings
 from app.core import pipeline
 from app.core.dart_client import DartApiError, QuotaExceededError
+from app.models.corp_cache import CorpCache
 from app.models.corp_profile import CorpProfile
 from app.models.financial_snapshot import FinancialSnapshot
 from app.models.fsc_corp_index import FscCorpIndex
@@ -1684,3 +1685,102 @@ async def test_backfill_marks_result_failed_when_no_disclosure_found(
     assert result.revenue_cur is None
     assert result.total_assets_cur is None
     assert result.excluded_by_revenue == 0  # 값을 모르면 제외하지 않는다(기존 원칙 그대로)
+
+
+@pytest.mark.asyncio
+async def test_backfill_recovers_homonym_dead_corp_code_by_address(
+    db_session_factory, patch_pipeline_env
+):
+    """A4 이름 매칭이 동명이인 중 '폐지된' corp_code(공시 0건)를 붙인 경우,
+    B1이 같은 이름의 다른 corp_code 중 **주소가 일치하고 실제 공시가 있는** 것으로
+    교체해야 한다.
+
+    실측 회귀(2026-07-20): '유성정밀'이 corpCode.xml에 3개 있고, A4의 이름 인덱스가
+    '먼저 만난 것 하나'만 보관해 2017년 이후 공시가 0건인 폐지 법인(00433989)을
+    골라 Job #20에서 FAILED가 됐다. 실제 정답은 사천시 법인(01647297)이며, 단순히
+    '최근 갱신 우선'으로 골랐다면 부산의 동명이인(00840383)을 잘못 골랐을 것 —
+    그래서 주소 대조가 판정 기준이어야 한다.
+    """
+    job_id = _make_job(db_session_factory, cond_revenue={"min_krw": 0, "max_krw": 10**12})
+    with db_session_factory() as db:
+        # modify_date 내림차순으로 BUSAN001이 REAL0001보다 먼저 시도된다 —
+        # 주소가 다르므로 반드시 탈락해야 한다.
+        db.add(CorpCache(corp_code="DEAD0001", corp_name="유성정밀", modify_date="20170630"))
+        db.add(CorpCache(corp_code="BUSAN001", corp_name="유성정밀", modify_date="20230220"))
+        db.add(CorpCache(corp_code="REAL0001", corp_name="유성정밀", modify_date="20230208"))
+        db.add(
+            Result(
+                job_id=job_id,
+                corp_code="DEAD0001",
+                corp_name="유성정밀",
+                address="경상남도 사천시 사남면 외국기업로 21",
+            )
+        )
+        db.commit()
+
+    rcept_no = "20260331003150"
+    fake_client = FakeDartClient(
+        disclosure_pages_by_corp={
+            "DEAD0001": [{"status": "013", "list": [], "total_page": 1}],
+            "BUSAN001": [
+                {"status": "000", "total_page": 1, "list": [{"rcept_no": "20260331001989"}]}
+            ],
+            "REAL0001": [{"status": "000", "total_page": 1, "list": [{"rcept_no": rcept_no}]}],
+        },
+        companies={
+            "BUSAN001": {"adres": "부산광역시 사상구 낙동대로 856 (감전동)"},
+            "REAL0001": {"adres": "경상남도 사천시 사남면 외국기업로 21 (유천리, 유성정밀)"},
+        },
+    )
+
+    await pipeline._backfill_latest_rcept_no_for_job(fake_client, db_session_factory, job_id, 4)
+
+    with db_session_factory() as db:
+        result = db.execute(select(Result).where(Result.job_id == job_id)).scalar_one()
+    assert result.corp_code == "REAL0001"  # 폐지 코드에서 교체됨(STEP 4/5/7이 이 값을 쓴다)
+    assert result.rcept_no == rcept_no
+    assert result.parse_status != ParseStatus.FAILED
+    # 주소가 다른 동명이인도 실제로 검사했음을 확인(공시가 있는 후보에만 company.json 호출)
+    assert "BUSAN001" in fake_client.company_calls
+
+
+@pytest.mark.asyncio
+async def test_backfill_homonym_falls_back_to_job_region_when_address_missing(
+    db_session_factory, patch_pipeline_env
+):
+    """후보의 FSC 주소를 파싱할 수 없으면 Job의 지역 조건(`region_matches`)으로
+    동명이인을 가려야 한다.
+
+    `Job.cond_region`은 DB에 **JSON 문자열**로 저장되므로 dict로 파싱해서 넘겨야
+    한다 — 원시 문자열을 넘기면 `region_matches`가 AttributeError로 터진다(회귀).
+    """
+    job_id = _make_job(db_session_factory, cond_region={"sido": ["경상남도"]})
+    with db_session_factory() as db:
+        db.add(CorpCache(corp_code="DEAD0001", corp_name="유성정밀", modify_date="20170630"))
+        db.add(CorpCache(corp_code="BUSAN001", corp_name="유성정밀", modify_date="20230220"))
+        db.add(CorpCache(corp_code="REAL0001", corp_name="유성정밀", modify_date="20230208"))
+        # address=None -> want_sido를 못 구하므로 Job 지역 조건으로 폴백해야 한다.
+        db.add(Result(job_id=job_id, corp_code="DEAD0001", corp_name="유성정밀", address=None))
+        db.commit()
+
+    rcept_no = "20260331003150"
+    fake_client = FakeDartClient(
+        disclosure_pages_by_corp={
+            "DEAD0001": [{"status": "013", "list": [], "total_page": 1}],
+            "BUSAN001": [
+                {"status": "000", "total_page": 1, "list": [{"rcept_no": "20260331001989"}]}
+            ],
+            "REAL0001": [{"status": "000", "total_page": 1, "list": [{"rcept_no": rcept_no}]}],
+        },
+        companies={
+            "BUSAN001": {"adres": "부산광역시 사상구 낙동대로 856 (감전동)"},
+            "REAL0001": {"adres": "경상남도 사천시 사남면 외국기업로 21 (유천리, 유성정밀)"},
+        },
+    )
+
+    await pipeline._backfill_latest_rcept_no_for_job(fake_client, db_session_factory, job_id, 4)
+
+    with db_session_factory() as db:
+        result = db.execute(select(Result).where(Result.job_id == job_id)).scalar_one()
+    assert result.corp_code == "REAL0001"
+    assert result.rcept_no == rcept_no
