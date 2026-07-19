@@ -1,3 +1,44 @@
+:root {
+  color-scheme: light;
+}
+
 body {
   margin: 0;
+  /* 보고서 서식과 동일한 차분한 페이지 배경 톤 (흰 카드가 떠 보이도록) */
+  background: #e7eaf0;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* 소프트 배경이 콘텐츠 뒤로 비치도록 Main 영역은 투명 처리 */
+.mantine-AppShell-main {
+  background: transparent;
+}
+
+/* ── 브랜드 상단 네비게이션 (그라디언트 헤더 위) ── */
+.brand-nav {
+  color: rgba(255, 255, 255, 0.82);
+  text-decoration: none;
+  font-size: 13.5px;
+  font-weight: 600;
+  padding: 6px 15px;
+  border-radius: 20px;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease;
+}
+.brand-nav:hover {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.12);
+}
+.brand-nav.active {
+  color: #0a192f;
+  background: #c9a227;
+}
+
+/* ── 결과/상세 테이블 헤더를 딥 네이비로 통일 (보고서 표와 동일 규격) ── */
+.mantine-Table-th {
+  background: #0a192f;
+  color: #fff;
+  font-weight: 600;
 }

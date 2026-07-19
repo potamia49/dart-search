@@ -6,6 +6,7 @@ import {
   Group,
   NumberInput,
   Paper,
+  SimpleGrid,
   Stack,
   Text,
   TextInput,
@@ -21,6 +22,7 @@ import { createJob } from '../api/jobs'
 import type { CandidatesPreviewResponse, FscIndexStatus, IndustryMeta, RegionMeta } from '../types'
 
 const EOK = 100_000_000 // 1억원 = 100,000,000원
+const MAX_EOK = 1_000_000 // 최대 미입력 시 기본 상한: 1,000,000억원(=100조원)
 
 export default function SearchPage() {
   const navigate = useNavigate()
@@ -107,12 +109,12 @@ export default function SearchPage() {
         name: name.trim() ? name.trim() : null,
         region: { sido, sigungu },
         revenue: {
-          min_krw: minRevenueEok === '' ? null : Math.round(minRevenueEok * EOK),
-          max_krw: maxRevenueEok === '' ? null : Math.round(maxRevenueEok * EOK),
+          min_krw: minRevenueEok === '' ? 0 : Math.round(minRevenueEok * EOK),
+          max_krw: maxRevenueEok === '' ? MAX_EOK * EOK : Math.round(maxRevenueEok * EOK),
         },
         total_assets: {
-          min_krw: minAssetsEok === '' ? null : Math.round(minAssetsEok * EOK),
-          max_krw: maxAssetsEok === '' ? null : Math.round(maxAssetsEok * EOK),
+          min_krw: minAssetsEok === '' ? 0 : Math.round(minAssetsEok * EOK),
+          max_krw: maxAssetsEok === '' ? MAX_EOK * EOK : Math.round(maxAssetsEok * EOK),
         },
         industry: industryCodes,
         history_years: 4,
@@ -127,11 +129,12 @@ export default function SearchPage() {
   }
 
   return (
-    <Stack maw={860} mx="auto">
+    <Stack maw={960} mx="auto">
       <Title order={2}>검색 조건</Title>
       <Text size="sm" c="dimmed">
-        지역/매출액/총자산/업종 조건으로 후보 회사를 먼저 확정합니다(Phase 1). 재무제표
-        다년치 수집(Phase 2)은 후보 목록을 확인한 뒤 별도로 시작합니다.
+        1단계: 먼저 지역·매출액·총자산·업종 조건으로 후보 회사를 찾습니다.
+        <br />
+        2단계: 후보 목록을 확인한 뒤, DART 재무제표(다년치)를 수집합니다.
       </Text>
       {metaError && (
         <Alert color="red" title="목록 로딩 실패">
@@ -151,78 +154,80 @@ export default function SearchPage() {
         </Stack>
       </Paper>
 
-      <Paper withBorder p="md">
-        <Title order={4} mb="sm">
-          지역
-        </Title>
-        <RegionSelect
-          regions={regions}
-          sido={sido}
-          sigungu={sigungu}
-          onSidoChange={setSido}
-          onSigunguChange={setSigungu}
-        />
-      </Paper>
+      <SimpleGrid cols={{ base: 1, md: 2 }} spacing="md" verticalSpacing="md">
+        <Paper withBorder p="md">
+          <Title order={4} mb="sm">
+            지역
+          </Title>
+          <RegionSelect
+            regions={regions}
+            sido={sido}
+            sigungu={sigungu}
+            onSidoChange={setSido}
+            onSigunguChange={setSigungu}
+          />
+        </Paper>
 
-      <Paper withBorder p="md">
-        <Title order={4} mb="sm">
-          업종 (미선택 시 전체)
-        </Title>
-        <IndustryTreeSelect
-          industries={industries}
-          selected={industryCodes}
-          onChange={setIndustryCodes}
-        />
-        {industryCodes.length > 0 && (
-          <Text size="sm" c="dimmed" mt={4}>
-            선택됨: {industryCodes.length}건
-          </Text>
-        )}
-      </Paper>
+        <Paper withBorder p="md">
+          <Title order={4} mb="sm">
+            업종 (미선택 시 전체)
+          </Title>
+          <IndustryTreeSelect
+            industries={industries}
+            selected={industryCodes}
+            onChange={setIndustryCodes}
+          />
+          {industryCodes.length > 0 && (
+            <Text size="sm" c="dimmed" mt={4}>
+              선택됨: {industryCodes.length}건
+            </Text>
+          )}
+        </Paper>
 
-      <Paper withBorder p="md">
-        <Title order={4} mb="sm">
-          매출액 범위 (억원, 미입력 시 무제한)
-        </Title>
-        <Group grow>
-          <NumberInput
-            label="최소"
-            placeholder="예: 60"
-            min={0}
-            value={minRevenueEok}
-            onChange={(v) => setMinRevenueEok(v === '' ? '' : Number(v))}
-          />
-          <NumberInput
-            label="최대"
-            placeholder="예: 150"
-            min={0}
-            value={maxRevenueEok}
-            onChange={(v) => setMaxRevenueEok(v === '' ? '' : Number(v))}
-          />
-        </Group>
-      </Paper>
+        <Paper withBorder p="md">
+          <Title order={4} mb="sm">
+            매출액 범위 (억원)
+          </Title>
+          <Group grow>
+            <NumberInput
+              label="최소"
+              placeholder="예: 60"
+              min={0}
+              value={minRevenueEok}
+              onChange={(v) => setMinRevenueEok(v === '' ? '' : Number(v))}
+            />
+            <NumberInput
+              label="최대"
+              placeholder="예: 150"
+              min={0}
+              value={maxRevenueEok}
+              onChange={(v) => setMaxRevenueEok(v === '' ? '' : Number(v))}
+            />
+          </Group>
+        </Paper>
 
-      <Paper withBorder p="md">
-        <Title order={4} mb="sm">
-          총자산 범위 (억원, 미입력 시 무제한)
-        </Title>
-        <Group grow>
-          <NumberInput
-            label="최소"
-            placeholder="예: 30"
-            min={0}
-            value={minAssetsEok}
-            onChange={(v) => setMinAssetsEok(v === '' ? '' : Number(v))}
-          />
-          <NumberInput
-            label="최대"
-            placeholder="예: 300"
-            min={0}
-            value={maxAssetsEok}
-            onChange={(v) => setMaxAssetsEok(v === '' ? '' : Number(v))}
-          />
-        </Group>
-      </Paper>
+        <Paper withBorder p="md">
+          <Title order={4} mb="sm">
+            총자산 범위 (억원)
+          </Title>
+          <Group grow>
+            <NumberInput
+              label="최소"
+              placeholder="예: 30"
+              min={0}
+              value={minAssetsEok}
+              onChange={(v) => setMinAssetsEok(v === '' ? '' : Number(v))}
+            />
+            <NumberInput
+              label="최대"
+              placeholder="예: 300"
+              min={0}
+              value={maxAssetsEok}
+              onChange={(v) => setMaxAssetsEok(v === '' ? '' : Number(v))}
+            />
+          </Group>
+        </Paper>
+      </SimpleGrid>
 
       {preview && (
         <Alert color={preview.exceeds_daily_quota ? 'yellow' : 'blue'} variant="light">
