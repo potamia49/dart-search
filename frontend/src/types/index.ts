@@ -16,8 +16,10 @@ export type ParseStatus = 'OK' | 'PARTIAL' | 'FAILED'
 export type JobPhase = 'CANDIDATES' | 'FINANCIALS'
 
 export interface RegionCondition {
-  sido: string | null
-  sigungu: string[]
+  /** 시도 다중 선택. */
+  sido: string[]
+  /** 시도별 시군구(업종 대분류→중분류와 동일 구조). 빈 배열이거나 키가 없으면 그 시도 전체. */
+  sigungu_by_sido: Record<string, string[]>
 }
 
 export interface RevenueCondition {

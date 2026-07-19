@@ -77,10 +77,9 @@ function FinancialHistorySection({
                 <Stack gap={2}>
                   <Text span fw={600} size="sm">{snap.fiscal_year}</Text>
                   {snap.rcept_no && (
-                    <Anchor
-                      component="button"
-                      type="button"
-                      size="xs"
+                    <Button
+                      size="compact-xs"
+                      variant="light"
                       onClick={() =>
                         onOpenDocument({
                           section: 'bs',
@@ -89,8 +88,8 @@ function FinancialHistorySection({
                         })
                       }
                     >
-                      원문
-                    </Anchor>
+                      원문 보기
+                    </Button>
                   )}
                 </Stack>
               </Table.Th>

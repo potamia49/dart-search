@@ -12,12 +12,33 @@ export function summarizeJobConditions(job: JobResponse): string {
   const parts: string[] = []
 
   const region = job.cond_region
-  if (region?.sido) {
-    const sigungu = region.sigungu ?? []
-    const sigunguPart = sigungu.length > 0 ? ` (${sigungu.join(', ')})` : ' 전체'
-    parts.push(`${region.sido}${sigunguPart}`)
-  } else {
+  // 시도 다중 선택 + 시도별 시군구. 구 Job의 cond_region은 단일 문자열 sido +
+  // 평면 sigungu라, 두 형태를 모두 흡수한다.
+  const rawSido = region?.sido as string[] | string | null | undefined
+  const sidoList = Array.isArray(rawSido) ? rawSido : rawSido ? [rawSido] : []
+  const bySido = (region as { sigungu_by_sido?: Record<string, string[]> })?.sigungu_by_sido
+  const flatSigungu = (region as { sigungu?: string[] })?.sigungu ?? []
+
+  function sigunguOf(sidoName: string): string[] {
+    if (bySido && bySido[sidoName]) return bySido[sidoName]
+    // 구 평면 형태: 시도가 1개일 때만 그 시도에 매핑됐던 값.
+    if (sidoList.length === 1) return flatSigungu
+    return []
+  }
+
+  if (sidoList.length === 0) {
     parts.push('전국')
+  } else if (sidoList.length === 1) {
+    const sg = sigunguOf(sidoList[0])
+    parts.push(`${sidoList[0]}${sg.length > 0 ? ` (${sg.join(', ')})` : ' 전체'}`)
+  } else {
+    const label = sidoList
+      .map((s) => {
+        const sg = sigunguOf(s)
+        return sg.length > 0 ? `${s}(${sg.length})` : s
+      })
+      .join(', ')
+    parts.push(`${label} · ${sidoList.length}개 시도`)
   }
 
   const revenue = job.cond_revenue

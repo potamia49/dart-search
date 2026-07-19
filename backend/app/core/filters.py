@@ -66,26 +66,76 @@ def parse_address(address: str | None) -> tuple[str | None, str | None]:
     return sido, sigungu
 
 
+def cond_sido_list(cond_region: dict | None) -> list[str]:
+    """cond_region의 sido를 정규화된 시도명 리스트로 반환한다.
+
+    시도는 다중 선택(리스트)이 기본이지만, 하위호환을 위해 구 단일 선택(문자열)
+    형태(`{"sido": "경남"}`)도 1개짜리 리스트로 흡수한다 — 이미 저장된 Job의
+    cond_region JSON과 문자열을 넘기는 기존 테스트가 그대로 동작하도록 하기 위함.
+    None/빈 값이면 빈 리스트(지역 조건 없음)를 반환한다.
+    """
+    if not cond_region:
+        return []
+    raw = cond_region.get("sido")
+    if not raw:
+        return []
+    values = [raw] if isinstance(raw, str) else list(raw)
+    result: list[str] = []
+    for v in values:
+        if v:
+            result.append(normalize_sido(v) or v)
+    return result
+
+
+def cond_region_sigungu_map(cond_region: dict | None) -> dict[str, list[str]] | None:
+    """cond_region을 {정규화된 시도: [시군구...]} 매핑으로 변환한다.
+
+    지역 조건이 없으면 None(전체 통과)을 반환한다. 시군구 목록이 비어 있으면
+    해당 시도 전체를 의미한다. 지원하는 입력 형태:
+      - 신형(시도별 시군구): {"sido": ["경상남도", "부산광역시"],
+        "sigungu_by_sido": {"경상남도": ["김해시"], "부산광역시": []}}
+      - 구형 평면(시도 1개): {"sido": "경남", "sigungu": ["김해시"]}
+        또는 {"sido": ["경남"], "sigungu": ["김해시"]} — 그 유일한 시도에 매핑.
+    시군구가 시도별로 그룹화되므로 "중구"처럼 시도 간 시군구명이 충돌하지 않는다.
+    """
+    if not cond_region:
+        return None
+    sidos = cond_sido_list(cond_region)
+    if not sidos:
+        return None
+    result: dict[str, list[str]] = {s: [] for s in sidos}
+    sbs = cond_region.get("sigungu_by_sido")
+    if isinstance(sbs, dict) and sbs:
+        for key, values in sbs.items():
+            norm_key = normalize_sido(key) or key
+            if norm_key in result:
+                result[norm_key] = list(values or [])
+    else:
+        flat = cond_region.get("sigungu") or []
+        if flat and len(sidos) == 1:
+            result[sidos[0]] = list(flat)
+    return result
+
+
 def region_matches(
     sido: str | None, sigungu: str | None, cond_region: dict | None
 ) -> bool:
     """corp_profiles의 (sido, sigungu)가 Job.cond_region 조건과 일치하는지 판정.
 
-    cond_region: {"sido": "경남", "sigungu": ["김해시", "양산시"]} 형태(§5).
+    cond_region은 시도 다중 선택 + 시도별 시군구(§5, `cond_region_sigungu_map`
+    참조)이며 구 평면 형태도 하위호환으로 받아들인다.
     - cond_region이 비어 있으면(지역 조건 없음) 무조건 통과.
-    - sido가 지정되었는데 프로필의 sido를 알 수 없거나 다르면 탈락.
-    - sigungu 목록이 지정되었는데 프로필의 sigungu가 그 목록에 없으면 탈락
+    - 프로필의 sido가 선택된 시도 목록에 없으면 탈락.
+    - 그 시도에 시군구 목록이 지정됐는데 프로필의 sigungu가 목록에 없으면 탈락
       (목록이 비어 있으면 해당 시도 전체 통과).
     """
-    if not cond_region:
+    region_map = cond_region_sigungu_map(cond_region)
+    if not region_map:
         return True
-    cond_sido_raw = cond_region.get("sido")
-    if cond_sido_raw:
-        cond_sido = normalize_sido(cond_sido_raw) or cond_sido_raw
-        if sido != cond_sido:
-            return False
-    cond_sigungu = cond_region.get("sigungu") or []
-    if cond_sigungu and sigungu not in cond_sigungu:
+    if sido not in region_map:
+        return False
+    allowed = region_map[sido]
+    if allowed and sigungu not in allowed:
         return False
     return True
 

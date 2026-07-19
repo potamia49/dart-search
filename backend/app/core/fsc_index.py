@@ -38,7 +38,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.config import Settings, get_settings
 from app.core.dart_client import FscCorpInfoClient
 from app.core.db import get_session_factory
-from app.core.filters import normalize_corp_name, normalize_sido, parse_address, region_matches
+from app.core.filters import cond_sido_list, normalize_corp_name, parse_address, region_matches
 from app.core.industry_data import INDUSTRIES
 from app.models.corp_cache import CacheMeta, CorpCache
 from app.models.fsc_corp_index import FscCorpIndex
@@ -434,10 +434,9 @@ def filter_local_candidates(
     stmt = select(FscCorpIndex)
 
     cond_region = cond_region or {}
-    cond_sido_raw = cond_region.get("sido")
-    if cond_sido_raw:
-        cond_sido = normalize_sido(cond_sido_raw) or cond_sido_raw
-        stmt = stmt.where(FscCorpIndex.sido == cond_sido)
+    cond_sidos = cond_sido_list(cond_region)
+    if cond_sidos:
+        stmt = stmt.where(FscCorpIndex.sido.in_(cond_sidos))
 
     rows = db.execute(stmt).scalars().all()
     industry_labels = _industry_labels_for_codes(cond_industry or [])

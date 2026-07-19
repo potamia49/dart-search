@@ -33,8 +33,8 @@ export default function SearchPage() {
   const [metaError, setMetaError] = useState<string | null>(null)
 
   const [name, setName] = useState('')
-  const [sido, setSido] = useState<string | null>(null)
-  const [sigungu, setSigungu] = useState<string[]>([])
+  const [sido, setSido] = useState<string[]>([])
+  const [sigunguBySido, setSigunguBySido] = useState<Record<string, string[]>>({})
   const [minRevenueEok, setMinRevenueEok] = useState<number | ''>('')
   const [maxRevenueEok, setMaxRevenueEok] = useState<number | ''>('')
   const [minAssetsEok, setMinAssetsEok] = useState<number | ''>('')
@@ -45,7 +45,7 @@ export default function SearchPage() {
 
   const [preview, setPreview] = useState<CandidatesPreviewResponse | null>(null)
   const [debouncedSido] = useDebouncedValue(sido, 400)
-  const [debouncedSigungu] = useDebouncedValue(sigungu, 400)
+  const [debouncedSigunguBySido] = useDebouncedValue(sigunguBySido, 400)
   const [debouncedIndustryCodes] = useDebouncedValue(industryCodes, 400)
 
   useEffect(() => {
@@ -82,13 +82,13 @@ export default function SearchPage() {
   // 훑게 되므로 호출하지 않는다 — sido가 있어야 백엔드가 SQL WHERE로 먼저
   // 좁힌다(app/core/fsc_index.py::filter_local_candidates).
   useEffect(() => {
-    if (!debouncedSido) {
+    if (debouncedSido.length === 0) {
       setPreview(null)
       return
     }
     let cancelled = false
     getCandidatesPreview({
-      region: { sido: debouncedSido, sigungu: debouncedSigungu },
+      region: { sido: debouncedSido, sigungu_by_sido: debouncedSigunguBySido },
       industry: debouncedIndustryCodes,
     })
       .then((data) => {
@@ -100,14 +100,14 @@ export default function SearchPage() {
     return () => {
       cancelled = true
     }
-  }, [debouncedSido, debouncedSigungu, debouncedIndustryCodes])
+  }, [debouncedSido, debouncedSigunguBySido, debouncedIndustryCodes])
 
   async function handleSubmit() {
     setSubmitting(true)
     try {
       const job = await createJob({
         name: name.trim() ? name.trim() : null,
-        region: { sido, sigungu },
+        region: { sido, sigungu_by_sido: sigunguBySido },
         revenue: {
           min_krw: minRevenueEok === '' ? 0 : Math.round(minRevenueEok * EOK),
           max_krw: maxRevenueEok === '' ? MAX_EOK * EOK : Math.round(maxRevenueEok * EOK),
@@ -162,9 +162,9 @@ export default function SearchPage() {
           <RegionSelect
             regions={regions}
             sido={sido}
-            sigungu={sigungu}
+            sigunguBySido={sigunguBySido}
             onSidoChange={setSido}
-            onSigunguChange={setSigungu}
+            onSigunguBySidoChange={setSigunguBySido}
           />
         </Paper>
 

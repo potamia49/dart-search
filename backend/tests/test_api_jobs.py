@@ -77,7 +77,12 @@ def test_create_job_returns_pending_and_triggers_phase1_background_task(monkeypa
         body = resp.json()
         assert body["status"] == JobStatus.PENDING
         assert body["phase"] == JobPhase.CANDIDATES
-        assert body["cond_region"] == {"sido": "경남", "sigungu": ["김해시"]}
+        # 시도는 다중 선택(리스트) + 시도별 시군구로 저장된다 — 구 평면 형태
+        # (단일 문자열 sido + 평면 sigungu)도 하위호환으로 표준 형태로 변환된다.
+        assert body["cond_region"] == {
+            "sido": ["경남"],
+            "sigungu_by_sido": {"경남": ["김해시"]},
+        }
         assert body["cond_industry"] == ["C25"]
         assert body["cond_total_assets"] == {"min_krw": None, "max_krw": None}
         assert body["history_years"] == 4  # 미지정 시 기본값
@@ -125,15 +130,37 @@ def test_create_job_rejects_invalid_history_years(monkeypatch):
         app_main.app.dependency_overrides.clear()
 
 
-def test_create_job_rejects_sigungu_without_sido(monkeypatch):
-    """sido 없이 sigungu만 지정하면 422 — filter_local_candidates가 sido 선필터
-    없이 fsc_corp_index 전체(최대 약 128만 행)를 메모리로 로드하는 것을 막는다."""
+def test_create_job_rejects_sigungu_for_unselected_sido(monkeypatch):
+    """시군구를 지정한 시도가 선택된 시도 목록에 없으면 422 — filter_local_candidates가
+    sido 선필터(SQL IN) 없이 fsc_corp_index 전체를 메모리로 로드하는 것을 막는다."""
     client, _calls, _phase2_calls = _build_test_client(monkeypatch)
     try:
         payload = _sample_payload()
-        payload["region"] = {"sido": None, "sigungu": ["김해시"]}
+        payload["region"] = {
+            "sido": ["경상남도"],
+            "sigungu_by_sido": {"부산광역시": ["해운대구"]},
+        }
         resp = client.post("/api/jobs", json=payload)
         assert resp.status_code == 422
+    finally:
+        app_main.app.dependency_overrides.clear()
+
+
+def test_create_job_accepts_multiple_sido_with_per_sido_sigungu(monkeypatch):
+    """시도 다중 선택 + 시도별 시군구가 그대로 저장된다(업종 대분류→중분류 구조)."""
+    client, _calls, _phase2_calls = _build_test_client(monkeypatch)
+    try:
+        payload = _sample_payload()
+        payload["region"] = {
+            "sido": ["경상남도", "부산광역시"],
+            "sigungu_by_sido": {"경상남도": ["김해시"], "부산광역시": []},
+        }
+        resp = client.post("/api/jobs", json=payload)
+        assert resp.status_code == 200
+        assert resp.json()["cond_region"] == {
+            "sido": ["경상남도", "부산광역시"],
+            "sigungu_by_sido": {"경상남도": ["김해시"], "부산광역시": []},
+        }
     finally:
         app_main.app.dependency_overrides.clear()
 

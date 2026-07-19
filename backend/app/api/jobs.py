@@ -47,20 +47,56 @@ router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 
 
 class RegionCondition(BaseModel):
-    """cond_region: {"sido": "경남", "sigungu": ["김해시", "양산시"]}"""
+    """cond_region: 시도 다중 선택 + 시도별 시군구.
 
-    sido: str | None = None
-    sigungu: list[str] = Field(default_factory=list)
+    표준 형태:
+      {"sido": ["경상남도", "부산광역시"],
+       "sigungu_by_sido": {"경상남도": ["김해시", "양산시"], "부산광역시": []}}
+    시군구가 시도별로 그룹화되므로 여러 시도를 골라도 "중구"처럼 시도 간
+    시군구명이 충돌하지 않는다(업종 대분류→중분류 선택과 동일한 구조).
+
+    하위호환: 구 평면 형태(`{"sido": "경남", "sigungu": ["김해시"]}`,
+    시도 1개)도 `_normalize_shape`가 표준 형태로 변환해 받아들인다 — 이미
+    저장된 Job의 cond_region JSON과 문자열/평면 payload를 넘기는 기존 테스트가
+    그대로 동작하도록 하기 위함.
+    """
+
+    sido: list[str] = Field(default_factory=list)
+    sigungu_by_sido: dict[str, list[str]] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_shape(cls, data: object) -> object:
+        if not isinstance(data, dict):
+            return data
+        data = dict(data)
+        raw_sido = data.get("sido")
+        if raw_sido is None:
+            sido: list[str] = []
+        elif isinstance(raw_sido, str):
+            sido = [raw_sido] if raw_sido else []
+        else:
+            sido = list(raw_sido)
+        sbs = data.get("sigungu_by_sido")
+        if not (isinstance(sbs, dict) and sbs):
+            # 구 평면 sigungu는 시도가 정확히 1개일 때만 그 시도로 흡수한다.
+            flat = data.get("sigungu") or []
+            sbs = {sido[0]: list(flat)} if flat and len(sido) == 1 else {}
+        data["sido"] = sido
+        data["sigungu_by_sido"] = sbs
+        data.pop("sigungu", None)
+        return data
 
     @model_validator(mode="after")
-    def _sigungu_requires_sido(self) -> "RegionCondition":
-        # Phase 1 A2(`app/core/fsc_index.py::filter_local_candidates`)는 sido가
-        # 있어야만 SQL WHERE로 fsc_corp_index(최대 약 128만 행)를 먼저 좁힌다 —
-        # sigungu만 있고 sido가 없으면 전체 인덱스를 메모리로 로드하게 되어
-        # OOM/장시간 정지 위험이 있다. 프론트는 항상 sido와 함께 보내지만
-        # API를 직접 호출하는 경로까지 막기 위해 여기서 거부한다.
-        if self.sigungu and not self.sido:
-            raise ValueError("sigungu를 지정하려면 sido도 함께 지정해야 합니다.")
+    def _sigungu_keys_subset_of_sido(self) -> "RegionCondition":
+        # 시군구를 지정한 시도는 선택된 시도 목록에도 있어야 한다 — 시도 선필터
+        # (`filter_local_candidates`의 SQL IN) 없이 시군구만 지정돼 fsc_corp_index
+        # 전체(최대 약 63만 행)를 메모리로 로드하는 것을 막는다.
+        for key in self.sigungu_by_sido:
+            if key not in self.sido:
+                raise ValueError(
+                    "시군구를 지정한 시도는 시도 목록에도 포함되어야 합니다."
+                )
         return self
 
 

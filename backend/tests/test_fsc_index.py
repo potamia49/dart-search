@@ -262,6 +262,28 @@ def test_filter_local_candidates_applies_region_and_industry(db_session_factory)
     assert [c.corp_name for c in candidates] == ["김해기계"]
 
 
+def test_filter_local_candidates_applies_multiple_sido(db_session_factory):
+    """시도 다중 선택 시 그중 어느 하나에 속한 후보를 모두 통과시킨다(IN 필터)."""
+    with db_session_factory() as db:
+        db.add_all(
+            [
+                FscCorpIndex(crno="1", corp_name="김해기계", sido="경상남도", sigungu="김해시"),
+                FscCorpIndex(crno="2", corp_name="부산상사", sido="부산광역시", sigungu="해운대구"),
+                FscCorpIndex(crno="3", corp_name="서울상사", sido="서울특별시", sigungu="강남구"),
+            ]
+        )
+        db.commit()
+
+    with db_session_factory() as db:
+        candidates = fsc_index.filter_local_candidates(
+            db,
+            cond_region={"sido": ["경상남도", "부산광역시"], "sigungu": []},
+            cond_industry=[],
+        )
+
+    assert sorted(c.corp_name for c in candidates) == ["김해기계", "부산상사"]
+
+
 def test_filter_local_candidates_matches_narrow_industry_selection_against_fine_grained_sic_name(
     db_session_factory,
 ):

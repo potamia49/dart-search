@@ -76,6 +76,18 @@ def test_region_matches_sigungu_empty_list_means_whole_sido():
     assert region_matches("경상남도", "창원시", cond) is True
 
 
+def test_region_matches_per_sido_sigungu_no_cross_collision():
+    # 시도별 시군구(신형): 경남은 김해시로 제한, 부산은 전체 — "중구"가 시도 간 섞이지 않는다.
+    cond = {
+        "sido": ["경상남도", "부산광역시"],
+        "sigungu_by_sido": {"경상남도": ["김해시"], "부산광역시": []},
+    }
+    assert region_matches("경상남도", "김해시", cond) is True
+    assert region_matches("경상남도", "창원시", cond) is False
+    assert region_matches("부산광역시", "중구", cond) is True
+    assert region_matches("서울특별시", "중구", cond) is False
+
+
 def test_industry_matches_prefix():
     assert industry_matches("C25110", ["C25", "C29"]) is True
     assert industry_matches("G46900", ["C25", "C29"]) is False
