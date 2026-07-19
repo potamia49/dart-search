@@ -24,6 +24,8 @@ from lxml import etree
 
 from app.parsers.base import (
     ACCOUNT_NAME_ALIASES,
+    CF_ACCOUNT_NAME_ALIASES,
+    CF_FINANCIAL_FIELDS,
     ParsedFinancials,
     compute_gross_margin,
     determine_parse_status,
@@ -35,8 +37,10 @@ logger = logging.getLogger(__name__)
 
 _BS_TITLE_MARK = "재무상태표"
 _IS_TITLE_MARK = "손익계산서"
+_CF_TITLE_MARK = "현금흐름표"  # §4-8: 종료 마커에서 파싱 대상 섹션 "cf"로 승격
 # 이 마커들을 만나면 재무상태표/손익계산서 구간 추적을 멈춘다(자본변동표 등과 혼입 방지).
-_OTHER_TITLE_MARKS = ("자본변동표", "결손금처리계산서", "이익잉여금처분계산서", "현금흐름표", "주석", "외부감사")
+# "현금흐름표"는 이제 별도 섹션으로 파싱하므로 여기서 제외한다.
+_OTHER_TITLE_MARKS = ("자본변동표", "결손금처리계산서", "이익잉여금처분계산서", "주석", "외부감사")
 
 
 def _text_of(el: etree._Element) -> str:
@@ -94,10 +98,15 @@ def _apply_sign(raw_label: str, value: float | None) -> float | None:
     return value
 
 
-def _extract_section(table: etree._Element, values_cur: dict, values_prv: dict) -> None:
+def _extract_section(
+    table: etree._Element,
+    values_cur: dict,
+    values_prv: dict,
+    aliases: dict[str, str] = ACCOUNT_NAME_ALIASES,
+) -> None:
     cur_span, prv_span = _period_spans(table)
     for raw_label, norm_label, value_texts in _row_values(table):
-        field = ACCOUNT_NAME_ALIASES.get(norm_label)
+        field = aliases.get(norm_label)
         if field is None or field in values_cur:
             continue  # 미매핑 과목이거나 이미 채워진 표준 필드(첫 매칭 우선)는 건너뜀
         cur_group = value_texts[:cur_span]
@@ -137,6 +146,8 @@ def parse_xml_financials(raw_xml: bytes) -> ParsedFinancials:
                 section = "bs"
             elif _IS_TITLE_MARK in compact:
                 section = "is"
+            elif _CF_TITLE_MARK in compact:
+                section = "cf"
             elif any(mark in compact for mark in _OTHER_TITLE_MARKS):
                 section = None
             continue
@@ -146,10 +157,24 @@ def parse_xml_financials(raw_xml: bytes) -> ParsedFinancials:
             _extract_section(el, values_cur, values_prv)
             section = None  # 구간당 첫 FINANCE 테이블만 사용
 
+        elif local_tag == "TABLE" and section == "cf" and el.get("ACLASS") == "FINANCE":
+            # 현금흐름표 4항목(best-effort). found_any_table에는 반영하지 않아
+            # parse_status 판정에 영향을 주지 않는다(§4-8 확정).
+            _extract_section(el, values_cur, values_prv, CF_ACCOUNT_NAME_ALIASES)
+            section = None  # 구간당 첫 FINANCE 테이블만 사용
+
     values_cur["gross_margin"] = compute_gross_margin(values_cur.get("revenue"), values_cur.get("cogs"))
     values_prv["gross_margin"] = compute_gross_margin(values_prv.get("revenue"), values_prv.get("cogs"))
 
     status, note = determine_parse_status(values_cur, values_prv, found_any_table=found_any_table)
+
+    # 현금흐름표 미확보는 parse_status를 바꾸지 않고 parse_note에만 부기한다(§4-8).
+    # 재무제표 자체가 미첨부(found_any_table=False)인 경우는 이미 그 안내가
+    # note에 있으므로 CF 부기를 생략한다(중복 방지).
+    if found_any_table and values_cur.get("cf_operating") is None:
+        cf_note = "현금흐름표 미확보(best-effort)"
+        note = f"{note} / {cf_note}" if note else cf_note
+
     return ParsedFinancials(
         values_cur=values_cur, values_prv=values_prv, parse_status=status, parse_note=note
     )

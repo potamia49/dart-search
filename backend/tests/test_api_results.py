@@ -318,3 +318,145 @@ def test_get_result_history_rejects_result_from_other_job(client_with_db):
 
     resp = client.get(f"/api/jobs/{job_id_2}/results/{result_id_in_job1}/history")
     assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# §4-8 원문 섹션 열람 API (document-sections)
+# ---------------------------------------------------------------------------
+
+import shutil  # noqa: E402
+from pathlib import Path  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+_FIXTURES_DIR = Path(__file__).parent / "fixtures"
+
+
+def _seed_result_with_rcept(factory, rcept_no: str) -> tuple[int, int]:
+    """rcept_no를 가진 결과 1건을 seed하고 (job_id, result_id)를 반환."""
+    db = factory()
+    try:
+        job = Job(
+            created_at="2026-07-19T00:00:00",
+            name="원문열람 테스트",
+            cond_region="{}",
+            cond_revenue="{}",
+            cond_industry="[]",
+            cond_period="{}",
+            status=JobStatus.DONE,
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        result = Result(job_id=job.id, corp_code="00100001", rcept_no=rcept_no, corp_name="㈜원문")
+        db.add(result)
+        db.commit()
+        db.refresh(result)
+        return job.id, result.id
+    finally:
+        db.close()
+
+
+def _point_cache_at_tmp(monkeypatch, tmp_path, rcept_no: str, fixture_id: str) -> None:
+    """DOCUMENT_CACHE_DIR을 tmp로 돌리고 fixture XML을 {tmp}/{rcept_no}/에 복사."""
+    target = tmp_path / rcept_no
+    target.mkdir(parents=True, exist_ok=True)
+    shutil.copy(_FIXTURES_DIR / fixture_id / f"{fixture_id}_00760.xml", target / "document.xml")
+    monkeypatch.setattr(
+        "app.api.results.get_settings",
+        lambda: SimpleNamespace(document_cache_dir=str(tmp_path)),
+    )
+
+
+def test_document_section_returns_assembled_html(client_with_db, monkeypatch, tmp_path):
+    client, factory = client_with_db
+    job_id, result_id = _seed_result_with_rcept(factory, "20260630000641")
+    _point_cache_at_tmp(monkeypatch, tmp_path, "20260630000641", "20260630000641")
+
+    resp = client.get(f"/api/jobs/{job_id}/results/{result_id}/document-sections/cf")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["available"] is True
+    assert body["notice"] is None
+    assert "<table>" in body["html"]
+    assert "현" in body["html"]  # 현금흐름표 제목/내용
+
+
+def test_document_section_invalid_section_returns_400(client_with_db, monkeypatch, tmp_path):
+    client, factory = client_with_db
+    job_id, result_id = _seed_result_with_rcept(factory, "20260630000641")
+    _point_cache_at_tmp(monkeypatch, tmp_path, "20260630000641", "20260630000641")
+
+    resp = client.get(f"/api/jobs/{job_id}/results/{result_id}/document-sections/xxx")
+    assert resp.status_code == 400
+
+
+def test_document_section_cache_missing_returns_404(client_with_db, monkeypatch, tmp_path):
+    client, factory = client_with_db
+    job_id, result_id = _seed_result_with_rcept(factory, "20260630000641")
+    # 캐시 디렉터리를 비운 채(파일 복사 없이) 조회 → 404
+    monkeypatch.setattr(
+        "app.api.results.get_settings",
+        lambda: SimpleNamespace(document_cache_dir=str(tmp_path)),
+    )
+    resp = client.get(f"/api/jobs/{job_id}/results/{result_id}/document-sections/cf")
+    assert resp.status_code == 404
+
+
+def test_document_section_absent_section_returns_notice(client_with_db, monkeypatch, tmp_path):
+    """재무제표 미첨부(의견거절 계열) 원문의 cf는 에러가 아니라 available=false + 안내."""
+    client, factory = client_with_db
+    job_id, result_id = _seed_result_with_rcept(factory, "20260630001111")
+    _point_cache_at_tmp(monkeypatch, tmp_path, "20260630001111", "20260630001111")
+
+    resp = client.get(f"/api/jobs/{job_id}/results/{result_id}/document-sections/cf")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["available"] is False
+    assert body["notice"]  # 안내 문구 존재
+    assert body["html"] == ""
+
+
+def test_document_section_rejects_foreign_rcept_no(client_with_db, monkeypatch, tmp_path):
+    """?rcept_no=가 이 결과에 속하지 않으면 404 (history 공시가 아닌 임의 값 거부)."""
+    client, factory = client_with_db
+    job_id, result_id = _seed_result_with_rcept(factory, "20260630000641")
+    _point_cache_at_tmp(monkeypatch, tmp_path, "20260630000641", "20260630000641")
+
+    resp = client.get(
+        f"/api/jobs/{job_id}/results/{result_id}/document-sections/cf",
+        params={"rcept_no": "99999999999999"},
+    )
+    assert resp.status_code == 404
+
+
+def test_document_section_allows_history_rcept_no(client_with_db, monkeypatch, tmp_path):
+    """?rcept_no=가 이 결과의 financial_snapshots 공시면 허용된다."""
+    client, factory = client_with_db
+    job_id, result_id = _seed_result_with_rcept(factory, "20260630000641")
+    # 이력 공시로 다른 rcept_no를 등록하고 그 원문을 캐시에 둔다.
+    db = factory()
+    try:
+        db.add(
+            FinancialSnapshot(
+                result_id=result_id, rcept_no="20260630000665", fiscal_year="2024", revenue=1
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+    tgt = tmp_path / "20260630000665"
+    tgt.mkdir(parents=True)
+    shutil.copy(
+        _FIXTURES_DIR / "20260630000665" / "20260630000665_00760.xml", tgt / "document.xml"
+    )
+    monkeypatch.setattr(
+        "app.api.results.get_settings",
+        lambda: SimpleNamespace(document_cache_dir=str(tmp_path)),
+    )
+
+    resp = client.get(
+        f"/api/jobs/{job_id}/results/{result_id}/document-sections/cf",
+        params={"rcept_no": "20260630000665"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["available"] is True

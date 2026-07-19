@@ -55,6 +55,17 @@ class Result(Base):
     net_income_cur: Mapped[int | None] = mapped_column(Integer, nullable=True)
     net_income_prv: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
+    # 현금흐름표 4항목 (§4-8, 2026-07-19) — best-effort. parse_status 판정에는
+    # 반영하지 않으며(base.py CF_FINANCIAL_FIELDS 주석 참고), 누락 시 parse_note에만 부기.
+    cf_operating_cur: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cf_operating_prv: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cf_investing_cur: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cf_investing_prv: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cf_financing_cur: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cf_financing_prv: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cf_ending_cash_cur: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cf_ending_cash_prv: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
     # 상태
     parse_status: Mapped[str | None] = mapped_column(String, nullable=True)  # OK/PARTIAL/FAILED
     parse_note: Mapped[str | None] = mapped_column(String, nullable=True)

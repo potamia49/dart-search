@@ -46,6 +46,22 @@ const FINANCIAL_LABELS: [keyof ResultResponse, keyof ResultResponse, string][] =
   ['net_income_cur', 'net_income_prv', '당기순이익'],
 ]
 
+// 현금흐름표 4항목 (§4-8) — 기본 숨김, 컬럼 토글로 노출. best-effort 항목이라
+// 파싱상태가 OK여도 값이 없을 수 있다(라벨에 별도 표기는 하지 않고 셀에 "-" 표시).
+const CASH_FLOW_LABELS: [keyof ResultResponse, keyof ResultResponse, string][] = [
+  ['cf_operating_cur', 'cf_operating_prv', '영업활동현금흐름'],
+  ['cf_investing_cur', 'cf_investing_prv', '투자활동현금흐름'],
+  ['cf_financing_cur', 'cf_financing_prv', '재무활동현금흐름'],
+  ['cf_ending_cash_cur', 'cf_ending_cash_prv', '기말의현금'],
+]
+
+export const CASH_FLOW_COLUMNS: ResultColumn[] = CASH_FLOW_LABELS.flatMap(
+  ([curKey, prvKey, label]) => [
+    { key: curKey, label: `${label}_당기`, format: formatNumber },
+    { key: prvKey, label: `${label}_전기`, format: formatNumber },
+  ],
+)
+
 export const FINANCIAL_COLUMNS: ResultColumn[] = FINANCIAL_LABELS.flatMap(
   ([curKey, prvKey, label]) => {
     const format = curKey === 'gross_margin_cur' ? formatPercent : formatNumber
@@ -63,6 +79,7 @@ export const STATUS_COLUMNS: ResultColumn[] = [
 export const ALL_COLUMNS: ResultColumn[] = [
   ...BASIC_COLUMNS,
   ...FINANCIAL_COLUMNS,
+  ...CASH_FLOW_COLUMNS,
   ...STATUS_COLUMNS,
 ]
 

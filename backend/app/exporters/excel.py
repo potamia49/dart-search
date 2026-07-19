@@ -62,6 +62,15 @@ RESULT_COLUMN_LABELS: dict[str, str] = {
     "operating_income_prv": "영업이익(전기)",
     "net_income_cur": "당기순이익(당기)",
     "net_income_prv": "당기순이익(전기)",
+    # 현금흐름표 4항목 (§4-8, 2026-07-19)
+    "cf_operating_cur": "영업활동현금흐름(당기)",
+    "cf_operating_prv": "영업활동현금흐름(전기)",
+    "cf_investing_cur": "투자활동현금흐름(당기)",
+    "cf_investing_prv": "투자활동현금흐름(전기)",
+    "cf_financing_cur": "재무활동현금흐름(당기)",
+    "cf_financing_prv": "재무활동현금흐름(전기)",
+    "cf_ending_cash_cur": "기말의현금(당기)",
+    "cf_ending_cash_prv": "기말의현금(전기)",
     # 상태
     "parse_status": "파싱상태",
     "parse_note": "파싱비고",

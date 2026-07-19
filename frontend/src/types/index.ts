@@ -114,6 +114,15 @@ export interface ResultResponse {
   operating_income_prv: number | null
   net_income_cur: number | null
   net_income_prv: number | null
+  // 현금흐름표 4항목 (§4-8)
+  cf_operating_cur: number | null
+  cf_operating_prv: number | null
+  cf_investing_cur: number | null
+  cf_investing_prv: number | null
+  cf_financing_cur: number | null
+  cf_financing_prv: number | null
+  cf_ending_cash_cur: number | null
+  cf_ending_cash_prv: number | null
 
   parse_status: ParseStatus | null
   parse_note: string | null
@@ -209,7 +218,23 @@ export interface FinancialSnapshotResponse {
   sga: number | null
   operating_income: number | null
   net_income: number | null
+  // 현금흐름표 4항목 (§4-8)
+  cf_operating: number | null
+  cf_investing: number | null
+  cf_financing: number | null
+  cf_ending_cash: number | null
 
   parse_status: ParseStatus | null
   parse_note: string | null
+}
+
+/** §4-8 원문 섹션 열람 — GET .../document-sections/{section}. */
+export type DocumentSection = 'bs' | 'is' | 'cf' | 'notes'
+
+export interface DocumentSectionResponse {
+  section: string
+  rcept_no: string
+  available: boolean
+  html: string
+  notice: string | null
 }

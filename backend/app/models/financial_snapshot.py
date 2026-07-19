@@ -68,5 +68,11 @@ class FinancialSnapshot(Base):
     operating_income: Mapped[int | None] = mapped_column(Integer, nullable=True)
     net_income: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
+    # 현금흐름표 4항목 (§4-8, 2026-07-19) — results의 cf_*와 동일 필드셋, 접미어 없음
+    cf_operating: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cf_investing: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cf_financing: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cf_ending_cash: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
     parse_status: Mapped[str | None] = mapped_column(String, nullable=True)  # OK/PARTIAL/FAILED
     parse_note: Mapped[str | None] = mapped_column(String, nullable=True)

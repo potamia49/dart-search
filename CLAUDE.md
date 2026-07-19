@@ -881,6 +881,59 @@ CF alias 실측 범위/기존 완료 Job 소급 재파싱/손상 원문 표시),
 체크리스트는 §8 M7(전체 미완료), 스키마 주석은 §5, API 표는 §6, 화면
 설계는 §7-3, PRD.md §2/§3-2에도 같은 취지로 반영했다.
 
+**M7(현금흐름표 파싱 + 원문 섹션 열람) 구현 완료(2026-07-19).** 위 §4-8
+설계를 그대로 구현했다. 코드 변경 전 첫 단계로 **CF 계정 라벨을 fixtures
+30건으로 실측**했다 — CF 섹션 보유 19건 전부에서 간접법 구서식 "영업활동
+으로 인한 현금흐름"/"투자활동..."/"재무활동..."/"기말의 현금" 계열이
+19/19(100%)로 일관됐고, "기말의 현금(Ⅳ+Ⅴ)"처럼 소계 산식이 괄호로 붙은
+표기 1건만 예외라 `normalize_account_label`에 **산식 접미어 제거**
+(`_FORMULA_SUFFIX_RE` — 괄호 안이 로마숫자·숫자·공백·"+"로만 이뤄지고 "+"를
+최소 1개 포함할 때만 제거, "당기순이익(손실)" 등 한글 괄호는 보존)를 추가해
+해결했다. 구현 내역:
+- **파서(`base.py`/`xml_parser.py`)**: `CF_ACCOUNT_NAME_ALIASES`(실측 계열 +
+  신서식 방어적 추가) + `CF_FINANCIAL_FIELDS` 신설, "현금흐름표"를
+  `_OTHER_TITLE_MARKS`(종료 마커)에서 새 섹션 `"cf"`로 승격,
+  `_extract_section(aliases=...)`로 alias 사전을 파라미터화해 CF 구간에서만 CF
+  사전을 쓴다. **`determine_parse_status()`는 무변경** — fixtures 30건의
+  OK/PARTIAL 분포가 CF 추가 전후 완전히 동일함을 실측 재확인했다(CF는
+  `found_any_table`/`DIRECT_FINANCIAL_FIELDS`에 관여하지 않음). CF 미확보는
+  `found_any_table`이 True일 때만 `parse_note`에 "현금흐름표 미확보(best-effort)"
+  로 부기(미첨부 건은 중복 방지).
+- **DB/파이프라인**: `results` 8컬럼(`cf_*_cur/prv`)·`financial_snapshots`
+  4컬럼(`cf_*`)을 모델 + `run_schema_migrations()` ad-hoc ALTER로 추가,
+  `_apply_parsed_result()`/`_upsert_financial_snapshot()` 적재 필드에
+  `CF_FINANCIAL_FIELDS`를 추가(STEP 7은 파서 확장이 자동 전파). 실제 기동으로
+  `dart_search.db`의 두 테이블에 CF 컬럼이 ALTER된 것을 확인했다.
+- **원문 섹션 열람 API**: 신규 `app/parsers/document_sections.py` +
+  `GET /api/jobs/{id}/results/{result_id}/document-sections/{section}`
+  (`bs|is|cf|notes`, `?rcept_no=`). 실측 구조상 BS/IS/CF는 `<TABLE-GROUP>`,
+  주석은 `<SECTION>`에 담기므로 "섹션 마크 첫 `<TITLE>`의 부모 컨테이너를
+  통째로 화이트리스트 HTML(텍스트 전부 이스케이프, COLSPAN/ROWSPAN만 통과)로
+  조립"한다 — 원문 마크업 미통과라 XSS 안전. 캐시 없음 404, PDF는 안내,
+  주석 미제시/섹션 미첨부는 `available=false`+안내(에러 아님), `?rcept_no=`는
+  해당 result의 최신 공시 또는 `financial_snapshots` 이력 공시만 허용.
+- **프론트(`resultColumns.ts`/`ResultDetailDrawer.tsx`/신규
+  `DocumentSectionModal.tsx`)**: CF 8컬럼(`CASH_FLOW_COLUMNS`, 기본 숨김·토글
+  노출), 당기·전기 표에 CF 4행 + 이력 표에 CF 4행, "원문 보기" 버튼 4개 +
+  이력 표 연도별 "원문" 링크 → 섹션 탭 전환이 되는 Modal(서버 조립 HTML을
+  `dangerouslySetInnerHTML`로 렌더).
+- **소급 재파싱은 하지 않음(확정, §4-8 열린 질문 2)** — 신규 Job 실행분부터만
+  CF를 채운다(관리자 전체 재파싱 트리거 미추가). 원문 섹션 열람은 로컬 캐시
+  기반이라 기존 Job(#18 등)에서도 즉시 동작함을 실측 확인했다(DB CF는 NULL이어도
+  원문 현금흐름표가 정상 렌더링).
+- **검증**: `pytest tests/ -q` **180 passed**(기존 167 + 신규 13: CF 파서
+  실측/산식 접미어/document-sections 6종), `npm run build`(tsc)/`npm run
+  lint`(oxlint) 통과. 실제 백엔드(port 8000, 캐시 문서 1,454건) 재기동 후 실
+  result(#3042, ㈜와이케이건기)로 document-sections API(cf/bs/notes 정상, 잘못된
+  섹션 400, 타/자기 rcept_no 검증 404/200) + Playwright로 결과 상세 Drawer의
+  CF 행·현금흐름표 원문 모달 렌더링을 콘솔 에러 0으로 확인했다.
+- **구현 중 발견**: §4-8 배경이 CF 예시로 든 `20260630000651`은 실제로는
+  재무상태표/손익계산서 `<TITLE>` 자체가 없는 특수 서식(기존 BS/IS 파서도
+  못 잡는 문서)이라 CF도 못 잡는다 — 예시가 부정확했다(§4-8 구현 메모에 기록).
+  백엔드는 재기동해 새 코드로 떠 있다(port 8000). **다음 세션 판단거리**:
+  EUC-KR 등 비UTF-8 원문 재조사(우선순위 2에서 관찰 보류 중)는 이번에도
+  다루지 않았다 — Job 실행 결과의 `parse_note` 인코딩 실패 빈도를 계속 관찰.
+
 작업을 시작하기 전에 반드시 아래 두 문서를 먼저 읽으세요 —
 이 저장소의 유일한 진실 소스(source of truth)입니다.
 

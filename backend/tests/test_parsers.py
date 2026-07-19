@@ -153,6 +153,60 @@ def test_parse_xml_financials_ok_unqualified_opinion():
     assert parsed.values_prv["gross_margin"] == pytest.approx(expected_gm_prv)
 
 
+@pytest.mark.parametrize(
+    "label, expected",
+    [
+        ("기말의 현금(Ⅳ+Ⅴ)", "기말의현금"),  # 유니코드 로마숫자 산식 접미어 (20260630000665 실측)
+        ("현금의증가(감소)(Ⅰ+Ⅱ+Ⅲ)", "현금의증가(감소)"),  # 한글 괄호는 보존, 산식 괄호만 제거
+        ("기말의 현금(I+II+III)", "기말의현금"),  # 아스키 로마숫자 산식
+        ("당기순이익(손실)", "당기순이익(손실)"),  # +가 없는 한글 괄호는 산식이 아니므로 보존
+    ],
+)
+def test_normalize_account_label_formula_suffix(label, expected):
+    """현금흐름표 소계 행의 산식 접미어 "(Ⅳ+Ⅴ)"를 제거해도 의미있는 괄호는 보존한다(§4-8)."""
+    assert normalize_account_label(label) == expected
+
+
+def test_parse_xml_financials_extracts_cash_flow():
+    """한국학술정보(20260630000641)의 현금흐름표 4항목 당기·전기 실측값(§4-8).
+
+    원문 현금흐름표 TABLE-GROUP의 "영업활동으로 인한 현금흐름"/"투자활동..."/
+    "재무활동..."/"기말의 현금" TE 셀 값을 그대로 옮겨 왔다.
+    """
+    parsed = parse_xml_financials(_read_fixture("20260630000641"))
+
+    assert parsed.values_cur["cf_operating"] == 7_541_679_518
+    assert parsed.values_prv["cf_operating"] == 3_744_531_358
+    assert parsed.values_cur["cf_investing"] == -3_260_098_592
+    assert parsed.values_prv["cf_investing"] == -4_301_670_215
+    assert parsed.values_cur["cf_financing"] == -4_482_513_557
+    assert parsed.values_prv["cf_financing"] == 1_455_116_279
+    assert parsed.values_cur["cf_ending_cash"] == 1_749_296_461
+    assert parsed.values_prv["cf_ending_cash"] == 1_950_229_092
+    # CF는 best-effort — 정상 추출됐어도 parse_status/parse_note는 오염되지 않는다.
+    assert parsed.parse_status == "OK"
+    assert parsed.parse_note is None
+
+
+def test_parse_xml_financials_cash_flow_formula_suffix_label():
+    """기말현금 라벨이 "기말의 현금(Ⅳ+Ⅴ)"처럼 산식 접미어를 달고 있어도 매핑된다(20260630000665)."""
+    parsed = parse_xml_financials(_read_fixture("20260630000665"))
+    assert parsed.values_cur["cf_ending_cash"] == 86_743_556
+    assert parsed.values_cur["cf_operating"] == -6_343_925_554
+
+
+def test_cash_flow_absence_does_not_change_parse_status_but_notes():
+    """CF 미첨부 원문은 CF 4항목이 None이지만 parse_status는 CF와 무관하게 판정된다(§4-8).
+
+    20260630000634는 재무제표 자체가 미첨부(의견거절)라 PARTIAL이며, CF도 당연히
+    없다 — 이 경우 이미 "미첨부" 안내가 있으므로 CF 부기를 중복하지 않는다.
+    """
+    parsed = parse_xml_financials(_read_fixture("20260630000634"))
+    assert parsed.parse_status == "PARTIAL"
+    assert parsed.values_cur.get("cf_operating") is None
+    assert "현금흐름표 미확보" not in (parsed.parse_note or "")
+
+
 def test_parse_xml_financials_qualified_opinion_flips_loss_sign():
     """홈마리나속초호텔(rcept_no=20260630000895), 한정의견, 영업손실/당기순손실.
 

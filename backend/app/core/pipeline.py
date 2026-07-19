@@ -120,7 +120,12 @@ from app.models.fsc_corp_index import FscCorpIndex
 from app.models.job import Job, JobPhase, JobStatus
 from app.models.result import ParseStatus, Result
 from app.parsers.audit_opinion import extract_audit_opinion
-from app.parsers.base import DIRECT_FINANCIAL_FIELDS, STANDARD_FINANCIAL_FIELDS, ParsedFinancials
+from app.parsers.base import (
+    CF_FINANCIAL_FIELDS,
+    DIRECT_FINANCIAL_FIELDS,
+    STANDARD_FINANCIAL_FIELDS,
+    ParsedFinancials,
+)
 from app.parsers.pdf_parser import parse_pdf_financials
 from app.parsers.xml_parser import parse_xml_financials
 
@@ -696,7 +701,7 @@ def _apply_parsed_result(
         result = db.get(Result, result_id)
         if result is None:
             return
-        for f in DIRECT_FINANCIAL_FIELDS + ("gross_margin",):
+        for f in DIRECT_FINANCIAL_FIELDS + ("gross_margin",) + CF_FINANCIAL_FIELDS:
             setattr(result, f"{f}_cur", parsed.values_cur.get(f))
             setattr(result, f"{f}_prv", parsed.values_prv.get(f))
         result.audit_opinion = audit_opinion
@@ -918,7 +923,7 @@ def _upsert_financial_snapshot(
             existing = FinancialSnapshot(result_id=result_id, fiscal_year=fiscal_year)
             db.add(existing)
         existing.rcept_no = rcept_no
-        for f in STANDARD_FINANCIAL_FIELDS:  # gross_margin 포함 — 파서가 이미 계산해 둔 값을 그대로 저장
+        for f in STANDARD_FINANCIAL_FIELDS + CF_FINANCIAL_FIELDS:  # gross_margin·CF 포함
             setattr(existing, f, values.get(f))
         existing.parse_status = parse_status
         existing.parse_note = parse_note

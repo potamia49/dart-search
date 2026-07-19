@@ -1,5 +1,7 @@
 import { apiClient } from './client'
 import type {
+  DocumentSection,
+  DocumentSectionResponse,
   ExportFormat,
   FinancialSnapshotResponse,
   ParseStatus,
@@ -73,6 +75,22 @@ export async function getResultHistory(
 ): Promise<FinancialSnapshotResponse[]> {
   const { data } = await apiClient.get<FinancialSnapshotResponse[]>(
     `/jobs/${jobId}/results/${resultId}/history`,
+  )
+  return data
+}
+
+/** §4-8 원문 섹션 열람 — 감사보고서 원문의 재무상태표/손익계산서/현금흐름표/주석을
+ * 서버 조립 HTML로 받아온다(추가 API 호출/쿼터 0건, 로컬 문서 캐시만 사용).
+ * rcept_no를 지정하면 다년치 이력의 특정 연도 공시를 열람한다(이 결과 소속 공시만 허용). */
+export async function getDocumentSection(
+  jobId: number,
+  resultId: number,
+  section: DocumentSection,
+  rceptNo?: string,
+): Promise<DocumentSectionResponse> {
+  const { data } = await apiClient.get<DocumentSectionResponse>(
+    `/jobs/${jobId}/results/${resultId}/document-sections/${section}`,
+    { params: rceptNo ? { rcept_no: rceptNo } : {} },
   )
   return data
 }

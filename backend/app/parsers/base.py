@@ -49,6 +49,19 @@ DIRECT_FINANCIAL_FIELDS: tuple[str, ...] = tuple(
     f for f in STANDARD_FINANCIAL_FIELDS if f != "gross_margin"
 )
 
+# 현금흐름표 4항목 (§4-8, 2026-07-19). 위 13항목과 달리 best-effort 항목이며
+# `determine_parse_status()` 판정에는 절대 포함하지 않는다 — CF 누락으로 기존
+# OK 건이 PARTIAL로 재분류되면 이미 완료된 Job의 검수 기준과 충돌하기 때문
+# (설계 확정: CF 미확보는 parse_note에만 부기). "현금의 증가(감소)"는 세 활동의
+# 합으로 파생 가능해 저장하지 않고, "기초의 현금"은 전기 cf_ending_cash와
+# 중복이라 제외한다.
+CF_FINANCIAL_FIELDS: tuple[str, ...] = (
+    "cf_operating",    # 영업활동현금흐름
+    "cf_investing",    # 투자활동현금흐름
+    "cf_financing",    # 재무활동현금흐름
+    "cf_ending_cash",  # 기말의 현금
+)
+
 # 계정과목 표기 변형(공백 제거 후 기준) → 표준 필드 매핑 사전 (v1).
 # 실측 샘플(한국학술정보/홈마리나속초호텔 등)에서 확인된 표기를 반영했다.
 # 검수 과정(M5)에서 지속 보강한다.
@@ -74,6 +87,32 @@ ACCOUNT_NAME_ALIASES: dict[str, str] = {
     "당기순이익(손실)": "net_income",
 }
 
+# 현금흐름표 전용 계정과목 alias (§4-8). fixtures 30건 중 CF 섹션 보유 19건을
+# 실측한 결과, 간접법 구서식의 "영업활동으로 인한 현금흐름" 계열이 19/19로
+# 지배적이었다("기말의 현금(Ⅳ+Ⅴ)"처럼 산식 접미어가 붙은 표기는
+# normalize_account_label의 산식 접미어 제거로 "기말의현금"으로 정규화된다).
+# 신서식(K-IFRS 직접법 등)의 "영업활동현금흐름" 계열은 실측 표본엔 없었으나
+# 흔한 표준 표기라 방어적으로 함께 등록한다. BS/IS 라벨과 겹치지 않으므로
+# xml_parser는 CF 섹션에서만 이 사전을 사용한다.
+CF_ACCOUNT_NAME_ALIASES: dict[str, str] = {
+    "영업활동으로인한현금흐름": "cf_operating",
+    "영업활동현금흐름": "cf_operating",
+    "영업활동으로부터의현금흐름": "cf_operating",
+    "영업활동순현금흐름": "cf_operating",
+    "투자활동으로인한현금흐름": "cf_investing",
+    "투자활동현금흐름": "cf_investing",
+    "투자활동으로부터의현금흐름": "cf_investing",
+    "투자활동순현금흐름": "cf_investing",
+    "재무활동으로인한현금흐름": "cf_financing",
+    "재무활동현금흐름": "cf_financing",
+    "재무활동으로부터의현금흐름": "cf_financing",
+    "재무활동순현금흐름": "cf_financing",
+    "기말의현금": "cf_ending_cash",
+    "기말현금": "cf_ending_cash",
+    "기말의현금및현금성자산": "cf_ending_cash",
+    "기말현금및현금성자산": "cf_ending_cash",
+}
+
 # 과목명 앞에 붙는 번호/기호 접두어 제거용 (실측: "Ⅰ.매출액"(유니코드 로마숫자),
 # "I. 유동자산"(아스키 알파벳 로마숫자 — 회사마다 서식이 다르다), "1.현금및
 # 현금성자산", "(1)당좌자산", "가.기초상품재고액" 등). [가-힣] 단일 글자 분기와
@@ -90,6 +129,15 @@ _PREFIX_RE = re.compile(
 # (+"주석" 또는 "주")일 때만 제거한다 — "당기순이익(손실)"/"수익(매출액)"처럼
 # 괄호 안이 실제 항목명을 구성하는 경우까지 지워버리지 않기 위해서다.
 _FOOTNOTE_SUFFIX_RE = re.compile(r"\(\s*(?:주석|주)?[\s0-9,]*\)\s*$")
+
+# 과목명 뒤에 붙는 소계 "산식" 접미어 제거용 (실측: "기말의현금(Ⅳ+Ⅴ)",
+# "현금의증가(감소)(Ⅰ+Ⅱ+Ⅲ)" — 현금흐름표 소계 행이 계산식을 괄호로 병기하는
+# 서식). 괄호/대괄호 안이 로마숫자(유니코드/아스키 I·V·X)·숫자·공백·"+"로만
+# 이뤄지고 최소 하나의 "+"를 포함할 때만 제거한다 — "당기순이익(손실)"/
+# "수익(매출액)"처럼 한글이 든 괄호나 순수 각주 괄호는 건드리지 않는다.
+_FORMULA_SUFFIX_RE = re.compile(
+    r"[\(\[][ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩIVX0-9\s]*[+＋][ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩIVX0-9\s+＋]*[\)\]]\s*$"
+)
 
 # 금액 문자열에서 콤마/공백 제거용
 _AMOUNT_CLEAN_RE = re.compile(r"[,\s　]")
@@ -121,6 +169,11 @@ def normalize_account_label(label: str) -> str:
         text = stripped
     for _ in range(2):  # "(주석13)" 같은 각주 참조가 이어 붙는 경우 대비
         stripped = _FOOTNOTE_SUFFIX_RE.sub("", text).strip()
+        if stripped == text:
+            break
+        text = stripped
+    for _ in range(2):  # "기말의현금(Ⅳ+Ⅴ)" 같은 산식 접미어 제거 (현금흐름표)
+        stripped = _FORMULA_SUFFIX_RE.sub("", text).strip()
         if stripped == text:
             break
         text = stripped

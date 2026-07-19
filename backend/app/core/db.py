@@ -65,6 +65,23 @@ _JOBS_NEW_COLUMNS: dict[str, str] = {
 _RESULTS_NEW_COLUMNS: dict[str, str] = {
     "excluded_by_assets": "INTEGER DEFAULT 0",
     "excluded_manually": "INTEGER DEFAULT 0",
+    # 현금흐름표 4항목 (§4-8, 2026-07-19)
+    "cf_operating_cur": "INTEGER",
+    "cf_operating_prv": "INTEGER",
+    "cf_investing_cur": "INTEGER",
+    "cf_investing_prv": "INTEGER",
+    "cf_financing_cur": "INTEGER",
+    "cf_financing_prv": "INTEGER",
+    "cf_ending_cash_cur": "INTEGER",
+    "cf_ending_cash_prv": "INTEGER",
+}
+# financial_snapshots(2026-07-15 STEP7 신설)에도 §4-8 CF 4컬럼을 추가한다.
+# 이 테이블은 이미 실 데이터가 있어 create_all이 컬럼을 못 붙이므로 ALTER 필요.
+_FINANCIAL_SNAPSHOTS_NEW_COLUMNS: dict[str, str] = {
+    "cf_operating": "INTEGER",
+    "cf_investing": "INTEGER",
+    "cf_financing": "INTEGER",
+    "cf_ending_cash": "INTEGER",
 }
 
 
@@ -100,6 +117,7 @@ def run_schema_migrations() -> None:
         return
     _ensure_columns(engine, "jobs", _JOBS_NEW_COLUMNS)
     _ensure_columns(engine, "results", _RESULTS_NEW_COLUMNS)
+    _ensure_columns(engine, "financial_snapshots", _FINANCIAL_SNAPSHOTS_NEW_COLUMNS)
 
 
 def create_all_tables() -> None:
