@@ -1,8 +1,8 @@
-import { useEffect, useState } from 'react'
+import { Fragment, useEffect, useState } from 'react'
 import { Anchor, Badge, Button, Drawer, Group, Loader, SimpleGrid, Stack, Table, Text, Title } from '@mantine/core'
 import type { FinancialSnapshotResponse, ResultResponse } from '../types'
 import { getResultHistory } from '../api/results'
-import { BASIC_COLUMNS, CASH_FLOW_COLUMNS, FINANCIAL_COLUMNS, formatCell, formatNumber, formatPercent } from '../util/resultColumns'
+import { BASIC_COLUMNS, FINANCIAL_GROUPS, formatCell } from '../util/resultColumns'
 import DocumentSectionModal, { type DocumentSectionTarget } from './DocumentSectionModal'
 
 interface ResultDetailDrawerProps {
@@ -19,28 +19,6 @@ const DOC_SECTION_BUTTONS: { section: DocumentSectionTarget['section']; label: s
   { section: 'is', label: '손익계산서' },
   { section: 'cf', label: '현금흐름표' },
   { section: 'notes', label: '주석' },
-]
-
-// [항목 키, 표시 라벨, 포맷 함수] — financial_snapshots 필드셋 (results의 _cur/_prv와 동일 항목, 접미어 없음).
-const HISTORY_ROWS: [keyof FinancialSnapshotResponse, string, (v: unknown) => string][] = [
-  ['current_assets', '유동자산', formatNumber],
-  ['noncurrent_assets', '비유동자산', formatNumber],
-  ['total_assets', '자산총계', formatNumber],
-  ['current_liab', '유동부채', formatNumber],
-  ['noncurrent_liab', '비유동부채', formatNumber],
-  ['total_liab', '부채총계', formatNumber],
-  ['total_equity', '자본총계', formatNumber],
-  ['revenue', '매출액', formatNumber],
-  ['cogs', '매출원가', formatNumber],
-  ['gross_margin', '매출총이익율', formatPercent],
-  ['sga', '판매비와관리비', formatNumber],
-  ['operating_income', '영업이익', formatNumber],
-  ['net_income', '당기순이익', formatNumber],
-  // 현금흐름표 4항목 (§4-8)
-  ['cf_operating', '영업활동현금흐름', formatNumber],
-  ['cf_investing', '투자활동현금흐름', formatNumber],
-  ['cf_financing', '재무활동현금흐름', formatNumber],
-  ['cf_ending_cash', '기말의현금', formatNumber],
 ]
 
 /** STEP 7(최근 N년 재무이력) 표 — Drawer가 열릴 때(선택된 result가 바뀔 때)만 lazy fetch한다. */
@@ -120,13 +98,22 @@ function FinancialHistorySection({
           </Table.Tr>
         </Table.Thead>
         <Table.Tbody>
-          {HISTORY_ROWS.map(([key, label, format]) => (
-            <Table.Tr key={key}>
-              <Table.Td>{label}</Table.Td>
-              {history.map((snap) => (
-                <Table.Td key={snap.fiscal_year}>{format(snap[key])}</Table.Td>
+          {FINANCIAL_GROUPS.map((group) => (
+            <Fragment key={group.section}>
+              <Table.Tr>
+                <Table.Td colSpan={1 + history.length}>
+                  <Text span fw={600} size="sm" c="dimmed">{group.title}</Text>
+                </Table.Td>
+              </Table.Tr>
+              {group.items.map((item) => (
+                <Table.Tr key={item.snapKey}>
+                  <Table.Td>{item.label}</Table.Td>
+                  {history.map((snap) => (
+                    <Table.Td key={snap.fiscal_year}>{item.format(snap[item.snapKey])}</Table.Td>
+                  ))}
+                </Table.Tr>
               ))}
-            </Table.Tr>
+            </Fragment>
           ))}
           <Table.Tr>
             <Table.Td>파싱상태</Table.Td>
@@ -202,35 +189,22 @@ export default function ResultDetailDrawer({ jobId, result, onClose }: ResultDet
               </Table.Tr>
             </Table.Thead>
             <Table.Tbody>
-              {[...Array(FINANCIAL_COLUMNS.length / 2).keys()].map((i) => {
-                const curCol = FINANCIAL_COLUMNS[i * 2]
-                const prvCol = FINANCIAL_COLUMNS[i * 2 + 1]
-                const label = curCol.label.replace('_당기', '')
-                return (
-                  <Table.Tr key={curCol.key}>
-                    <Table.Td>{label}</Table.Td>
-                    <Table.Td>{formatCell(curCol, result)}</Table.Td>
-                    <Table.Td>{formatCell(prvCol, result)}</Table.Td>
+              {FINANCIAL_GROUPS.map((group) => (
+                <Fragment key={group.section}>
+                  <Table.Tr>
+                    <Table.Td colSpan={3}>
+                      <Text span fw={600} size="sm" c="dimmed">{group.title}</Text>
+                    </Table.Td>
                   </Table.Tr>
-                )
-              })}
-              <Table.Tr>
-                <Table.Td colSpan={3}>
-                  <Text span fw={600} size="sm" c="dimmed">현금흐름표</Text>
-                </Table.Td>
-              </Table.Tr>
-              {[...Array(CASH_FLOW_COLUMNS.length / 2).keys()].map((i) => {
-                const curCol = CASH_FLOW_COLUMNS[i * 2]
-                const prvCol = CASH_FLOW_COLUMNS[i * 2 + 1]
-                const label = curCol.label.replace('_당기', '')
-                return (
-                  <Table.Tr key={curCol.key}>
-                    <Table.Td>{label}</Table.Td>
-                    <Table.Td>{formatCell(curCol, result)}</Table.Td>
-                    <Table.Td>{formatCell(prvCol, result)}</Table.Td>
-                  </Table.Tr>
-                )
-              })}
+                  {group.items.map((item) => (
+                    <Table.Tr key={item.curKey}>
+                      <Table.Td>{item.label}</Table.Td>
+                      <Table.Td>{item.format(result[item.curKey])}</Table.Td>
+                      <Table.Td>{item.format(result[item.prvKey])}</Table.Td>
+                    </Table.Tr>
+                  ))}
+                </Fragment>
+              ))}
             </Table.Tbody>
           </Table>
 
