@@ -24,7 +24,7 @@ from app.parsers.base import (
     parse_won_amount,
 )
 from app.parsers.pdf_parser import parse_pdf_financials
-from app.parsers.xml_parser import parse_xml_financials
+from app.parsers.xml_parser import _decode_raw_xml, parse_xml_financials
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -327,6 +327,46 @@ def test_parse_xml_financials_recovers_underlined_total_cell():
     assert parsed.values_cur.get("cogs") is None  # 서비스업 서식 — 구조적 부재
     assert parsed.values_cur.get("sga") is None
     assert parsed.parse_status == "PARTIAL"
+
+
+def test_decode_raw_xml_passes_through_utf8_unchanged():
+    """정상 UTF-8 원문은 바이트를 그대로 반환해 기존 파싱 경로에 영향이 없어야 한다."""
+    raw = "<DOC><TE>자산총계</TE></DOC>".encode("utf-8")
+    assert _decode_raw_xml(raw) is raw
+
+
+def test_decode_raw_xml_recovers_euckr_declared_as_utf8():
+    """실제 EUC-KR 원문(rcept_no=20220127000408, 남경산업)은 선언부에
+    encoding="utf-8"이라고 적혀 있지만 실제 바이트는 CP949다 — UTF-8 디코딩이
+    실패해야 하고, _decode_raw_xml이 CP949로 폴백해 UTF-8 bytes로 정규화해야 한다."""
+    raw = _read_fixture("20220127000408")
+    with pytest.raises(UnicodeDecodeError):
+        raw.decode("utf-8")  # 원문이 실제로 비UTF-8임을 전제 확인
+
+    normalized = _decode_raw_xml(raw)
+    text = normalized.decode("utf-8")  # 정규화 후에는 UTF-8로 디코딩돼야 한다
+    assert "남경산업" in text  # 한글이 깨지지 않고 정상 디코딩됨
+    assert "재무상태표" in text
+    assert not text.lstrip().startswith("<?xml")  # 거짓 인코딩 선언부 제거됨
+
+
+def test_parse_xml_financials_recovers_euckr_encoded_document():
+    """Job #14를 통째로 죽였던 EUC-KR 인코딩 원문(20220127000408)이 이제
+    parse_status=OK로 재무 13항목까지 복구되는지 확인한다.
+
+    실측(2026-07-19): 로컬 캐시 1,453건 중 64건(4.4%)이 encoding="utf-8"로
+    거짓 선언된 EUC-KR/CP949 원문이었고, 인코딩 폴백 이전에는 recover=True로도
+    복구되지 않아 XMLSyntaxError로 Job 전체가 FAILED로 죽었다.
+    """
+    raw = _read_fixture("20220127000408")
+    parsed = parse_xml_financials(raw)
+
+    assert parsed.parse_status == "OK"
+    assert parsed.values_cur["total_assets"] == 11_342_787_789
+    assert parsed.values_cur["revenue"] == 23_795_704_614
+    assert parsed.values_cur["total_equity"] == -5_415_433_951  # 자본잠식(음수)
+    assert parsed.values_cur["operating_income"] == -6_308_961_098  # 영업손실
+    assert parsed.values_cur["net_income"] == -7_040_301_441  # 당기순손실
 
 
 def test_parse_xml_financials_invalid_xml_returns_failed():
