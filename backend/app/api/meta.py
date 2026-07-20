@@ -44,11 +44,16 @@ from fastapi import APIRouter, BackgroundTasks
 from pydantic import BaseModel, Field
 
 from app.api.jobs import RegionCondition
+from app.config import get_settings
 from app.core.dart_client import DartClient, FscCorpInfoClient
-from app.core.dart_corp_index import crawl_dart_corp_index, get_dart_index_status
+from app.core.dart_corp_index import (
+    crawl_dart_corp_index,
+    filter_local_candidates,
+    get_dart_index_status,
+)
 from app.core.db import get_session_factory
 from app.core.fsc_financial_stat import crawl_fsc_financial_stat, get_financial_stat_status
-from app.core.fsc_index import crawl_fsc_index, filter_local_candidates, get_fsc_index_status
+from app.core.fsc_index import crawl_fsc_index, get_fsc_index_status
 from app.core.industry_data import INDUSTRIES
 from app.core.region_data import REGIONS
 
@@ -383,13 +388,10 @@ async def get_fsc_index_status_endpoint() -> FscIndexStatusResponse:
 
 
 # data.go.kr GetFinaStatInfoService_V2(A3가 호출하는 금융위 재무정보 API)의
-# 일일 트래픽 허용량 — 2026-07-17 공식 API 상세페이지(data.go.kr)로 확인한
-# "개발계정" 기본값이다. 운영계정으로 승급하거나 트래픽 증가를 별도 신청하면
-# 더 늘어날 수 있어(§8 M6 QA 리뷰 이후 열려 있던 사안), 이 값은 "최소
-# 보장되는 하한"으로 다룬다 — 실제 계정이 더 넉넉하면 경고가 보수적으로(더
-# 자주) 뜨는 방향으로만 어긋나고, 결과 정확도 자체에는 영향이 없다(Phase 2
-# B4가 항상 DART 원문으로 최종 재검증하기 때문).
-_FSC_DAILY_QUOTA_ASSUMED = 10_000
+# 후보 1개사를 Phase 2에서 처리하는 데 드는 DART 호출 수(§4-10-C 실측 근거:
+# 경남 4,538개사 × 약 5회 ≈ 22,690 호출). 최신 공시 조회 1회 + 원문 다운로드,
+# 그리고 재무이력 연도 수만큼의 추가 원문이 더해진 값이다.
+_DART_CALLS_PER_CANDIDATE = 5
 
 
 class CandidatesPreviewRequest(BaseModel):
@@ -408,15 +410,16 @@ class CandidatesPreviewResponse(BaseModel):
 async def get_candidates_preview(payload: CandidatesPreviewRequest) -> CandidatesPreviewResponse:
     """검색 조건(지역/업종) 제출 전에 후보 수와 예상 소요일을 미리 계산한다.
 
-    Phase 1 A2(`filter_local_candidates`)만 실행한다 — `fsc_corp_index`에 대한
-    로컬 DB 쿼리뿐이라 외부 API 호출이 전혀 없고, Job을 만들지 않고도 즉시
-    응답 가능하다(M4 시점에는 이런 미리보기가 후보 전체의 DART company.json
-    호출을 요구해 스코프 제외됐었으나, M6 재설계로 A2가 로컬 쿼리만 쓰게
-    되면서 가능해졌다). 여기 나오는 `candidate_count`는 Job 실행 시 A3가
-    `getSummFinaStat_V2`로 스크리닝해야 할 후보 수의 근사치이고, 이 값이
-    `daily_quota_assumed`를 넘으면 A3 스크리닝이 하루 안에 끝나지 않을 수
-    있다는 뜻이다(최종 결과 정확도에는 영향 없음 — Phase 2 B4가 항상 실제
-    DART 원문으로 재검증한다).
+    Phase 1 A2(`dart_corp_index.filter_local_candidates`)만 실행한다 — 로컬 DB
+    쿼리뿐이라 외부 API 호출이 전혀 없고, Job을 만들지 않고도 즉시 응답할 수 있다.
+
+    **기준이 바뀌었다(M8 3단계, §4-10-C)**: 예전에는 A3(`getSummFinaStat_V2`
+    건별 스크리닝)의 data.go.kr 일일 쿼터가 병목이라 그 한도로 일수를 계산했다.
+    A3가 폐기된 지금 병목은 **Phase 2가 쓰는 DART 일일 한도**다 — 후보 1개사당
+    약 `_DART_CALLS_PER_CANDIDATE`회를 쓰므로 하루에 처리 가능한 후보 수는
+    `daily_quota_limit / 5` 정도다. 한도를 넘으면 Job이 `PAUSED_QUOTA`로 멈췄다가
+    다음 날 이어서 진행되며(결과 정확도에는 영향 없음), 밴드 근접도 정렬 덕에
+    첫날에 실제 대상 대부분이 확보된다(§4-10-D).
     """
     with get_session_factory()() as db:
         candidates = filter_local_candidates(
@@ -425,12 +428,11 @@ async def get_candidates_preview(payload: CandidatesPreviewRequest) -> Candidate
             cond_industry=payload.industry,
         )
     count = len(candidates)
-    estimated_days = (
-        (count + _FSC_DAILY_QUOTA_ASSUMED - 1) // _FSC_DAILY_QUOTA_ASSUMED if count else 0
-    )
+    daily_capacity = max(1, get_settings().daily_quota_limit // _DART_CALLS_PER_CANDIDATE)
+    estimated_days = (count + daily_capacity - 1) // daily_capacity if count else 0
     return CandidatesPreviewResponse(
         candidate_count=count,
-        daily_quota_assumed=_FSC_DAILY_QUOTA_ASSUMED,
-        exceeds_daily_quota=count > _FSC_DAILY_QUOTA_ASSUMED,
+        daily_quota_assumed=daily_capacity,
+        exceeds_daily_quota=count > daily_capacity,
         estimated_days=estimated_days,
     )

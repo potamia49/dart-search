@@ -1,4 +1,8 @@
-"""app/core/fsc_index.py(Phase 1 A1~A4) 단위 테스트.
+"""app/core/fsc_index.py(A1 — 금융위 전역 인덱스 크롤) 단위 테스트.
+
+A2/A3/A4 테스트는 M8 3단계(2026-07-20)에서 함께 제거됐다 — A2는
+`tests/test_dart_corp_index.py`로 옮겨졌고, A3(사전 스크리닝)와 A4(이름 매칭)는
+파이프라인에서 폐기됐다(§4-10-C).
 
 CLAUDE.md 지침대로 실제 공공데이터포털 호출 없이 `FscCorpInfoClient`를
 모킹해 검증한다. 응답 봉투 구조(`response.body.items.item`,
@@ -14,44 +18,23 @@ import pytest
 from sqlalchemy import select
 
 from app.core import fsc_index
-from app.models.corp_cache import CorpCache
 from app.models.fsc_corp_index import FscCorpIndex
 
 
 class FakeFscIndexClient:
     """FscCorpInfoClient 대체 테스트 더블.
 
-    - `pages`: A1(`get_corp_basic_info`)용 — page_no(1-base) 순서의 응답 리스트.
-    - `fina_stats`: A3(`get_summary_financial_stat`)용 — (crno, biz_year) -> item dict.
-      키가 없으면 "데이터 없음"(totalCount=0)으로 응답한다.
-    - `raise_for_crno`: 이 crno로 조회하면 예외를 던져 FSC 호출 실패를 시뮬레이션한다.
+    `pages`는 A1(`get_corp_basic_info`)용 — page_no(1-base) 순서의 응답 리스트다.
     """
 
-    def __init__(
-        self,
-        pages: list[dict] | None = None,
-        fina_stats: dict[tuple[str, str], dict] | None = None,
-        raise_for_crno: set[str] | None = None,
-    ) -> None:
+    def __init__(self, pages: list[dict] | None = None) -> None:
         self.pages = pages or []
-        self.fina_stats = fina_stats or {}
-        self.raise_for_crno = raise_for_crno or set()
-        self.finstat_calls: list[tuple[str, str]] = []
         self.closed = False
 
     async def get_corp_basic_info(
         self, *, page_no: int = 1, num_of_rows: int = 100, corp_nm: str | None = None
     ) -> dict:
         return self.pages[page_no - 1]
-
-    async def get_summary_financial_stat(self, *, crno: str, biz_year: str) -> dict:
-        self.finstat_calls.append((crno, biz_year))
-        if crno in self.raise_for_crno:
-            raise RuntimeError("FSC finstat 네트워크 오류 시뮬레이션")
-        item = self.fina_stats.get((crno, biz_year))
-        if item is None:
-            return {"response": {"body": {"totalCount": 0, "items": {"item": []}}}}
-        return {"response": {"body": {"totalCount": 1, "items": {"item": [item]}}}}
 
     async def aclose(self) -> None:
         self.closed = True
@@ -216,274 +199,3 @@ async def test_get_fsc_index_status_reports_in_progress_during_second_crawl(db_s
     status = fsc_index.get_fsc_index_status(db_session_factory)
     assert status["crawl_in_progress"] is True
     assert status["last_completed_at"] is None
-
-
-# ---------------------------------------------------------------------------
-# A2 — 로컬 필터 (지역 + 업종, API 호출 없음)
-# ---------------------------------------------------------------------------
-
-
-def test_filter_local_candidates_applies_region_and_industry(db_session_factory):
-    with db_session_factory() as db:
-        db.add_all(
-            [
-                FscCorpIndex(
-                    crno="1",
-                    corp_name="김해기계",
-                    sido="경상남도",
-                    sigungu="김해시",
-                    sic_name="금속가공제품 제조업(기계 및 가구 제외)",
-                ),
-                FscCorpIndex(
-                    crno="2",
-                    corp_name="양산화학",
-                    sido="경상남도",
-                    sigungu="양산시",
-                    sic_name="화학물질 및 화학제품 제조업",
-                ),
-                FscCorpIndex(
-                    crno="3",
-                    corp_name="서울상사",
-                    sido="서울특별시",
-                    sigungu="강남구",
-                    sic_name="금속가공제품 제조업(기계 및 가구 제외)",
-                ),
-            ]
-        )
-        db.commit()
-
-    with db_session_factory() as db:
-        candidates = fsc_index.filter_local_candidates(
-            db,
-            cond_region={"sido": "경남", "sigungu": ["김해시"]},
-            cond_industry=["C25"],
-        )
-
-    assert [c.corp_name for c in candidates] == ["김해기계"]
-
-
-def test_filter_local_candidates_applies_multiple_sido(db_session_factory):
-    """시도 다중 선택 시 그중 어느 하나에 속한 후보를 모두 통과시킨다(IN 필터)."""
-    with db_session_factory() as db:
-        db.add_all(
-            [
-                FscCorpIndex(crno="1", corp_name="김해기계", sido="경상남도", sigungu="김해시"),
-                FscCorpIndex(crno="2", corp_name="부산상사", sido="부산광역시", sigungu="해운대구"),
-                FscCorpIndex(crno="3", corp_name="서울상사", sido="서울특별시", sigungu="강남구"),
-            ]
-        )
-        db.commit()
-
-    with db_session_factory() as db:
-        candidates = fsc_index.filter_local_candidates(
-            db,
-            cond_region={"sido": ["경상남도", "부산광역시"], "sigungu": []},
-            cond_industry=[],
-        )
-
-    assert sorted(c.corp_name for c in candidates) == ["김해기계", "부산상사"]
-
-
-def test_filter_local_candidates_matches_narrow_industry_selection_against_fine_grained_sic_name(
-    db_session_factory,
-):
-    """회귀 테스트 — 중분류 코드 하나만 선택했을 때 FSC의 세분류 수준
-    `sic_name`("떡류 제조업")이 중분류 라벨("식료품 제조업")과 글자 그대로는
-    겹치지 않아도 대분류("제조업") 단위로는 통과해야 한다. 이전에는 중분류
-    라벨만으로 매칭해 실제 회사가 있어도 0건으로 걸러지는 버그가 있었다
-    (2026-07-18 실제 운영 중 발견).
-    """
-    with db_session_factory() as db:
-        db.add_all(
-            [
-                FscCorpIndex(
-                    crno="1",
-                    corp_name="김해떡공장",
-                    sido="경상남도",
-                    sigungu="김해시",
-                    sic_name="떡류 제조업",
-                ),
-                FscCorpIndex(
-                    crno="2",
-                    corp_name="김해건설",
-                    sido="경상남도",
-                    sigungu="김해시",
-                    sic_name="아파트 건설업",
-                ),
-            ]
-        )
-        db.commit()
-
-    with db_session_factory() as db:
-        candidates = fsc_index.filter_local_candidates(
-            db,
-            cond_region={"sido": "경남", "sigungu": ["김해시"]},
-            cond_industry=["10"],
-        )
-
-    assert [c.corp_name for c in candidates] == ["김해떡공장"]
-
-
-def test_filter_local_candidates_no_conditions_returns_all(db_session_factory):
-    with db_session_factory() as db:
-        db.add_all(
-            [
-                FscCorpIndex(crno="1", corp_name="A사", sido="경상남도", sigungu="김해시"),
-                FscCorpIndex(crno="2", corp_name="B사", sido="서울특별시", sigungu="강남구"),
-            ]
-        )
-        db.commit()
-
-    with db_session_factory() as db:
-        candidates = fsc_index.filter_local_candidates(db, cond_region={}, cond_industry=[])
-
-    assert {c.corp_name for c in candidates} == {"A사", "B사"}
-
-
-# ---------------------------------------------------------------------------
-# A3 — 매출액/총자산 보강 + 안전마진 스크리닝
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_enrich_and_screen_financials_screens_by_margin_and_passes_on_failure(
-    db_session_factory,
-):
-    with db_session_factory() as db:
-        c1 = FscCorpIndex(crno="1000000000001", corp_name="통과사")
-        c2 = FscCorpIndex(crno="1000000000002", corp_name="제외사")
-        c3 = FscCorpIndex(crno="1000000000003", corp_name="조회실패사")
-        c4 = FscCorpIndex(crno=None, corp_name="crno없는사")
-        db.add_all([c1, c2, c3, c4])
-        db.commit()
-        for c in (c1, c2, c3, c4):
-            db.refresh(c)
-            db.expunge(c)
-        candidates = [c1, c2, c3, c4]
-
-    this_year = str(datetime.now().year)
-    client = FakeFscIndexClient(
-        fina_stats={
-            ("1000000000001", this_year): {
-                "enpSaleAmt": "10000000000",
-                "enpTastAmt": "20000000000",
-                "bizYear": this_year,
-            },
-            ("1000000000002", this_year): {
-                "enpSaleAmt": "1000000000",
-                "enpTastAmt": "2000000000",
-                "bizYear": this_year,
-            },
-        },
-        raise_for_crno={"1000000000003"},
-    )
-
-    passed = await fsc_index.enrich_and_screen_financials(
-        client,
-        db_session_factory,
-        candidates,
-        cond_revenue={"min_krw": 6_000_000_000, "max_krw": 15_000_000_000},
-        cond_total_assets=None,
-    )
-
-    assert {c.corp_name for c in passed} == {"통과사", "조회실패사", "crno없는사"}
-
-    with db_session_factory() as db:
-        stored_c1 = db.get(FscCorpIndex, c1.id)
-        assert stored_c1.revenue_latest == 10_000_000_000
-        assert stored_c1.total_assets_latest == 20_000_000_000
-        assert stored_c1.revenue_biz_year == this_year
-
-
-@pytest.mark.asyncio
-async def test_enrich_and_screen_financials_retries_previous_year_when_no_data(
-    db_session_factory,
-):
-    with db_session_factory() as db:
-        candidate = FscCorpIndex(crno="1000000000009", corp_name="작년자료만")
-        db.add(candidate)
-        db.commit()
-        db.refresh(candidate)
-        db.expunge(candidate)
-
-    this_year = datetime.now().year
-    prev_year = str(this_year - 1)
-    client = FakeFscIndexClient(
-        fina_stats={
-            ("1000000000009", prev_year): {"enpSaleAmt": "10000000000", "enpTastAmt": "20000000000"},
-        }
-    )
-
-    passed = await fsc_index.enrich_and_screen_financials(
-        client,
-        db_session_factory,
-        [candidate],
-        cond_revenue=None,
-        cond_total_assets=None,
-    )
-
-    assert len(passed) == 1
-    assert (str(this_year), "") not in client.finstat_calls  # 참고용, 실제 확인은 아래
-    assert ("1000000000009", str(this_year)) in client.finstat_calls
-    assert ("1000000000009", prev_year) in client.finstat_calls
-
-
-# ---------------------------------------------------------------------------
-# A4 — 후보 확정 (corp_code 해석)
-# ---------------------------------------------------------------------------
-
-
-def test_resolve_candidates_prefers_fss_then_name_match_then_drops(db_session_factory):
-    with db_session_factory() as db:
-        db.add(CorpCache(corp_code="00112233", corp_name="이름매칭상사"))
-        db.commit()
-
-    candidates = [
-        FscCorpIndex(corp_name="직접매칭상사", fss_corp_unq_no="00998877"),
-        FscCorpIndex(corp_name="(주)이름매칭상사", fss_corp_unq_no=""),
-        FscCorpIndex(corp_name="매칭불가상사", fss_corp_unq_no=""),
-    ]
-
-    with db_session_factory() as db:
-        corp_codes = fsc_index.resolve_candidates(db, candidates)
-
-    assert corp_codes == ["00998877", "00112233"]
-
-
-def test_resolve_candidates_excludes_listed_companies(db_session_factory):
-    """상장사(corp_cache.stock_code가 채워진 회사)는 후보에서 제외한다.
-
-    fsc_corp_index는 금융위 전체 기업 DB라 상장사가 섞여 들어오는데, 상장사는
-    감사보고서를 별도 공시(pblntf_ty=F)로 내지 않아 Phase 2에서 전부 FAILED가
-    된다(2026-07-20 Job #21 실측). 타깃도 비상장 외감법인이다.
-    """
-    with db_session_factory() as db:
-        db.add(CorpCache(corp_code="00580056", corp_name="상장상사", stock_code="099440"))
-        db.add(CorpCache(corp_code="00112233", corp_name="비상장상사", stock_code=""))
-        db.commit()
-
-    candidates = [
-        # fss_corp_unq_no 직접 매칭 경로도 상장사면 걸러져야 한다.
-        FscCorpIndex(corp_name="상장상사", fss_corp_unq_no="00580056"),
-        # 이름 매칭 경로.
-        FscCorpIndex(corp_name="(주)비상장상사", fss_corp_unq_no=""),
-    ]
-
-    with db_session_factory() as db:
-        corp_codes = fsc_index.resolve_candidates(db, candidates)
-
-    assert corp_codes == ["00112233"]
-
-
-def test_resolve_candidates_ignores_non_8_digit_fss_corp_unq_no(db_session_factory):
-    """fss_corp_unq_no가 있어도 8자리 숫자가 아니면 이름 매칭 안전망을 탄다."""
-    with db_session_factory() as db:
-        db.add(CorpCache(corp_code="00445566", corp_name="이상한코드상사"))
-        db.commit()
-
-    candidates = [FscCorpIndex(corp_name="이상한코드상사", fss_corp_unq_no="ABC")]
-
-    with db_session_factory() as db:
-        corp_codes = fsc_index.resolve_candidates(db, candidates)
-
-    assert corp_codes == ["00445566"]

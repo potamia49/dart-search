@@ -77,6 +77,11 @@ _RESULTS_NEW_COLUMNS: dict[str, str] = {
     # 감사인(회계법인/감사반) 이름·주소 (2026-07-20, app/parsers/auditor.py)
     "auditor_name": "TEXT",
     "auditor_address": "TEXT",
+    # 금융위 요약재무 참고값 + 기준연도 (2026-07-20 M8 3단계, §4-10-C/D).
+    # 필터 판정용이 아니라 후보 목록 표시용이다.
+    "ref_revenue": "INTEGER",
+    "ref_total_assets": "INTEGER",
+    "ref_fin_year": "TEXT",
 }
 # financial_snapshots(2026-07-15 STEP7 신설)에도 §4-8 CF 4컬럼을 추가한다.
 # 이 테이블은 이미 실 데이터가 있어 create_all이 컬럼을 못 붙이므로 ALTER 필요.

@@ -32,7 +32,7 @@ import asyncio
 import io
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 import httpx
@@ -40,6 +40,7 @@ from openpyxl import load_workbook
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.config import Settings, get_settings
 from app.core.db import get_session_factory
 from app.core.filters import (
     cond_sido_list,
@@ -48,6 +49,7 @@ from app.core.filters import (
     parse_address,
     region_matches,
 )
+from app.core.industry_data import INDUSTRIES
 from app.models.corp_cache import CacheMeta
 from app.models.dart_corp_index import DartCorpIndex
 
@@ -569,6 +571,30 @@ async def crawl_dart_corp_index(
 # ---------------------------------------------------------------------------
 
 
+def _expand_industry_prefixes(cond_industry: list[str] | None) -> list[str]:
+    """조건의 업종 코드를 `induty_code` prefix 목록으로 정규화한다.
+
+    `GET /api/meta/industries`는 대분류를 **알파벳**(A~U)으로 주는데
+    `dart_corp_index.induty_code`는 KSIC 숫자 코드(2~5자리)라, 대분류를 고른
+    조건을 그대로 prefix 매칭하면 **조용히 0건**이 된다 — §4-10-C에서 폐기한
+    "조용한 누락"과 같은 종류의 실패다. 대분류 코드는 그 대분류에 속한 중분류
+    2자리 코드 전체로 펼쳐서 넘긴다.
+    """
+    prefixes: list[str] = []
+    for raw in cond_industry or []:
+        code = (raw or "").strip()
+        if not code:
+            continue
+        if code.isdigit():
+            prefixes.append(code)
+            continue
+        children = next(
+            (entry["children"] for entry in INDUSTRIES if entry["code"] == code), []
+        )
+        prefixes.extend(child["code"] for child in children)
+    return list(dict.fromkeys(prefixes))
+
+
 def filter_local_candidates(
     db: Session,
     *,
@@ -606,7 +632,7 @@ def filter_local_candidates(
     if cond_sidos:
         stmt = stmt.where(DartCorpIndex.sido.in_(cond_sidos))
 
-    prefixes = [code.strip() for code in (cond_industry or []) if code and code.strip()]
+    prefixes = _expand_industry_prefixes(cond_industry)
     if prefixes:
         # SQL 단계에서 먼저 좁힌다(인덱스 전체를 메모리로 올리지 않기 위해).
         stmt = stmt.where(
@@ -620,6 +646,32 @@ def filter_local_candidates(
         if region_matches(row.sido, row.sigungu, cond_region)
         and industry_matches(row.induty_code, prefixes or None)
     ]
+
+
+def is_dart_index_stale(
+    session_factory: sessionmaker[Session] | None = None,
+    ttl_days: int | None = None,
+    settings: Settings | None = None,
+) -> bool:
+    """`dart_corp_index`가 비어있거나 TTL(기본 180일)이 지났으면 True.
+
+    `fsc_index.is_fsc_index_stale()`/`corp_cache.is_cache_stale()`와 동일한 패턴.
+    """
+    settings = settings or get_settings()
+    ttl_days = ttl_days if ttl_days is not None else settings.dart_index_ttl_days
+    factory = session_factory or get_session_factory()
+
+    with factory() as db:
+        updated_at_raw = _get_meta(db, _META_KEY_UPDATED_AT)
+        has_rows = db.execute(select(DartCorpIndex.corp_code).limit(1)).first() is not None
+
+    if not has_rows or not updated_at_raw:
+        return True
+    try:
+        updated_at = datetime.fromisoformat(updated_at_raw)
+    except ValueError:
+        return True
+    return datetime.now() - updated_at > timedelta(days=ttl_days)
 
 
 def get_dart_index_status(

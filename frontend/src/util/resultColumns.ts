@@ -42,14 +42,14 @@ export function formatPercent(value: unknown): string {
   return `${Number(value).toFixed(2)}%`
 }
 
-// phone/ceo_name/induty_name은 Phase 2가 덮어쓰지 않아 Phase 1(FSC) 추정치가
-// 그대로 남는다 — 실제 연락처로 쓰일 수 있어 라벨로 미확정임을 명시한다.
+// 주소/대표자/업종은 M8 3단계(§4-10)부터 DART 기업개황 원본이라 "미확정" 단서가
+// 필요 없다. 전화번호만은 기업개황 엑셀에 열이 없어 항상 비어 있다.
 export const BASIC_COLUMNS: ResultColumn[] = [
   { key: 'corp_name', label: '회사명' },
   { key: 'address', label: '주소' },
-  { key: 'phone', label: '전화번호 (미확정·FSC 기준)' },
-  { key: 'ceo_name', label: '대표자 (미확정·FSC 기준)' },
-  { key: 'induty_name', label: '업종 (미확정·FSC 기준)' },
+  { key: 'phone', label: '전화번호 (미수집)' },
+  { key: 'ceo_name', label: '대표자' },
+  { key: 'induty_name', label: '업종' },
   { key: 'induty_code', label: '업종코드' },
   { key: 'fiscal_date', label: '결산기준일' },
   { key: 'audit_opinion', label: '감사의견' },

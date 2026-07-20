@@ -1146,6 +1146,46 @@ API 응답을 확인했다 — 감사의견 전문("...중요성의 관점에서
   컬럼만 채우면 되므로, 기존 결과 소급 채움은 언제든 안전하게 가능하다 —
   다음 세션에서 사용자가 원하면 일회성 스크립트로 처리할 것.
 
+**M8 3단계 완료 — Phase 1 파이프라인을 DART 인덱스 기준으로 교체하고 A3/A4를
+제거했다(2026-07-20).** 1~2단계(`dart_corp_index` 크롤 + `fsc_financial_stat`
+스냅샷)에 이어 `run_job_phase1()` 호출부를 갈아끼웠다. 핵심은 **Phase 1이 외부
+API를 0건 호출하는 로컬 쿼리 단계가 됐다**는 것이다:
+- **A4(이름 매칭 corp_code 해석) 삭제** — `dart_corp_index`는 `corp_code`가 PK라
+  이름 매칭 자체가 불필요하다(동명이인 오매칭 실측 11.6%가 구조적으로 소멸).
+  상장사 제외도 인덱스의 `corp_cls`로 A2에서 끝난다.
+- **A3(FSC 건별 재무 사전 스크리닝) 삭제** — §4-10-C 확정 정책. 1년 묵은 값으로
+  거르면 조건에 맞는 회사의 25.3%를 **조용히** 놓친다. `run_job_phase1()`은 이제
+  `cond_revenue`/`cond_total_assets`를 읽지도 않는다 — 판정 지점은 B4 한 곳이다.
+  `FscCorpInfoClient`/`QuotaExceededError` 경로도 Phase 1에서 함께 사라졌다.
+- **참고값은 `_cur`가 아니라 신설 `ref_*` 컬럼에 넣는다**(`ref_revenue`/
+  `ref_total_assets`/`ref_fin_year`, `_RESULTS_NEW_COLUMNS` ad-hoc ALTER).
+  구 A3는 추정치를 확정치 자리(`revenue_cur`)에 임시 저장해 B4가 추정치로 판정할
+  위험을 안고 있었고 그래서 B1에 "추정치 지우기" 보정이 붙어 있었다 — 컬럼을
+  분리하니 그 위험 자체가 없어졌다(B1의 보정은 구 Job 데이터용으로만 남겼다).
+  기준연도는 회사마다 다르므로(`fsc_financial_stat`은 최신 연도일수록 비어 있다)
+  반드시 함께 저장해 화면에 명시한다.
+- **`app/core/fsc_index.py`는 A1(크롤/상태)만 남기고 A2/A3/A4를 삭제**했다.
+  `fsc_corp_index` 테이블과 크롤러 자체는 롤백 여지로 남긴다(§4-10-E).
+- **구현 중 발견한 조용한 0건 버그**: `GET /api/meta/industries`는 대분류를
+  알파벳(A~U)으로 주는데 `dart_corp_index.induty_code`는 KSIC 숫자라, 사용자가
+  "제조업"만 고르면 `like 'C%'`가 되어 **0건이 조용히 나온다**.
+  `_expand_industry_prefixes()`가 대분류를 소속 중분류 2자리 코드 전체로 펼치도록
+  고치고 회귀 테스트를 추가했다(§4-10-C가 폐기한 "조용한 누락"과 같은 종류).
+- **라벨 정리**: 주소/대표자/업종이 DART 원본이 됐으므로 "미확정(FSC 기준)"
+  라벨을 없앴고, 전화번호만 "(미수집)"으로 바꿨다 — 기업개황 엑셀에 전화번호 열이
+  아예 없다(§4-10-G 열린 질문 4). `resultColumns.ts`/`excel.py` 양쪽 반영.
+- **`candidates-preview`도 함께 교체**했다. A3가 사라져 병목이 data.go.kr 쿼터
+  → **DART 일일 한도**로 바뀌었다(하루 처리 가능 후보 ≈ `daily_quota_limit / 5`).
+  응답 계약은 무변경이고 필드 의미만 바뀌었다 — 프론트 안내 문구는 5단계 몫.
+- **검증**: `pytest tests/ -q` **237 passed**. 실 DB(`dart_corp_index` 118,268행)로
+  A2를 실측해 김해시 1,127개사 / 재무 참고값 매칭 433건(38.4%)이 **§4-10-A·B의
+  스파이크 수치와 정확히 일치**함을 확인했고, 실제 Job #22(김해시 + 중분류 25)를
+  `run_job_phase1()`로 끝까지 돌려 121건이 `ref_*`만 채워진 채(`_cur`는 NULL)
+  DONE/CANDIDATES로 멈추는 것을 확인했다. `npm run build`/`npm run lint` 통과.
+- **다음(4단계)**: Phase 2 세 루프에 밴드 근접도 `ORDER BY` 추가(§4-10-D).
+  5단계는 `GET /api/meta/industries`를 DART 트리 기반으로 재생성(소분류 한 층
+  추가)하고 `CandidatesView`에 참고값 기준연도를 노출하는 작업이다.
+
 작업을 시작하기 전에 반드시 아래 두 문서를 먼저 읽으세요 —
 이 저장소의 유일한 진실 소스(source of truth)입니다.
 

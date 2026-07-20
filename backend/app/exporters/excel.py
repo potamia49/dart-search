@@ -29,10 +29,12 @@ RESULT_COLUMN_LABELS: dict[str, str] = {
     # 기본정보 (PRD 3-1)
     "corp_name": "회사명",
     "address": "주소",
-    "phone": "전화번호(미확정,FSC기준)",
-    "ceo_name": "대표자명(미확정,FSC기준)",
+    # M8 3단계(§4-10)부터 주소/대표자/업종은 DART 기업개황 원본이라 "미확정" 단서가
+    # 필요 없다. 전화번호만은 기업개황 엑셀에 열 자체가 없어 항상 비어 있다.
+    "phone": "전화번호(미수집)",
+    "ceo_name": "대표자명",
     "induty_code": "업종코드",
-    "induty_name": "업종명(미확정,FSC기준)",
+    "induty_name": "업종명",
     "fiscal_date": "결산기준일",
     "audit_opinion": "감사의견",
     "auditor_name": "감사인",
@@ -73,6 +75,11 @@ RESULT_COLUMN_LABELS: dict[str, str] = {
     "cf_financing_prv": "재무활동현금흐름(전기)",
     "cf_ending_cash_cur": "기말의현금(당기)",
     "cf_ending_cash_prv": "기말의현금(전기)",
+    # 금융위 요약재무 참고값 (§4-10-C/D) — 필터 판정에 쓰이지 않는 참고 표시용이고
+    # 기준연도가 회사마다 다르므로 라벨에 "참고"와 연도 컬럼을 함께 둔다.
+    "ref_revenue": "매출액(참고)",
+    "ref_total_assets": "자산총계(참고)",
+    "ref_fin_year": "참고값기준연도",
     # 상태
     "parse_status": "파싱상태",
     "parse_note": "파싱비고",

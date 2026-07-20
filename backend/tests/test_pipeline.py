@@ -22,7 +22,8 @@ from app.core.dart_client import DartApiError, QuotaExceededError
 from app.models.corp_cache import CorpCache
 from app.models.corp_profile import CorpProfile
 from app.models.financial_snapshot import FinancialSnapshot
-from app.models.fsc_corp_index import FscCorpIndex
+from app.models.dart_corp_index import DartCorpIndex
+from app.models.fsc_financial_stat import FscFinancialStat
 from app.models.job import Job, JobStatus
 from app.models.result import ParseStatus, Result
 from app.parsers.base import ParsedFinancials
@@ -1503,33 +1504,12 @@ async def test_run_job_quota_exceeded_during_step7_pauses_and_resumes(
 # ---------------------------------------------------------------------------
 
 
-class FakePhase1FscClient:
-    """run_job_phase1 통합 테스트용 더블 — A3(get_summary_financial_stat)만 필요하다.
-
-    A1(get_corp_basic_info)은 run_job_phase1이 절대 호출하지 않으므로 구현하지
-    않는다(호출되면 AttributeError로 즉시 드러나야 한다 — 의도적으로 없음).
-    """
-
-    def __init__(self, fina_stats: dict[tuple[str, str], dict] | None = None) -> None:
-        self.fina_stats = fina_stats or {}
-        self.closed = False
-
-    async def get_summary_financial_stat(self, *, crno: str, biz_year: str) -> dict:
-        item = self.fina_stats.get((crno, biz_year))
-        if item is None:
-            return {"response": {"body": {"totalCount": 0, "items": {"item": []}}}}
-        return {"response": {"body": {"totalCount": 1, "items": {"item": [item]}}}}
-
-    async def aclose(self) -> None:
-        self.closed = True
-
-
 @pytest.mark.asyncio
 async def test_run_job_phase1_inserts_candidates_and_marks_done(
-    monkeypatch, db_session_factory, patch_pipeline_env
+    db_session_factory, patch_pipeline_env
 ):
-    """A2(로컬 필터)~A4(corp_code 확정)를 거쳐 results에 후보가 선삽입되고
-    phase=CANDIDATES/status=DONE으로 멈추는지 확인. DART는 전혀 호출하지 않는다."""
+    """A2(로컬 필터)만으로 후보가 results에 선삽입되고 phase=CANDIDATES/status=DONE으로
+    멈추는지 확인. M8 3단계 이후 Phase 1은 외부 API를 전혀 호출하지 않는다."""
     job_id = _make_job(
         db_session_factory,
         cond_region={"sido": "경남", "sigungu": ["김해시"]},
@@ -1537,70 +1517,106 @@ async def test_run_job_phase1_inserts_candidates_and_marks_done(
         cond_industry=["C25"],
     )
 
-    this_year = str(datetime.now().year)
     with db_session_factory() as db:
         db.add(
-            FscCorpIndex(
-                crno="1000000000001",
-                fss_corp_unq_no="00099001",
+            DartCorpIndex(
+                corp_code="00099001",
                 corp_name="김해기계",
                 address="경상남도 김해시 어딘가 1",
                 sido="경상남도",
                 sigungu="김해시",
-                sic_name="금속가공제품 제조업(기계 및 가구 제외)",
+                ceo_name="홍길동",
+                jurir_no="1000000000001",
+                induty_code="25",
+                induty_name="금속가공제품 제조업",
+                corp_cls="기타법인",
+            )
+        )
+        # 금융위 요약재무는 참고 표시용으로만 쓰인다(§4-10-C) — 후보를 제외하지 않는다.
+        db.add(
+            FscFinancialStat(
+                crno="1000000000001",
+                biz_year="2024",
+                sale_amt=10_000_000_000,
+                tast_amt=20_000_000_000,
             )
         )
         db.commit()
-
-    fsc_client = FakePhase1FscClient(
-        fina_stats={
-            ("1000000000001", this_year): {
-                "enpSaleAmt": "10000000000",
-                "enpTastAmt": "20000000000",
-                "bizYear": this_year,
-            }
-        }
-    )
-    monkeypatch.setattr(pipeline, "FscCorpInfoClient", lambda **kwargs: fsc_client)
 
     await pipeline.run_job_phase1(job_id)
 
     job = _get_job(db_session_factory, job_id)
     assert job.status == JobStatus.DONE
     assert job.phase == "CANDIDATES"
-    assert fsc_client.closed is True
 
     with db_session_factory() as db:
         results = db.execute(select(Result).where(Result.job_id == job_id)).scalars().all()
     assert len(results) == 1
-    assert results[0].corp_code == "00099001"
-    assert results[0].corp_name == "김해기계"
-    assert results[0].revenue_cur == 10_000_000_000
-    assert results[0].total_assets_cur == 20_000_000_000
-    assert results[0].parse_status is None  # 원문 파싱은 Phase 2 몫 — 아직 NULL
+    result = results[0]
+    assert result.corp_code == "00099001"
+    assert result.corp_name == "김해기계"
+    assert result.ceo_name == "홍길동"
+    assert result.induty_code == "25"
+    # 참고값은 ref_* 컬럼에 기준연도와 함께 들어가고, 확정치(_cur)는 비어 있어야 한다 —
+    # B4가 참고값으로 판정하는 일이 없도록 컬럼 자체를 분리했다.
+    assert result.ref_revenue == 10_000_000_000
+    assert result.ref_total_assets == 20_000_000_000
+    assert result.ref_fin_year == "2024"
+    assert result.revenue_cur is None
+    assert result.total_assets_cur is None
+    assert result.parse_status is None  # 원문 파싱은 Phase 2 몫 — 아직 NULL
+
+
+@pytest.mark.asyncio
+async def test_run_job_phase1_keeps_candidate_without_financial_stat(
+    db_session_factory, patch_pipeline_env
+):
+    """금융위 재무 스냅샷이 없는 후보(실측 커버리지 18.1%)도 그대로 후보로 남아야 한다 —
+    참고값 부재는 제외 사유가 아니다(§4-10-C 사전 제외 전면 폐기)."""
+    job_id = _make_job(
+        db_session_factory,
+        cond_region={"sido": "경남", "sigungu": ["김해시"]},
+        cond_revenue={"min_krw": 6_000_000_000, "max_krw": 15_000_000_000},
+    )
+
+    with db_session_factory() as db:
+        db.add(
+            DartCorpIndex(
+                corp_code="00099002",
+                corp_name="재무자료없는사",
+                sido="경상남도",
+                sigungu="김해시",
+                jurir_no="3000000000003",
+            )
+        )
+        db.commit()
+
+    await pipeline.run_job_phase1(job_id)
+
+    with db_session_factory() as db:
+        results = db.execute(select(Result).where(Result.job_id == job_id)).scalars().all()
+    assert [r.corp_code for r in results] == ["00099002"]
+    assert results[0].ref_revenue is None
+    assert results[0].ref_fin_year is None
 
 
 @pytest.mark.asyncio
 async def test_run_job_phase1_excludes_candidates_outside_local_filter(
-    monkeypatch, db_session_factory, patch_pipeline_env
+    db_session_factory, patch_pipeline_env
 ):
-    """A2(지역 필터) 통과 못 한 후보는 애초에 A3/A4로 넘어가지 않아야 한다."""
+    """A2(지역 필터)를 통과하지 못한 후보는 results에 들어가지 않아야 한다."""
     job_id = _make_job(db_session_factory, cond_region={"sido": "경남", "sigungu": ["김해시"]})
 
     with db_session_factory() as db:
         db.add(
-            FscCorpIndex(
-                crno="2000000000002",
-                fss_corp_unq_no="A0000088",
+            DartCorpIndex(
+                corp_code="00099003",
                 corp_name="서울상사",
                 sido="서울특별시",
                 sigungu="강남구",
             )
         )
         db.commit()
-
-    fsc_client = FakePhase1FscClient()
-    monkeypatch.setattr(pipeline, "FscCorpInfoClient", lambda **kwargs: fsc_client)
 
     await pipeline.run_job_phase1(job_id)
 
@@ -1612,21 +1628,18 @@ async def test_run_job_phase1_excludes_candidates_outside_local_filter(
 
 
 @pytest.mark.asyncio
-async def test_run_job_phase1_fails_when_fsc_index_empty(
-    monkeypatch, db_session_factory, patch_pipeline_env
+async def test_run_job_phase1_fails_when_dart_index_empty(
+    db_session_factory, patch_pipeline_env
 ):
-    """fsc_corp_index가 아직 한 번도 크롤되지 않았으면(A1 미실행) Job은 FAILED로
-    안내 메시지와 함께 종료돼야 한다 — Job 실행 중 전수 크롤을 트리거하지 않는다."""
+    """dart_corp_index가 아직 한 번도 크롤되지 않았으면 Job은 FAILED로 안내 메시지와
+    함께 종료돼야 한다 — Job 실행 중 전수 크롤을 트리거하지 않는다."""
     job_id = _make_job(db_session_factory)
-
-    fsc_client = FakePhase1FscClient()
-    monkeypatch.setattr(pipeline, "FscCorpInfoClient", lambda **kwargs: fsc_client)
 
     await pipeline.run_job_phase1(job_id)
 
     job = _get_job(db_session_factory, job_id)
     assert job.status == JobStatus.FAILED
-    assert "fsc_corp_index" in (job.error_msg or "")
+    assert "dart_corp_index" in (job.error_msg or "")
 
 
 @pytest.mark.asyncio

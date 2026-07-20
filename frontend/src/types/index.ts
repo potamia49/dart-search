@@ -130,6 +130,12 @@ export interface ResultResponse {
   cf_ending_cash_cur: number | null
   cf_ending_cash_prv: number | null
 
+  // 금융위 요약재무 참고값 + 기준연도 (§4-10-C/D). 후보 검토용 표시 전용이고
+  // 필터 판정에는 쓰이지 않는다 — 판정은 항상 원문 파싱값(_cur) 기준이다.
+  ref_revenue: number | null
+  ref_total_assets: number | null
+  ref_fin_year: string | null
+
   parse_status: ParseStatus | null
   parse_note: string | null
   excluded_by_revenue: number

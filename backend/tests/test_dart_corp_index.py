@@ -309,6 +309,25 @@ def test_filter_local_candidates_matches_narrow_industry_precisely(db_session_fa
     assert {r.corp_code for r in got} == {"00000001", "00000003"}
 
 
+def test_filter_local_candidates_expands_major_class_letter(db_session_factory):
+    """대분류는 알파벳(C)인데 `induty_code`는 숫자라, 펼치지 않으면 조용히 0건이 된다.
+
+    `GET /api/meta/industries`가 대분류를 A~U로 주므로 사용자가 "제조업"만 고른
+    조건이 그대로 들어올 수 있다 — 소속 중분류 전체로 펼쳐 매칭해야 한다.
+    """
+    with db_session_factory() as db:
+        _seed(db, [
+            ("00000001", "경상남도 김해시 1", "10121", "식료품사", None),
+            ("00000002", "경상남도 김해시 2", "29171", "자동차부품사", None),
+            ("00000003", "경상남도 김해시 3", "47", "소매업체", None),
+        ])
+        got = filter_local_candidates(
+            db, cond_region={"sido": ["경상남도"]}, cond_industry=["C"]
+        )
+    # 제조업(C) 소속 중분류 10·29는 통과하고, 도소매(G)의 47은 걸러진다
+    assert {r.corp_code for r in got} == {"00000001", "00000002"}
+
+
 def test_filter_local_candidates_supports_sub_class_prefix(db_session_factory):
     """소분류(3자리) 선택 — 얕게(2자리) 분류된 회사는 못 잡는 것이 정상이다."""
     with db_session_factory() as db:

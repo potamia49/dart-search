@@ -33,6 +33,16 @@ class Result(Base):
     auditor_name: Mapped[str | None] = mapped_column(String, nullable=True)
     auditor_address: Mapped[str | None] = mapped_column(String, nullable=True)
 
+    # 금융위 요약재무(`fsc_financial_stat`) 참고값 — Phase 1이 후보 목록 화면에
+    # 보여주려고 채운다(§4-10-C/D). **필터 판정에 절대 쓰지 않는다** —
+    # 매출액/총자산 조건은 원문에서 파싱한 `revenue_cur`/`total_assets_cur`로만
+    # B4에서 판정한다. 두 값을 `_cur` 컬럼에 섞어 넣던 구 A3 방식(사전 스크리닝
+    # 추정치를 확정치 자리에 임시 저장)을 이 3컬럼으로 분리한 것이다.
+    # `ref_fin_year`는 그 참고값의 회계연도(회사마다 확보된 최신 연도가 다르다).
+    ref_revenue: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    ref_total_assets: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    ref_fin_year: Mapped[str | None] = mapped_column(String, nullable=True)
+
     # 요약 재무 (PRD 3-2): 당기(_cur) / 전기(_prv), 단위: 원
     current_assets_cur: Mapped[int | None] = mapped_column(Integer, nullable=True)
     current_assets_prv: Mapped[int | None] = mapped_column(Integer, nullable=True)

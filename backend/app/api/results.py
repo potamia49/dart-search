@@ -172,6 +172,12 @@ class ResultResponse(BaseModel):
     cf_ending_cash_cur: int | None
     cf_ending_cash_prv: int | None
 
+    # 금융위 요약재무 참고값 + 기준연도 (§4-10-C/D) — 후보 목록에서 "재무정보 수집을
+    # 시작할지" 판단할 근거로만 쓴다. 필터 판정은 항상 `_cur`(원문 파싱값) 기준이다.
+    ref_revenue: int | None
+    ref_total_assets: int | None
+    ref_fin_year: str | None
+
     parse_status: str | None
     parse_note: str | None
     excluded_by_revenue: int
