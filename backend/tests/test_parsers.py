@@ -57,10 +57,44 @@ def _read_fixture(rcept_no: str) -> bytes:
         ("Ⅱ.매출원가(주6)", "매출원가"),  # "주6" 축약 각주도 제거 (티디케이전자한국 실측)
         ("Ⅷ. 당기순이익(손실)(주석10)", "당기순이익(손실)"),  # 각주만 제거, 의미있는 (손실)은 보존
         ("수익(매출액)", "수익(매출액)"),  # 괄호가 각주가 아니라 항목명 자체라 보존
+        ("Ⅱ . 비유동자산", "비유동자산"),  # 로마숫자-마침표 사이 공백 (주식회사 신진팩 실측, 2026-07-21)
+        ("∥.비유동자산", "비유동자산"),  # "Ⅱ" 대신 U+2225(∥) 오표기 ((주)해동주택 실측, 2026-07-21)
+        ("l.유동자산", "유동자산"),  # 소문자 l을 로마숫자 I 대신 사용 (제이엠테크노 실측, 2026-07-21)
+        ("ll.비유동부채", "비유동부채"),  # 소문자 ll을 로마숫자 II 대신 사용
+        ("Vl.기말의현금", "기말의현금"),  # 소문자 l을 VI의 두번째 글자로 사용
+        ("Ι.유동부채", "유동부채"),  # 그리스 대문자 이오타(U+0399)를 라틴 I 대신 사용
+        ("XⅠ.당기순이익(손실)", "당기순이익(손실)"),  # 아스키 X + 유니코드 로마숫자 Ⅰ(U+2160) 혼용
+        ("XII.당기순손실", "당기순손실"),  # X(10)를 넘는 항목 번호(오타 없음)
+        ("Ⅳ.판매비와관리\n비", "판매비와관리비"),  # 셀 내 줄바꿈이 단어 중간에 낀 표기
+        ("영업활동으로 인한 현금흐름(I)", "영업활동으로인한현금흐름"),  # "+" 없이 항목번호만 괄호 병기
     ],
 )
 def test_normalize_account_label(label, expected):
     assert normalize_account_label(label) == expected
+
+
+@pytest.mark.parametrize(
+    "label, field",
+    [
+        ("Ⅲ.매출총이익(총손실)", "gross_profit"),
+        ("매출총손실(이익)", "gross_profit"),
+        ("V.영업이익(영업손실)", "operating_income"),
+        ("Ⅴ.영업손실(이익)", "operating_income"),
+        ("Ⅹ.당기순이익(순손실)", "net_income"),
+        ("X.당기순손실(이익)", "net_income"),
+    ],
+)
+def test_account_name_aliases_cover_reversed_order_combined_labels(label, field):
+    """손실/이익 어느 쪽을 앞에 적는지 회사마다 다른 조합형 라벨도 매핑돼야
+    한다(2026-07-21, 로컬 캐시 4,922건 전수 스캔으로 발견)."""
+    assert ACCOUNT_NAME_ALIASES[normalize_account_label(label)] == field
+
+
+def test_normalize_account_label_does_not_map_net_income_attribution_line():
+    """"당기순이익(손실)의 귀속"은 연결재무제표에서 지배기업/비지배지분 귀속분을
+    나누는 별도 분석 행이라 net_income 요약 행과 다르다 — 매핑되면 안 된다."""
+    norm = normalize_account_label("XI. 당기순이익(손실)의 귀속")
+    assert norm not in ACCOUNT_NAME_ALIASES
 
 
 def test_account_name_aliases_cover_combined_loss_labels():
@@ -387,6 +421,75 @@ def test_parse_xml_financials_recovers_euckr_encoded_document():
     assert parsed.values_cur["total_equity"] == -5_415_433_951  # 자본잠식(음수)
     assert parsed.values_cur["operating_income"] == -6_308_961_098  # 영업손실
     assert parsed.values_cur["net_income"] == -7_040_301_441  # 당기순손실
+
+
+@pytest.mark.parametrize(
+    "rcept_no, current_assets, noncurrent_assets, total_assets",
+    [
+        # "Ⅱ . 비유동자산"(로마숫자-마침표 사이 공백) — 이전에는 alias 조회가
+        # 실패해 noncurrent_assets 전체가 None으로 누락되고 parse_status=PARTIAL로
+        # 잘못 판정됐다(2026-07-21 사용자 지적으로 프로덕션 DB 역추적 발견).
+        ("20260402000767", 3_094_933_423, 11_690_924_003, 14_785_857_426),
+        # "∥.비유동자산"(U+2225로 Ⅱ 오표기) — 같은 종류의 누락, 다른 원인.
+        ("20260408003380", 16_812_778_721, 272_745_550, 17_085_524_271),
+    ],
+)
+def test_parse_xml_financials_recovers_noncurrent_assets_prefix_variants(
+    rcept_no, current_assets, noncurrent_assets, total_assets
+):
+    raw = _read_fixture(rcept_no)
+    parsed = parse_xml_financials(raw)
+
+    assert parsed.parse_status == "OK"
+    assert parsed.values_cur["current_assets"] == current_assets
+    assert parsed.values_cur["noncurrent_assets"] == noncurrent_assets
+    assert parsed.values_cur["total_assets"] == total_assets
+    assert parsed.values_cur["current_assets"] + parsed.values_cur["noncurrent_assets"] == total_assets
+
+
+def test_parse_xml_financials_recovers_lowercase_roman_numeral_lookalikes():
+    """"l."/"ll."/"lll."/"Vl." 등 소문자 l을 로마숫자로 잘못 쓴 원문(제이엠테크노)이
+    BS/IS/CF 전 구간에서 복구되는지 확인한다 — 사용자가 "현금흐름표도 마찬가지
+    아니냐"고 지적해 로컬 문서 캐시 4,922건을 전수 스캔하며 발견(2026-07-21).
+    """
+    raw = _read_fixture("20230405001652")
+    parsed = parse_xml_financials(raw)
+
+    assert parsed.parse_status == "OK"
+    assert parsed.values_cur["current_assets"] == 23_173_972_906
+    assert parsed.values_cur["noncurrent_assets"] == 1_218_308_915
+    assert parsed.values_cur["current_liab"] == 7_082_665_499
+    assert parsed.values_cur["noncurrent_liab"] == 150_000_000
+    assert parsed.values_cur["revenue"] == 17_897_652_129
+    assert parsed.values_cur["cf_operating"] == -5_999_840_718.0
+    assert parsed.values_cur["cf_investing"] == 8_995_230_124.0
+    assert parsed.values_cur["cf_ending_cash"] == 148_899_665.0
+
+
+def test_parse_xml_financials_recovers_xii_prefix_net_income():
+    """"XII.당기순손실"(오타 없이 항목이 11~12번째까지 있는 손익계산서)이
+    복구되는지 확인한다 — 기존 _PREFIX_RE의 아스키 로마숫자 목록이 X(10)까지만
+    있어 XI/XII는 애초에 접두어 제거 대상이 아니었다(2026-07-21).
+    """
+    raw = _read_fixture("20220406002584")
+    parsed = parse_xml_financials(raw)
+
+    assert parsed.parse_status == "OK"
+    assert parsed.values_cur["net_income"] == -493_762_268
+
+
+def test_parse_xml_financials_recovers_cf_item_reference_suffix():
+    """현금흐름표 항목이 "영업활동으로 인한 현금흐름(I)"처럼 "+" 없이 항목번호만
+    괄호로 병기하는 서식(한미프랜트)이 복구되는지 확인한다 — 기존
+    _FORMULA_SUFFIX_RE는 "+"를 요구해 이 단순 참조 표기를 못 벗겼다(2026-07-21).
+    """
+    raw = _read_fixture("20230327000686")
+    parsed = parse_xml_financials(raw)
+
+    assert parsed.parse_status == "OK"
+    assert parsed.values_cur["cf_operating"] == 2_911_566_054
+    assert parsed.values_cur["cf_investing"] == -2_346_232_906
+    assert parsed.values_cur["cf_financing"] == 493_727_628
 
 
 def test_parse_xml_financials_invalid_xml_returns_failed():

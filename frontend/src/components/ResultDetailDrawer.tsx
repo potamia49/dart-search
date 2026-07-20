@@ -39,10 +39,12 @@ const DART_ORIGINAL_DOC_BASE = 'https://dart.fss.or.kr/dsaf001/main.do?rcpNo='
 
 /** 세부계정 상세를 펼칠 수 있는 항목인지 — 현금흐름표(영업/투자/재무활동)도
  * 재무상태표·손익계산서와 동일한 ALEVEL 계층 구조라 펼칠 수 있다(2026-07-20).
- * "기말의현금"처럼 그 자체가 총계인 항목은 펼쳐도 세부 내역이 없다는 안내만
- * 나온다(자산총계 등과 동일한 패턴 — canExpand로는 구분하지 않는다). */
-function canExpand(): boolean {
-  return true
+ * "자산총계"/"매출총이익"/"영업이익"/"당기순이익"/"기말의현금"처럼 그 자체가
+ * 합계·최종값이라 원문 구조상 하위 항목이 있을 수 없는 항목은 펼치기 버튼 자체를
+ * 숨긴다(fixtures 20건 실측 — 이 항목들은 children이 0건이었다, 2026-07-21).
+ * 판정은 resultColumns.ts의 FinancialItem.expandable에 항목별로 명시한다. */
+function canExpand(item: FinancialItem): boolean {
+  return item.expandable !== false
 }
 
 /** 연도 간 계정 매칭 키 — 각주 번호("(주석3)")나 항목 번호("1.")는 연도마다
@@ -314,7 +316,7 @@ function FinancialHistorySection({
               </Table.Tr>
               {group.items.map((item) => {
                 const field = item.snapKey as string
-                const expandable = canExpand()
+                const expandable = canExpand(item)
                 const isOpen = expanded.has(field)
                 const childRows = isOpen ? buildHistoryChildRows(field, history, byRcept) : []
                 return (

@@ -23,6 +23,10 @@ export interface FinancialItem {
   prvKey: keyof ResultResponse
   snapKey: keyof FinancialSnapshotResponse
   format: (value: unknown) => string
+  /** 세부계정 펼치기 가능 여부. 생략하면 true(기본은 펼침 가능) — 원문 구조상
+   * 그 자체가 합계/최종값이라 하위 항목이 있을 수 없는 항목만 false로 명시한다
+   * (실측: fixtures 20건 전부에서 이 항목들의 children이 0건이었다, 2026-07-21). */
+  expandable?: boolean
 }
 
 /** 재무제표 구분별 항목 묶음. */
@@ -79,11 +83,11 @@ export const FINANCIAL_GROUPS: FinancialGroup[] = [
     items: [
       { label: '유동자산', curKey: 'current_assets_cur', prvKey: 'current_assets_prv', snapKey: 'current_assets', format: formatNumber },
       { label: '비유동자산', curKey: 'noncurrent_assets_cur', prvKey: 'noncurrent_assets_prv', snapKey: 'noncurrent_assets', format: formatNumber },
-      { label: '자산총계', curKey: 'total_assets_cur', prvKey: 'total_assets_prv', snapKey: 'total_assets', format: formatNumber },
+      { label: '자산총계', curKey: 'total_assets_cur', prvKey: 'total_assets_prv', snapKey: 'total_assets', format: formatNumber, expandable: false },
       { label: '유동부채', curKey: 'current_liab_cur', prvKey: 'current_liab_prv', snapKey: 'current_liab', format: formatNumber },
       { label: '비유동부채', curKey: 'noncurrent_liab_cur', prvKey: 'noncurrent_liab_prv', snapKey: 'noncurrent_liab', format: formatNumber },
-      { label: '부채총계', curKey: 'total_liab_cur', prvKey: 'total_liab_prv', snapKey: 'total_liab', format: formatNumber },
-      { label: '자본총계', curKey: 'total_equity_cur', prvKey: 'total_equity_prv', snapKey: 'total_equity', format: formatNumber },
+      { label: '부채총계', curKey: 'total_liab_cur', prvKey: 'total_liab_prv', snapKey: 'total_liab', format: formatNumber, expandable: false },
+      { label: '자본총계', curKey: 'total_equity_cur', prvKey: 'total_equity_prv', snapKey: 'total_equity', format: formatNumber, expandable: false },
     ],
   },
   {
@@ -92,10 +96,10 @@ export const FINANCIAL_GROUPS: FinancialGroup[] = [
     items: [
       { label: '매출액', curKey: 'revenue_cur', prvKey: 'revenue_prv', snapKey: 'revenue', format: formatNumber },
       { label: '매출원가', curKey: 'cogs_cur', prvKey: 'cogs_prv', snapKey: 'cogs', format: formatNumber },
-      { label: '매출총이익', curKey: 'gross_profit_cur', prvKey: 'gross_profit_prv', snapKey: 'gross_profit', format: formatNumber },
+      { label: '매출총이익', curKey: 'gross_profit_cur', prvKey: 'gross_profit_prv', snapKey: 'gross_profit', format: formatNumber, expandable: false },
       { label: '판매비와관리비', curKey: 'sga_cur', prvKey: 'sga_prv', snapKey: 'sga', format: formatNumber },
-      { label: '영업이익', curKey: 'operating_income_cur', prvKey: 'operating_income_prv', snapKey: 'operating_income', format: formatNumber },
-      { label: '당기순이익', curKey: 'net_income_cur', prvKey: 'net_income_prv', snapKey: 'net_income', format: formatNumber },
+      { label: '영업이익', curKey: 'operating_income_cur', prvKey: 'operating_income_prv', snapKey: 'operating_income', format: formatNumber, expandable: false },
+      { label: '당기순이익', curKey: 'net_income_cur', prvKey: 'net_income_prv', snapKey: 'net_income', format: formatNumber, expandable: false },
     ],
   },
   {
@@ -106,7 +110,7 @@ export const FINANCIAL_GROUPS: FinancialGroup[] = [
       { label: '영업활동현금흐름', curKey: 'cf_operating_cur', prvKey: 'cf_operating_prv', snapKey: 'cf_operating', format: formatNumber },
       { label: '투자활동현금흐름', curKey: 'cf_investing_cur', prvKey: 'cf_investing_prv', snapKey: 'cf_investing', format: formatNumber },
       { label: '재무활동현금흐름', curKey: 'cf_financing_cur', prvKey: 'cf_financing_prv', snapKey: 'cf_financing', format: formatNumber },
-      { label: '기말의현금', curKey: 'cf_ending_cash_cur', prvKey: 'cf_ending_cash_prv', snapKey: 'cf_ending_cash', format: formatNumber },
+      { label: '기말의현금', curKey: 'cf_ending_cash_cur', prvKey: 'cf_ending_cash_prv', snapKey: 'cf_ending_cash', format: formatNumber, expandable: false },
     ],
   },
 ]
