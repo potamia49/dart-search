@@ -538,3 +538,32 @@ async def test_reconcile_falls_back_to_company_json_when_jurir_no_unknown(db_ses
     assert row.induty_code == "29119"
     assert row.induty_name is None
     assert row.ceo_name == "부산대표"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_marks_pending_resolved_only_on_full_pass(db_session_factory):
+    """교정이 밀렸는지를 화면이 알 수 있어야 한다 — 수동 2단계를 잊게 만든 그 갭.
+
+    `max_groups`를 지정한 파일럿은 일부만 손대므로 완료로 표시하면 남은 위험
+    그룹이 조용히 묻힌다 — 전체를 돌았을 때만 pending이 풀려야 한다.
+    """
+    from app.core.dart_corp_index import get_dart_index_status
+
+    with db_session_factory() as db:
+        _seed_pair(db)
+
+    assert get_dart_index_status(db_session_factory)["reconcile_pending"] is True
+
+    client = _FakeCompanyClient(
+        {
+            "01179565": {"jurir_no": "1955110200281", "adres": "경상남도 김해시 ..."},
+            "00929714": {"jurir_no": "2062110003835", "adres": "전라남도 여수시 ..."},
+        }
+    )
+    await reconcile_ambiguous_rows(client, db_session_factory, max_groups=1)
+    assert get_dart_index_status(db_session_factory)["reconcile_pending"] is True
+
+    await reconcile_ambiguous_rows(client, db_session_factory)
+    status = get_dart_index_status(db_session_factory)
+    assert status["reconcile_pending"] is False
+    assert status["last_reconciled_at"] is not None

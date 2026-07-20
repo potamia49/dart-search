@@ -1306,13 +1306,35 @@ API를 0건 호출하는 로컬 쿼리 단계가 됐다**는 것이다:
   #16/#17/#19(Phase 1 후보 목록)와 #22/#24다.
 - **`pytest tests/ -q` 247 passed**(기존 243 + 신규 4: 그룹 판별/순열 교정/멱등성/
   jurir_no 미매칭 폴백).
-- **⚠ 전수 재크롤 시 주의**: `crawl_dart_corp_index()`는 이 교정을 자동 수행하지 않는다
-  (DART 쿼터를 쓰기 때문에 분리했다). 인덱스를 다시 만들면
-  `POST /api/meta/dart-index/reconcile`을 **반드시 이어서 호출**할 것.
 - **다음 세션에서 판단할 것**: (a) 실전 Job을 더 완주시켜 `fsc_corp_index` 삭제 조건
   ("실전 3건 이상 + 오매칭 0 유지")을 채울지, (b) 다른 시군구로도 오매칭 0이 유지되는지
-  표본 확인할지, (c) `reconcile`을 크롤 완료 시 자동으로 잇는 배치를 만들지(현재는
-  수동 2단계라 잊기 쉽다 — 실제로 이번 버그도 "크롤만 하면 끝"이라는 전제에서 나왔다).
+  표본 확인할지. (c) reconcile 자동화는 아래에서 완료했다.
+
+**크롤 → 동명 회사 교정 자동 연결 완료(2026-07-20, 위 (c)).** "재크롤 시
+`reconcile`을 반드시 이어서 호출할 것"을 사람이 기억해야 하는 수동 2단계로 둔 것
+자체가 위험이었다 — 이번 버그도 "크롤만 하면 끝"이라는 전제에서 나왔다.
+- `POST /api/meta/dart-index/refresh`가 크롤 완료(`completed=True`) 시
+  `_run_reconcile_after_crawl()`(`app/api/meta.py`)로 교정을 이어서 실행한다.
+  요청 필드 `reconcile`(기본 `true`)로 끌 수 있다 — 쿼터를 아껴야 할 때만.
+  **코어 함수는 여전히 분리돼 있다**(쿼터를 쓰는 것과 안 쓰는 것을 섞지 않는다).
+- **교정 실패는 `_run_reconcile_after_crawl()` 안에서 전부 흡수한다** — 크롤은 이미
+  성공했는데 예외가 바깥 감독 루프까지 올라가면 23분짜리 크롤을 통째로 재시도한다.
+- **중단돼도 조용히 묻히지 않는다**: `cache_meta.dart_index_reconciled_at`을 남기고
+  (`reconcile_ambiguous_rows()`가 **전체를 돌았을 때만** 기록 — `max_groups` 파일럿은
+  일부만 손대므로 완료로 표시하면 남은 위험 그룹이 묻힌다),
+  `GET /api/meta/dart-index/status`가 `last_reconciled_at`/`reconcile_pending`을
+  노출하며, `IndexStatusNote`가 노란 경고("동명 회사 교정이 아직 완료되지 않았습니다 —
+  해당 지역 회사가 후보에서 빠질 수 있습니다")로 재실행을 유도한다.
+- 수동 `POST /api/meta/dart-index/reconcile`은 그대로 남는다(교정만 다시 돌리는 경로).
+- **로컬 DB에 `dart_index_reconciled_at`을 소급 기입했다** — 실제 교정은 오늘 이미
+  마쳤는데(Job #24가 오매칭 0으로 검증) 기록이 없어 잘못된 경고가 뜨는 상태였다.
+  정확한 완료 시각을 알 수 없어 검증이 끝난 시점(Job #24 생성 시각 21:06:20)을 썼다.
+- `pytest tests/ -q` **248 passed**(기존 247 + 신규 1: 전체 통과에서만 pending이 풀리는지),
+  `npm run build`/`npm run lint` 통과. 백엔드 재기동(RUNNING Job 없음 확인, 또 중복
+  기동돼 있던 uvicorn 2개를 정리하고 venv 것 1개만 기동) 후 실제 응답으로
+  `reconcile_pending=false`·`last_reconciled_at` 확인. **Playwright 브라우저 스모크는
+  생략했다** — 프론트 변경이 상태 문구 1줄 + 경고 분기 1개이고 API 응답을 실데이터로
+  직접 확인했다.
 
 작업을 시작하기 전에 반드시 아래 두 문서를 먼저 읽으세요 —
 이 저장소의 유일한 진실 소스(source of truth)입니다.

@@ -188,6 +188,11 @@ export interface DartIndexStatus {
   last_completed_at: string | null
   crawl_in_progress: boolean
   checkpoint_industry: string | null
+  /** 마지막으로 동명 회사 교정을 전부 마친 시각. 크롤은 이 교정을 자동으로
+   * 이어서 실행하지만, 쿼터 소진 등으로 중단되면 아래 플래그가 남는다. */
+  last_reconciled_at: string | null
+  /** 크롤 이후 교정이 밀려 있음 — 동명 회사의 주소·업종이 교차돼 있을 수 있다. */
+  reconcile_pending: boolean
 }
 
 /** GET /api/meta/fsc-financial/status (M8 2단계) — 매출액/총자산 **참고값**

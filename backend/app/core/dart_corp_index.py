@@ -87,6 +87,9 @@ LISTED_CORP_CLS = ("유가증권시장", "코스닥시장", "코넥스시장")
 
 _META_KEY_LAST_INDUSTRY = "dart_index_last_industry"
 _META_KEY_UPDATED_AT = "dart_index_updated_at"
+# 마지막으로 **전체** 동명 그룹 교정을 마친 시각. 크롤 완료 시각보다 오래됐거나
+# 없으면 교정이 밀린 상태다 — `get_dart_index_status()`가 이를 드러낸다.
+_META_KEY_RECONCILED_AT = "dart_index_reconciled_at"
 
 # 엑셀 14열 고정 순서 (§4-10-A). 헤더 문자열 대신 위치로 읽되, 열 수로 검증한다.
 _EXCEL_COLUMNS = (
@@ -592,6 +595,13 @@ async def reconcile_ambiguous_rows(
                     stats["fallback"] += 1
             db.commit()
         stats["groups"] += 1
+
+    if max_groups is None:
+        # 전체를 돌았을 때만 "교정 완료"로 기록한다 — 파일럿(`max_groups`)은
+        # 일부만 손대므로 완료로 표시하면 남은 위험 그룹이 조용히 묻힌다.
+        with session_factory() as db:
+            _set_meta(db, _META_KEY_RECONCILED_AT, datetime.now().isoformat(timespec="seconds"))
+            db.commit()
     return stats
 
 
@@ -833,15 +843,23 @@ def is_dart_index_stale(
 def get_dart_index_status(
     session_factory: sessionmaker[Session] | None = None,
 ) -> dict[str, Any]:
-    """행 수 / 마지막 완료 시각 / 진행 중 여부."""
+    """행 수 / 마지막 완료 시각 / 진행 중 여부 / 동명 그룹 교정이 밀렸는지."""
     factory = session_factory or get_session_factory()
     with factory() as db:
         row_count = db.execute(select(func.count(DartCorpIndex.corp_code))).scalar_one()
         updated_at = _get_meta(db, _META_KEY_UPDATED_AT) or None
         checkpoint = _get_meta(db, _META_KEY_LAST_INDUSTRY) or None
+        reconciled_at = _get_meta(db, _META_KEY_RECONCILED_AT) or None
     return {
         "row_count": row_count,
         "last_completed_at": updated_at,
         "crawl_in_progress": updated_at is None and checkpoint is not None,
         "checkpoint_industry": checkpoint,
+        "last_reconciled_at": reconciled_at,
+        # 크롤은 끝났는데 그 뒤로 교정을 한 적이 없으면 동명 회사의 주소/업종이
+        # 교차된 채 남아 있을 수 있다(M8 6단계 실측: 위험군 불일치 42.5%).
+        # 교정은 크롤 완료 후 자동으로 이어지지만, 쿼터 소진 등으로 중단되면
+        # 이 플래그가 남아 화면에서 재실행을 유도한다.
+        "reconcile_pending": bool(row_count)
+        and (reconciled_at is None or (updated_at is not None and reconciled_at < updated_at)),
     }

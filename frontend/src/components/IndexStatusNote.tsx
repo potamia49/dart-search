@@ -60,10 +60,25 @@ function DartIndexLine({ status }: { status: DartIndexStatus }) {
     )
   }
 
+  if (status.reconcile_pending) {
+    // 크롤은 끝났지만 동명 회사 교정이 밀린 상태. 이 경우 같은 이름의 회사끼리
+    // 주소·업종이 교차돼 있을 수 있어(M8 6단계 실측: 위험군 42.5% 불일치)
+    // 실제로 그 지역 회사가 후보에서 조용히 빠진다 — 검색 전에 알려야 한다.
+    return (
+      <Alert color="yellow" variant="light">
+        DART 기업개황 인덱스: {status.row_count.toLocaleString()}개사 (마지막 갱신{' '}
+        {formatDate(status.last_completed_at)}) — 동명 회사 교정이 아직 완료되지 않았습니다.
+        같은 이름의 회사끼리 주소·업종이 뒤바뀐 채 남아 있을 수 있어, 해당 지역 회사가 후보에서
+        빠질 수 있습니다. 관리자가 "동명 회사 교정"을 실행해야 합니다.
+      </Alert>
+    )
+  }
+
   return (
     <Text size="sm" c="dimmed">
       DART 기업개황 인덱스: {status.row_count.toLocaleString()}개사 (마지막 갱신{' '}
-      {formatDate(status.last_completed_at)})
+      {formatDate(status.last_completed_at)} · 동명 회사 교정{' '}
+      {formatDate(status.last_reconciled_at)})
     </Text>
   )
 }

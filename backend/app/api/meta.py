@@ -248,6 +248,10 @@ class DartIndexRefreshRequest(BaseModel):
 
     max_industries: int | None = None
     force: bool = False
+    # 크롤이 끝나면 동명 그룹 교정을 이어서 자동 실행한다. 둘을 따로 호출하는
+    # 수동 2단계는 잊기 쉬웠고, 실제로 M8 6단계 버그가 "크롤만 하면 끝"이라는
+    # 전제에서 나왔다. DART 쿼터를 아껴야 하는 상황에서만 False로 끈다.
+    reconcile: bool = True
 
 
 class DartIndexRefreshResponse(BaseModel):
@@ -261,6 +265,22 @@ class DartIndexRefreshResponse(BaseModel):
 # 전체가 약 23분이라 A1(100회)보다 적게 잡는다.
 _DART_CRAWL_OUTER_RETRIES = 20
 _DART_CRAWL_OUTER_BACKOFF_SEC = 30
+
+
+async def _run_reconcile_after_crawl() -> None:
+    """크롤 완료 직후 이어 붙이는 동명 그룹 교정.
+
+    **예외를 여기서 반드시 흡수한다** — 크롤 자체는 이미 성공했으므로, 교정이
+    실패했다고 바깥 감독 루프가 23분짜리 크롤을 통째로 재시도하면 안 된다.
+    교정이 못 끝나도 `get_dart_index_status()`의 `reconcile_pending`이 남아
+    화면이 재실행을 유도한다(교정은 멱등이라 다시 호출하면 이어서 진행된다).
+    """
+    try:
+        async with DartClient() as client:
+            stats = await reconcile_ambiguous_rows(client, get_session_factory())
+        logger.info("크롤 후 동명 그룹 교정 완료: %s", stats)
+    except Exception:  # noqa: BLE001 - 쿼터 소진 포함, 크롤 재시도로 번지면 안 된다
+        logger.exception("크롤 후 동명 그룹 교정 실패 — reconcile_pending 상태로 남는다")
 
 
 @router.post("/dart-index/refresh", response_model=DartIndexRefreshResponse)
@@ -289,6 +309,8 @@ async def refresh_dart_index(
                     force=payload.force if attempt == 1 else False,
                 )
                 logger.info("dart_corp_index 갱신 완료: %s", result)
+                if payload.reconcile and result.get("completed"):
+                    await _run_reconcile_after_crawl()
                 return
             except Exception:  # noqa: BLE001 - 백그라운드 작업은 여기서 반드시 흡수해야 한다
                 logger.exception(
@@ -328,7 +350,10 @@ async def reconcile_dart_index(
     발견). 전수 재크롤 대신 위험 그룹(전체의 3.69%)만 DART 정본으로 되돌린다.
 
     크롤과 달리 **DART 일일 호출 한도를 소모**하므로(그룹 구성원 1건당
-    company.json 1회) 크롤 완료 후 별도로 호출하는 단계로 분리했다.
+    company.json 1회) 코어 함수는 크롤과 분리돼 있다. 다만 `dart-index/refresh`가
+    크롤 완료 시 이 로직을 자동으로 이어서 실행하므로(`reconcile=false`로 끌 수
+    있다), 이 엔드포인트는 **교정만 다시 돌리고 싶을 때**(쿼터 소진으로 중단돼
+    `reconcile_pending`이 남은 경우 등) 쓰는 수동 경로다.
     """
     with get_session_factory()() as db:
         groups = find_ambiguous_corp_codes(db)
@@ -363,6 +388,8 @@ class DartIndexStatusResponse(BaseModel):
     last_completed_at: str | None
     crawl_in_progress: bool
     checkpoint_industry: str | None
+    last_reconciled_at: str | None
+    reconcile_pending: bool
 
 
 @router.get("/dart-index/status", response_model=DartIndexStatusResponse)
