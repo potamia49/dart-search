@@ -12,11 +12,16 @@ import {
 } from '@mantine/core'
 import { notifications } from '@mantine/notifications'
 import { cancelJob, deleteJob, listJobs, resumeJob, retryFailedJob } from '../api/jobs'
-import { getFscIndexStatus, getQuota } from '../api/meta'
-import type { FscIndexStatus, JobResponse, QuotaResponse } from '../types'
+import { getDartIndexStatus, getFscFinancialStatus, getQuota } from '../api/meta'
+import type {
+  DartIndexStatus,
+  FscFinancialStatus,
+  JobResponse,
+  QuotaResponse,
+} from '../types'
 import JobStatusBadge from '../components/JobStatusBadge'
 import JobPhaseBadge from '../components/JobPhaseBadge'
-import FscIndexStatusNote from '../components/FscIndexStatusNote'
+import IndexStatusNote from '../components/IndexStatusNote'
 import { summarizeJobConditions } from '../util/jobSummary'
 
 const POLL_INTERVAL_MS = 2000
@@ -25,20 +30,23 @@ export default function JobsPage() {
   const navigate = useNavigate()
   const [jobs, setJobs] = useState<JobResponse[]>([])
   const [quota, setQuota] = useState<QuotaResponse | null>(null)
-  const [fscIndexStatus, setFscIndexStatus] = useState<FscIndexStatus | null>(null)
+  const [dartIndexStatus, setDartIndexStatus] = useState<DartIndexStatus | null>(null)
+  const [financialStatStatus, setFinancialStatStatus] = useState<FscFinancialStatus | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
   const intervalRef = useRef<number | null>(null)
 
   const refresh = useCallback(async () => {
     try {
-      const [jobsData, quotaData, fscIndexData] = await Promise.all([
+      const [jobsData, quotaData, dartIndexData, financialStatData] = await Promise.all([
         listJobs(),
         getQuota(),
-        getFscIndexStatus(),
+        getDartIndexStatus(),
+        getFscFinancialStatus(),
       ])
       setJobs(jobsData)
       setQuota(quotaData)
-      setFscIndexStatus(fscIndexData)
+      setDartIndexStatus(dartIndexData)
+      setFinancialStatStatus(financialStatData)
       setLoadError(null)
     } catch {
       setLoadError('작업 목록을 불러오지 못했습니다. 백엔드 서버가 실행 중인지 확인하세요.')
@@ -121,7 +129,7 @@ export default function JobsPage() {
         )}
       </Group>
 
-      <FscIndexStatusNote status={fscIndexStatus} />
+      <IndexStatusNote dartIndex={dartIndexStatus} financialStat={financialStatStatus} />
 
       {loadError && <Alert color="red">{loadError}</Alert>}
 

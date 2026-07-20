@@ -78,23 +78,28 @@ async def get_regions() -> list[RegionEntry]:
     return [RegionEntry(sido=sido, sigungu=sigungu) for sido, sigungu in REGIONS.items()]
 
 
-class IndustryChild(BaseModel):
-    code: str
-    name: str
-
-
 class IndustryEntry(BaseModel):
+    """업종 트리 노드 — 대분류/중분류/소분류가 같은 모양이라 재귀로 정의한다.
+
+    `children`이 없는 노드(소분류)는 빈 리스트로 나간다 — 프론트가 레벨별로
+    다른 타입을 다루지 않아도 되도록 모양을 통일한다.
+    """
+
     code: str
     name: str
-    children: list[IndustryChild]
+    children: list[IndustryEntry] = []
 
 
 @router.get("/industries", response_model=list[IndustryEntry])
 async def get_industries() -> list[IndustryEntry]:
-    """KSIC 10차 대/중분류 트리. `app/core/industry_data.py`의 정적 데이터를 그대로 반환한다.
+    """KSIC 10차 대/중/소분류 트리. `app/core/industry_data.py`를 그대로 반환한다.
 
-    중분류 `code`는 DART `induty_code` 체계와 동일한 2자리 코드이며,
+    중분류(2자리)/소분류(3자리) `code`는 DART `induty_code` 체계와 동일하며,
     `app/core/filters.py::industry_matches()`가 prefix 매칭에 그대로 사용한다.
+    대분류만 알파벳(A~U)이라 `_expand_industry_prefixes()`가 소속 중분류로 펼친다.
+
+    M8 5단계에서 소분류 한 층이 추가됐다(21/77/234) — 세분류·세세분류는
+    누락률이 20.9%/41.3%라 **의도적으로 노출하지 않는다**(`industry_data.py` 참고).
     """
     return [IndustryEntry.model_validate(entry) for entry in INDUSTRIES]
 

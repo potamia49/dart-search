@@ -278,10 +278,23 @@ def get_financial_stat_status(
     with factory() as db:
         row_count = db.execute(select(func.count()).select_from(FscFinancialStat)).scalar_one()
         updated_at = _get_meta(db, _META_KEY_UPDATED_AT) or None
-        years = _get_meta(db, _META_KEY_YEARS) or None
+        # `_META_KEY_YEARS`(마지막 크롤이 요청한 연도)가 아니라 **테이블에 실제로
+        # 들어 있는 연도**를 센다. 한 해만 보강 크롤하면 메타에는 그 한 해만 남아
+        # 실제로는 4개년이 적재돼 있는데 화면에는 "2023년 기준"으로만 보였다
+        # (M8 5단계에서 이 값을 화면에 노출하며 발견). 사용자가 알고 싶은 것은
+        # 어떤 연도의 참고값을 볼 수 있느냐이지 마지막 크롤 인자가 아니다.
+        years = [
+            str(year)
+            for (year,) in db.execute(
+                select(FscFinancialStat.biz_year)
+                .distinct()
+                .order_by(FscFinancialStat.biz_year)
+            ).all()
+            if year
+        ]
     return {
         "row_count": row_count,
         "last_completed_at": updated_at,
-        "years": years.split(",") if years else [],
+        "years": years,
         "crawl_in_progress": updated_at is None and row_count > 0,
     }

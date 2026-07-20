@@ -35,8 +35,15 @@ interface CandidatesViewProps {
 /** phase='CANDIDATES' Job의 결과 화면 — §4-7-1/§7-3 "후보 목록" 뷰.
  *
  * 아직 원문을 열어보지 않았으므로 재무 13항목/parse_status는 의미가 없다 —
- * A3 스크리닝 추정치(매출액/총자산)만 "추정" 라벨과 함께 강조 표시하고,
  * 화면 상단에 "재무정보 수집 시작" 버튼 + 수집기간 선택을 배치한다.
+ *
+ * **M8 5단계에서 매출액/총자산 표시의 의미가 바뀌었다.** 예전에는 A3(금융위
+ * 건별 스크리닝)의 "추정치"였고 그 값으로 후보를 실제로 걸러내기까지 했다.
+ * 지금은 A3가 폐기돼(§4-10-C: 1년 묵은 값으로 거르면 조건에 맞는 회사의
+ * 25.3%를 조용히 놓친다) **어떤 후보도 이 값으로 제외되지 않는다** — 순수한
+ * 참고 표시(`ref_revenue`/`ref_total_assets`)이며, 회사마다 확보된 회계연도가
+ * 달라 `ref_fin_year`를 반드시 함께 보여준다. 매출액/총자산 조건 판정은
+ * Phase 2가 DART 원문을 파싱한 뒤 한 곳(B4)에서만 일어난다.
  */
 export default function CandidatesView({ job }: CandidatesViewProps) {
   const navigate = useNavigate()
@@ -97,11 +104,13 @@ export default function CandidatesView({ job }: CandidatesViewProps) {
 
   return (
     <Stack>
-      <Alert color="blue" title="후보 확정 결과 (Phase 1)">
-        아직 감사보고서 원문을 파싱하지 않았습니다. 아래 표의 모든 항목(전화번호/대표자
-        포함)은 공공데이터(금융위 기업기본정보·기업재무정보) 기준 <b>확정 전 값</b>이며,
-        DART 원문과 다를 수 있습니다 — 재무 13항목 전체와 parse_status, 확정된 값은
-        재무정보 수집(Phase 2) 완료 후에 채워집니다.
+      <Alert color="blue" title="후보 확정 결과 (1단계)">
+        회사명·주소·대표자·업종은 <b>DART 기업개황</b> 기준입니다. 매출액·총자산은
+        금융위 요약재무 <b>참고값</b>일 뿐이며 — 회사마다 기준연도가 다르고 최신
+        결산이 아직 반영되지 않았을 수 있습니다 — <b>이 값으로 후보를 제외하지
+        않습니다.</b> 입력하신 매출액·총자산 조건은 재무정보 수집(2단계)에서
+        감사보고서 원문을 파싱한 뒤에 판정합니다. 재무 13항목과 파싱 상태도 그때
+        채워집니다.
       </Alert>
 
       {!canStart && (
@@ -119,9 +128,11 @@ export default function CandidatesView({ job }: CandidatesViewProps) {
             </Title>
             <Text size="sm" c="dimmed" mb="xs">
               확정된 후보 회사에 대해 최근 N년치 재무정보(다년치 이력)를 DART 원문에서 수집합니다.
-              후보 수와 회사당 공시 건수에 따라 수 분~수십 분 이상 걸릴 수 있습니다 — 시작 후
-              작업 목록 화면에서 진행률을 확인하세요. 아래 표에서 "삭제" 버튼을 누른 회사는
-              수집 대상에서 제외됩니다("복원" 버튼으로 다시 취소할 수 있습니다).
+              후보 수와 회사당 공시 건수에 따라 수 분~수십 분 이상 걸릴 수 있고, DART 일일 호출
+              한도를 넘으면 자동으로 멈췄다가 다음 날 이어서 진행됩니다 — 위 참고값이 입력 조건에
+              가까운 회사부터 먼저 처리하므로 중간에 멈춰도 대상일 가능성이 높은 회사가 먼저
+              확보됩니다. 시작 후 작업 목록 화면에서 진행률을 확인하세요. 아래 표에서 "삭제"
+              버튼을 누른 회사는 수집 대상에서 제외됩니다("복원" 버튼으로 다시 취소할 수 있습니다).
             </Text>
             <SegmentedControl
               value={String(historyYears)}
@@ -160,11 +171,11 @@ export default function CandidatesView({ job }: CandidatesViewProps) {
                   <Table.Th>관리</Table.Th>
                   <Table.Th>회사명</Table.Th>
                   <Table.Th>주소</Table.Th>
-                  <Table.Th>업종 (참고용)</Table.Th>
-                  <Table.Th>전화번호 (미확정)</Table.Th>
-                  <Table.Th>대표자 (미확정)</Table.Th>
-                  <Table.Th>매출액 (추정)</Table.Th>
-                  <Table.Th>총자산 (추정)</Table.Th>
+                  <Table.Th>업종</Table.Th>
+                  <Table.Th>대표자</Table.Th>
+                  <Table.Th>매출액 (참고)</Table.Th>
+                  <Table.Th>총자산 (참고)</Table.Th>
+                  <Table.Th>참고값 기준연도</Table.Th>
                 </Table.Tr>
               </Table.Thead>
               <Table.Tbody>
@@ -199,10 +210,10 @@ export default function CandidatesView({ job }: CandidatesViewProps) {
                       </Table.Td>
                       <Table.Td>{row.address ?? '-'}</Table.Td>
                       <Table.Td>{row.induty_name ?? '-'}</Table.Td>
-                      <Table.Td>{row.phone ?? '-'}</Table.Td>
                       <Table.Td>{row.ceo_name ?? '-'}</Table.Td>
-                      <Table.Td>{formatNumber(row.revenue_cur)}</Table.Td>
-                      <Table.Td>{formatNumber(row.total_assets_cur)}</Table.Td>
+                      <Table.Td>{formatNumber(row.ref_revenue)}</Table.Td>
+                      <Table.Td>{formatNumber(row.ref_total_assets)}</Table.Td>
+                      <Table.Td>{row.ref_fin_year ? `${row.ref_fin_year}년` : '-'}</Table.Td>
                     </Table.Tr>
                   )
                 })}

@@ -16,10 +16,22 @@ import { useDebouncedValue } from '@mantine/hooks'
 import { notifications } from '@mantine/notifications'
 import RegionSelect from '../components/RegionSelect'
 import IndustryTreeSelect from '../components/IndustryTreeSelect'
-import FscIndexStatusNote from '../components/FscIndexStatusNote'
-import { getCandidatesPreview, getFscIndexStatus, getIndustries, getRegions } from '../api/meta'
+import IndexStatusNote from '../components/IndexStatusNote'
+import {
+  getCandidatesPreview,
+  getDartIndexStatus,
+  getFscFinancialStatus,
+  getIndustries,
+  getRegions,
+} from '../api/meta'
 import { createJob } from '../api/jobs'
-import type { CandidatesPreviewResponse, FscIndexStatus, IndustryMeta, RegionMeta } from '../types'
+import type {
+  CandidatesPreviewResponse,
+  DartIndexStatus,
+  FscFinancialStatus,
+  IndustryMeta,
+  RegionMeta,
+} from '../types'
 
 const EOK = 100_000_000 // 1억원 = 100,000,000원
 const MAX_EOK = 1_000_000 // 최대 미입력 시 기본 상한: 1,000,000억원(=100조원)
@@ -29,7 +41,8 @@ export default function SearchPage() {
 
   const [regions, setRegions] = useState<RegionMeta[]>([])
   const [industries, setIndustries] = useState<IndustryMeta[]>([])
-  const [fscIndexStatus, setFscIndexStatus] = useState<FscIndexStatus | null>(null)
+  const [dartIndexStatus, setDartIndexStatus] = useState<DartIndexStatus | null>(null)
+  const [financialStatStatus, setFinancialStatStatus] = useState<FscFinancialStatus | null>(null)
   const [metaError, setMetaError] = useState<string | null>(null)
 
   const [name, setName] = useState('')
@@ -63,24 +76,33 @@ export default function SearchPage() {
         if (!cancelled) setMetaError('지역/업종 목록을 불러오지 못했습니다. 백엔드 서버가 실행 중인지 확인하세요.')
       }
     }
-    async function loadFscIndexStatus() {
+    async function loadIndexStatus() {
+      // 두 인덱스 상태는 서로 독립적이라 따로 잡는다 — 한쪽이 실패해도 다른
+      // 쪽은 보여줘야 한다. 인덱스 상태는 참고 표시일 뿐이라 실패해도 검색 폼
+      // 자체는 그대로 쓸 수 있게 조용히 무시한다.
       try {
-        const data = await getFscIndexStatus()
-        if (!cancelled) setFscIndexStatus(data)
+        const data = await getDartIndexStatus()
+        if (!cancelled) setDartIndexStatus(data)
       } catch {
-        // FSC 인덱스 상태는 참고용 표시일 뿐이라 실패해도 검색 폼 자체는 그대로 쓸 수 있게 조용히 무시한다.
+        /* 무시 */
+      }
+      try {
+        const data = await getFscFinancialStatus()
+        if (!cancelled) setFinancialStatStatus(data)
+      } catch {
+        /* 무시 */
       }
     }
     loadMeta()
-    loadFscIndexStatus()
+    loadIndexStatus()
     return () => {
       cancelled = true
     }
   }, [])
 
-  // 시도를 고르기 전에는 지역 조건이 없어 fsc_corp_index 전체(약 63만 건)를
+  // 시도를 고르기 전에는 지역 조건이 없어 dart_corp_index 전체(약 12만 건)를
   // 훑게 되므로 호출하지 않는다 — sido가 있어야 백엔드가 SQL WHERE로 먼저
-  // 좁힌다(app/core/fsc_index.py::filter_local_candidates).
+  // 좁힌다(app/core/dart_corp_index.py::filter_local_candidates).
   useEffect(() => {
     if (debouncedSido.length === 0) {
       setPreview(null)
@@ -141,7 +163,7 @@ export default function SearchPage() {
           {metaError}
         </Alert>
       )}
-      <FscIndexStatusNote status={fscIndexStatus} />
+      <IndexStatusNote dartIndex={dartIndexStatus} financialStat={financialStatStatus} />
 
       <Paper withBorder p="md">
         <Stack>
@@ -172,6 +194,13 @@ export default function SearchPage() {
           <Title order={4} mb="sm">
             업종 (미선택 시 전체)
           </Title>
+          {/* M8 이전에는 중분류를 골라도 실제로는 대분류 전체가 통과했다
+              (금융위 업종 텍스트와 문자열 매칭했기 때문). DART가 부여한
+              업종코드로 바뀌어 이제 중분류·소분류가 그대로 정확히 걸린다. */}
+          <Text size="sm" c="dimmed" mb="xs">
+            대분류 → 중분류 → 소분류 순으로 좁힐 수 있습니다. 상위 분류를 고르면
+            그 아래 전부가 포함됩니다.
+          </Text>
           <IndustryTreeSelect
             industries={industries}
             selected={industryCodes}
@@ -229,12 +258,16 @@ export default function SearchPage() {
         </Paper>
       </SimpleGrid>
 
+      {/* 예상 규모 안내. 후보 확정(1단계) 자체는 로컬 DB 쿼리뿐이라 규모와
+          무관하게 즉시 끝난다 — 여기서 경고하는 것은 그 다음 단계인 재무정보
+          수집이 DART 일일 한도에 걸려 여러 날로 나뉠 수 있다는 점이다.
+          (M8 3단계 이전에는 이 경고가 data.go.kr 쿼터 기준이었다.) */}
       {preview && (
         <Alert color={preview.exceeds_daily_quota ? 'yellow' : 'blue'} variant="light">
           예상 후보 수: 약 {preview.candidate_count.toLocaleString()}개사
           {preview.exceeds_daily_quota
-            ? ` — data.go.kr 일일 조회 한도(약 ${preview.daily_quota_assumed.toLocaleString()}건)를 넘어 매출액·총자산 사전 확인이 약 ${preview.estimated_days}일에 걸쳐 나눠 진행될 수 있습니다. 최종 결과 정확도에는 영향이 없습니다(재무제표 원문으로 항상 다시 확인합니다).`
-            : ' — 하루 안에 매출액·총자산 사전 확인까지 끝낼 수 있는 규모입니다.'}
+            ? ` — 후보 확정(1단계)은 바로 끝나지만, 이어지는 재무정보 수집(2단계)은 DART 일일 호출 한도(하루 약 ${preview.daily_quota_assumed.toLocaleString()}개사 분량)를 넘어 약 ${preview.estimated_days}일에 걸쳐 나눠 진행됩니다. 한도에 걸리면 작업이 자동으로 멈췄다가 다음 날 이어서 진행되며, 결과 정확도에는 영향이 없습니다. 조건에 가까운 회사부터 먼저 처리하므로 첫날에 대상 대부분이 확보됩니다. 더 빨리 끝내려면 시군구나 업종으로 범위를 좁히세요.`
+            : ' — 재무정보 수집까지 하루 안에 끝낼 수 있는 규모입니다.'}
         </Alert>
       )}
 
@@ -242,7 +275,7 @@ export default function SearchPage() {
         <Button
           size="md"
           loading={submitting}
-          disabled={fscIndexStatus?.row_count === 0}
+          disabled={dartIndexStatus?.row_count === 0}
           onClick={handleSubmit}
         >
           후보 확정 시작

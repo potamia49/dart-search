@@ -76,6 +76,39 @@ def test_get_industries_manufacturing_has_children_codes():
     assert all(len(code) == 2 for code in child_codes)
 
 
+def test_get_industries_exposes_sub_classes_but_no_deeper():
+    """M8 5단계 — 소분류(3자리) 한 층까지만 노출한다.
+
+    세분류(4자리)/세세분류(5자리)는 회사별 분류 깊이 편차 때문에 prefix 매칭에서
+    각각 20.9%/41.3%를 놓친다 — 노출하면 "정밀하게 골랐는데 조용히 누락"이
+    된다(§4-10-G 열린 질문 2). 트리에는 존재하지만 응답에는 없어야 한다.
+    """
+    body = _client().get("/api/meta/industries").json()
+
+    mids = [child for entry in body for child in entry["children"]]
+    subs = [sub for mid in mids for sub in mid["children"]]
+
+    assert len(mids) == 77
+    assert len(subs) == 234
+    assert all(len(mid["code"]) == 2 and mid["code"].isdigit() for mid in mids)
+    assert all(len(sub["code"]) == 3 and sub["code"].isdigit() for sub in subs)
+    # 소분류가 leaf — 더 깊은 층이 섞여 들어오지 않아야 한다.
+    assert all(sub["children"] == [] for sub in subs)
+
+
+def test_get_industries_sub_class_codes_are_prefixed_by_their_mid_class():
+    """소분류 코드가 중분류 코드의 prefix 확장이어야 `industry_matches()`가 동작한다.
+
+    `filters.industry_matches()`는 `induty_code.startswith(prefix)`뿐이라,
+    이 관계가 깨지면 소분류를 골랐을 때 조용히 0건이 된다.
+    """
+    body = _client().get("/api/meta/industries").json()
+    for entry in body:
+        for mid in entry["children"]:
+            for sub in mid["children"]:
+                assert sub["code"].startswith(mid["code"]), (mid["code"], sub["code"])
+
+
 def test_get_candidates_preview_counts_local_matches_without_quota_warning(
     db_session_factory, monkeypatch
 ):

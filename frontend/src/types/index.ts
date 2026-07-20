@@ -180,11 +180,37 @@ export interface FscIndexStatus {
   crawl_in_progress: boolean
 }
 
-/** POST /api/meta/candidates-preview (2026-07-17 추가) — 지역/업종 조건만으로
- * Phase 1 A2(로컬 DB 필터, API 호출 없음)를 미리 실행한 후보 수. `exceeds_daily_quota`가
- * true면 A3(매출액/총자산 스크리닝)가 data.go.kr 일일 쿼터를 넘겨 하루 안에 끝나지
- * 않을 수 있다는 뜻이다(결과 정확도에는 영향 없음 — Phase 2가 항상 DART 원문으로
- * 최종 재검증). */
+/** GET /api/meta/dart-index/status (M8 1단계) — Phase 1이 후보를 찾는 정본
+ * 인덱스(`dart_corp_index`). **이게 비어 있으면 후보 확정이 즉시 실패한다.**
+ * fsc_corp_index를 대체했으므로 화면에서 먼저 보여야 하는 쪽이다. */
+export interface DartIndexStatus {
+  row_count: number
+  last_completed_at: string | null
+  crawl_in_progress: boolean
+  checkpoint_industry: string | null
+}
+
+/** GET /api/meta/fsc-financial/status (M8 2단계) — 매출액/총자산 **참고값**
+ * 스냅샷(`fsc_financial_stat`). 비어 있어도 후보 확정·최종 결과에는 영향이
+ * 없다(§4-10-C: 이 값으로 후보를 제외하지 않는다) — 후보 목록의 참고 표시와
+ * Phase 2 처리 순서(밴드 근접도 정렬)에만 쓰인다. */
+export interface FscFinancialStatus {
+  row_count: number
+  last_completed_at: string | null
+  years: string[]
+  crawl_in_progress: boolean
+}
+
+/** POST /api/meta/candidates-preview — 지역/업종 조건만으로 Phase 1 A2(로컬 DB
+ * 필터, API 호출 없음)를 미리 실행한 후보 수.
+ *
+ * **기준이 바뀌었다(M8 5단계)**: A3(data.go.kr 건별 스크리닝)가 폐기돼 병목이
+ * **DART 일일 한도**로 옮겨갔다. `daily_quota_assumed`는 하루에 재무정보를
+ * 수집할 수 있는 후보 수(후보 1개사당 약 5회 호출)이고, `exceeds_daily_quota`가
+ * true면 **재무정보 수집(2단계)** 이 여러 날에 걸쳐 나뉜다는 뜻이다 —
+ * 후보 확정(1단계) 자체는 외부 호출이 0건이라 항상 즉시 끝난다. 한도에 걸리면
+ * Job이 PAUSED_QUOTA로 멈췄다가 다음 날 이어서 진행되며 결과 정확도에는
+ * 영향이 없다. */
 export interface CandidatesPreviewRequest {
   region: RegionCondition
   industry: string[]

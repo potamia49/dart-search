@@ -12,6 +12,7 @@ from datetime import datetime
 from app.core.fsc_financial_stat import (
     default_biz_years,
     extract_items,
+    get_financial_stat_status,
     get_latest_stat_by_crno,
     to_row,
     upsert_financial_stats,
@@ -131,3 +132,26 @@ def test_get_latest_stat_by_crno_handles_more_crnos_than_sql_variable_limit(db_s
         latest = get_latest_stat_by_crno(db, crnos)
     assert len(latest) == 1500
     assert latest[crnos[0]].sale_amt == 7
+
+
+def test_get_financial_stat_status_reports_years_actually_stored(db_session_factory):
+    """회귀(M8 5단계): 상태의 `years`는 마지막 크롤 인자가 아니라 **적재된 연도**다.
+
+    한 해만 보강 크롤하면 메타에는 그 한 해만 남는데, 화면에는 "어떤 연도의
+    참고값을 볼 수 있는지"가 보여야 한다 — 실제로 4개년이 들어 있는 DB가
+    "2023년 기준"으로만 표시되던 것을 화면에 노출하며 발견했다.
+    """
+    with db_session_factory() as db:
+        upsert_financial_stats(
+            db,
+            [
+                to_row(_item(bizYear="2024")),
+                to_row(_item(bizYear="2023")),
+                to_row(_item(crno="2222222222222", bizYear="2025")),
+            ],
+        )
+        db.commit()
+
+    status = get_financial_stat_status(db_session_factory)
+    assert status["years"] == ["2023", "2024", "2025"]
+    assert status["row_count"] == 3
