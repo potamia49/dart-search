@@ -25,9 +25,9 @@ from typing import Protocol
 
 
 # PRD 3-2절 표준 13항목 (당기/전기 각각) — results 테이블 컬럼과 1:1 대응.
-# "gross_margin"은 원문에 직접 나오는 계정이 아니라 매출액/매출원가로부터
-# 계산되는 매출총이익율(%)이다(PRD 3-2절, Result 모델 주석 참고) — 원문의
-# "매출총이익"(금액) 행은 그대로 매핑하지 않고 계산에만 사용한다.
+# "gross_profit"(매출총이익, 손실이면 음수)은 원문의 "매출총이익"/"매출총손실"
+# 행을 다른 항목과 동일하게 직접 파싱한다(2026-07-20 변경 — 이전에는 매출액/
+# 매출원가로 계산한 매출총이익율(%)을 저장했었다, ACCOUNT_NAME_ALIASES 참고).
 STANDARD_FINANCIAL_FIELDS: tuple[str, ...] = (
     "current_assets",
     "noncurrent_assets",
@@ -38,16 +38,15 @@ STANDARD_FINANCIAL_FIELDS: tuple[str, ...] = (
     "total_equity",
     "revenue",
     "cogs",
-    "gross_margin",
+    "gross_profit",
     "sga",
     "operating_income",
     "net_income",
 )
 
-# xml_parser.py가 원문에서 직접 채우는 필드 (gross_margin 제외 — 계산값).
-DIRECT_FINANCIAL_FIELDS: tuple[str, ...] = tuple(
-    f for f in STANDARD_FINANCIAL_FIELDS if f != "gross_margin"
-)
+# xml_parser.py가 원문에서 직접 채우는 필드 — 이제 전부 표준 13항목과 같다
+# (계산 항목이었던 gross_margin을 없앤 뒤로는 별도로 뺄 필드가 없다).
+DIRECT_FINANCIAL_FIELDS: tuple[str, ...] = STANDARD_FINANCIAL_FIELDS
 
 # 현금흐름표 4항목 (§4-8, 2026-07-19). 위 13항목과 달리 best-effort 항목이며
 # `determine_parse_status()` 판정에는 절대 포함하지 않는다 — CF 누락으로 기존
@@ -78,6 +77,9 @@ ACCOUNT_NAME_ALIASES: dict[str, str] = {
     "영업수익": "revenue",
     "수익(매출액)": "revenue",
     "매출원가": "cogs",
+    "매출총이익": "gross_profit",
+    "매출총손실": "gross_profit",
+    "매출총이익(손실)": "gross_profit",
     "판매비와관리비": "sga",
     "영업이익": "operating_income",
     "영업손실": "operating_income",
@@ -222,18 +224,6 @@ class FinancialStatementParser(Protocol):
     """xml_parser.py / pdf_parser.py가 구현해야 하는 공통 인터페이스."""
 
     def parse(self, raw_bytes: bytes) -> ParsedFinancials: ...
-
-
-def compute_gross_margin(revenue: float | None, cogs: float | None) -> float | None:
-    """매출총이익율(%) = (매출액-매출원가)/매출액*100. PRD 3-2절 정의.
-
-    원문의 "매출총이익"(금액) 행을 그대로 쓰지 않고 매출액/매출원가로부터
-    계산한다 — Result.gross_margin_cur/prv 컬럼이 REAL(%)이기 때문
-    (results.py 모델 주석, ACCOUNT_NAME_ALIASES 상단 설명 참고).
-    """
-    if revenue is None or cogs is None or revenue == 0:
-        return None
-    return round((revenue - cogs) / revenue * 100, 2)
 
 
 def determine_parse_status(

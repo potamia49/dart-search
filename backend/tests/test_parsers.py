@@ -18,7 +18,6 @@ from app.parsers.audit_opinion import extract_audit_opinion
 from app.parsers.base import (
     ACCOUNT_NAME_ALIASES,
     DIRECT_FINANCIAL_FIELDS,
-    compute_gross_margin,
     determine_parse_status,
     normalize_account_label,
     parse_won_amount,
@@ -69,6 +68,13 @@ def test_account_name_aliases_cover_combined_loss_labels():
     assert ACCOUNT_NAME_ALIASES[normalize_account_label("Ⅷ. 당기순이익(손실)(주석10)")] == "net_income"
 
 
+def test_account_name_aliases_cover_gross_profit_and_loss_labels():
+    """"매출총이익"/"매출총손실"(2026-07-20 신설 alias)도 gross_profit로 매핑돼야 한다."""
+    assert ACCOUNT_NAME_ALIASES[normalize_account_label("Ⅲ.매출총이익")] == "gross_profit"
+    assert ACCOUNT_NAME_ALIASES[normalize_account_label("Ⅲ. 매출총손실")] == "gross_profit"
+    assert ACCOUNT_NAME_ALIASES[normalize_account_label("Ⅲ. 매출총이익(손실)(주석5)")] == "gross_profit"
+
+
 @pytest.mark.parametrize(
     "text, expected",
     [
@@ -84,13 +90,6 @@ def test_account_name_aliases_cover_combined_loss_labels():
 )
 def test_parse_won_amount(text, expected):
     assert parse_won_amount(text) == expected
-
-
-def test_compute_gross_margin_handles_zero_revenue():
-    assert compute_gross_margin(0, 100) is None
-    assert compute_gross_margin(None, 100) is None
-    assert compute_gross_margin(100, None) is None
-    assert compute_gross_margin(100, 60) == pytest.approx(40.0)
 
 
 def test_determine_parse_status_no_table_is_partial():
@@ -124,7 +123,7 @@ def test_parse_xml_financials_ok_unqualified_opinion():
     """한국학술정보(rcept_no=20260630000641), 적정의견, 완전한 재무제표 첨부.
 
     금액은 원문(tests/fixtures/20260630000641)의 자산총계/부채총계/자본총계/
-    매출액/매출원가/영업이익/당기순이익 TE 셀 값을 그대로 옮겨 왔다.
+    매출액/매출원가/매출총이익/영업이익/당기순이익 TE 셀 값을 그대로 옮겨 왔다.
     """
     raw = _read_fixture("20260630000641")
     parsed = parse_xml_financials(raw)
@@ -142,15 +141,14 @@ def test_parse_xml_financials_ok_unqualified_opinion():
     assert parsed.values_prv["revenue"] == 40_045_263_359
     assert parsed.values_cur["cogs"] == 23_905_559_602
     assert parsed.values_prv["cogs"] == 24_504_069_626
+    # 원문 "Ⅲ.매출총이익" 행(TE 셀) 값을 그대로 옮겨 왔다 — 매출액-매출원가와
+    # 일치하지만, 계산이 아니라 다른 항목과 동일하게 원문에서 직접 파싱한다.
+    assert parsed.values_cur["gross_profit"] == 15_242_639_160
+    assert parsed.values_prv["gross_profit"] == 15_541_193_733
     assert parsed.values_cur["operating_income"] == 1_843_858_188
     assert parsed.values_prv["operating_income"] == 1_716_581_763
     assert parsed.values_cur["net_income"] == 172_184_056
     assert parsed.values_prv["net_income"] == 138_144_741
-
-    expected_gm_cur = round((39_148_198_762 - 23_905_559_602) / 39_148_198_762 * 100, 2)
-    expected_gm_prv = round((40_045_263_359 - 24_504_069_626) / 40_045_263_359 * 100, 2)
-    assert parsed.values_cur["gross_margin"] == pytest.approx(expected_gm_cur)
-    assert parsed.values_prv["gross_margin"] == pytest.approx(expected_gm_prv)
 
 
 @pytest.mark.parametrize(

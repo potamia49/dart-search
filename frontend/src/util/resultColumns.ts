@@ -37,11 +37,6 @@ export function formatNumber(value: unknown): string {
   return Number(value).toLocaleString()
 }
 
-export function formatPercent(value: unknown): string {
-  if (value === null || value === undefined) return '-'
-  return `${Number(value).toFixed(2)}%`
-}
-
 // 주소/대표자/업종은 M8 3단계(§4-10)부터 DART 기업개황 원본이라 "미확정" 단서가
 // 필요 없다. 전화번호만은 기업개황 엑셀에 열이 없어 항상 비어 있다.
 export const BASIC_COLUMNS: ResultColumn[] = [
@@ -97,7 +92,7 @@ export const FINANCIAL_GROUPS: FinancialGroup[] = [
     items: [
       { label: '매출액', curKey: 'revenue_cur', prvKey: 'revenue_prv', snapKey: 'revenue', format: formatNumber },
       { label: '매출원가', curKey: 'cogs_cur', prvKey: 'cogs_prv', snapKey: 'cogs', format: formatNumber },
-      { label: '매출총이익율', curKey: 'gross_margin_cur', prvKey: 'gross_margin_prv', snapKey: 'gross_margin', format: formatPercent },
+      { label: '매출총이익', curKey: 'gross_profit_cur', prvKey: 'gross_profit_prv', snapKey: 'gross_profit', format: formatNumber },
       { label: '판매비와관리비', curKey: 'sga_cur', prvKey: 'sga_prv', snapKey: 'sga', format: formatNumber },
       { label: '영업이익', curKey: 'operating_income_cur', prvKey: 'operating_income_prv', snapKey: 'operating_income', format: formatNumber },
       { label: '당기순이익', curKey: 'net_income_cur', prvKey: 'net_income_prv', snapKey: 'net_income', format: formatNumber },

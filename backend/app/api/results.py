@@ -59,7 +59,7 @@ SORTABLE_COLUMNS: tuple[str, ...] = (
     "total_equity_cur", "total_equity_prv",
     "revenue_cur", "revenue_prv",
     "cogs_cur", "cogs_prv",
-    "gross_margin_cur", "gross_margin_prv",
+    "gross_profit_cur", "gross_profit_prv",
     "sga_cur", "sga_prv",
     "operating_income_cur", "operating_income_prv",
     "net_income_cur", "net_income_prv",
@@ -155,8 +155,8 @@ class ResultResponse(BaseModel):
     revenue_prv: int | None
     cogs_cur: int | None
     cogs_prv: int | None
-    gross_margin_cur: float | None
-    gross_margin_prv: float | None
+    gross_profit_cur: int | None
+    gross_profit_prv: int | None
     sga_cur: int | None
     sga_prv: int | None
     operating_income_cur: int | None
@@ -355,7 +355,7 @@ class FinancialSnapshotResponse(BaseModel):
     total_equity: int | None
     revenue: int | None
     cogs: int | None
-    gross_margin: float | None
+    gross_profit: int | None
     sga: int | None
     operating_income: int | None
     net_income: int | None
@@ -540,6 +540,9 @@ class AccountDetailResponse(BaseModel):
     fiscal_year_cur: str | None = None
     accounts: dict[str, list[AccountRowResponse]] = {}
     notice: str | None = None
+    # 이 원문의 감사의견(적정/한정/부적정/의견거절, 판정 불가 시 None) — 재무이력
+    # 표가 연도(=원문)마다 다른 감사의견을 재무상태표 위 안내 행에 보여주는 데 쓴다.
+    audit_opinion: str | None = None
 
 
 @router.get(
@@ -588,4 +591,5 @@ async def get_account_detail(
             ]
             for field, rows in detail.accounts.items()
         },
+        audit_opinion=detail.audit_opinion,
     )

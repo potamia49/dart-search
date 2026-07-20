@@ -28,7 +28,6 @@ from app.parsers.base import (
     CF_ACCOUNT_NAME_ALIASES,
     CF_FINANCIAL_FIELDS,
     ParsedFinancials,
-    compute_gross_margin,
     determine_parse_status,
     normalize_account_label,
     parse_won_amount,
@@ -199,9 +198,6 @@ def parse_xml_financials(raw_xml: bytes) -> ParsedFinancials:
             # parse_status 판정에 영향을 주지 않는다(§4-8 확정).
             _extract_section(el, values_cur, values_prv, CF_ACCOUNT_NAME_ALIASES)
             section = None  # 구간당 첫 FINANCE 테이블만 사용
-
-    values_cur["gross_margin"] = compute_gross_margin(values_cur.get("revenue"), values_cur.get("cogs"))
-    values_prv["gross_margin"] = compute_gross_margin(values_prv.get("revenue"), values_prv.get("cogs"))
 
     status, note = determine_parse_status(values_cur, values_prv, found_any_table=found_any_table)
 

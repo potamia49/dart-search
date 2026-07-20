@@ -112,8 +112,8 @@ export interface ResultResponse {
   revenue_prv: number | null
   cogs_cur: number | null
   cogs_prv: number | null
-  gross_margin_cur: number | null
-  gross_margin_prv: number | null
+  gross_profit_cur: number | null
+  gross_profit_prv: number | null
   sga_cur: number | null
   sga_prv: number | null
   operating_income_cur: number | null
@@ -260,7 +260,7 @@ export interface FinancialSnapshotResponse {
   total_equity: number | null
   revenue: number | null
   cogs: number | null
-  gross_margin: number | null
+  gross_profit: number | null
   sga: number | null
   operating_income: number | null
   net_income: number | null
@@ -305,4 +305,6 @@ export interface AccountDetailResponse {
   fiscal_year_cur: string | null
   accounts: Record<string, AccountRow[]>
   notice: string | null
+  /** 이 원문의 감사의견(적정/한정/부적정/의견거절, 판정 불가 시 null). */
+  audit_opinion: string | null
 }

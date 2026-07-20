@@ -16,7 +16,7 @@
       current_assets      INTEGER, noncurrent_assets   INTEGER, total_assets INTEGER,
       current_liab        INTEGER, noncurrent_liab     INTEGER, total_liab   INTEGER,
       total_equity        INTEGER,
-      revenue             INTEGER, cogs                INTEGER, gross_margin REAL,
+      revenue             INTEGER, cogs                INTEGER, gross_profit INTEGER,
       sga                 INTEGER, operating_income     INTEGER, net_income   INTEGER,
       parse_status        TEXT,   -- OK / PARTIAL / FAILED (results.parse_status와 동일 의미)
       parse_note          TEXT,
@@ -42,7 +42,7 @@ newest-first 순회 덕분에 정정본이 먼저 그 연도를 확정한다.
 
 from __future__ import annotations
 
-from sqlalchemy import Float, ForeignKey, Integer, String, UniqueConstraint
+from sqlalchemy import ForeignKey, Integer, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base
@@ -67,7 +67,9 @@ class FinancialSnapshot(Base):
     total_equity: Mapped[int | None] = mapped_column(Integer, nullable=True)
     revenue: Mapped[int | None] = mapped_column(Integer, nullable=True)
     cogs: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    gross_margin: Mapped[float | None] = mapped_column(Float, nullable=True)  # %
+    # 2026-07-20 변경: 계산값(매출총이익율 %)이 아니라 원문 "매출총이익"/
+    # "매출총손실" 행을 직접 파싱한 금액이다(손실이면 음수).
+    gross_profit: Mapped[int | None] = mapped_column(Integer, nullable=True)
     sga: Mapped[int | None] = mapped_column(Integer, nullable=True)
     operating_income: Mapped[int | None] = mapped_column(Integer, nullable=True)
     net_income: Mapped[int | None] = mapped_column(Integer, nullable=True)

@@ -23,7 +23,6 @@ import pdfplumber
 from app.parsers.base import (
     ACCOUNT_NAME_ALIASES,
     ParsedFinancials,
-    compute_gross_margin,
     determine_parse_status,
     normalize_account_label,
     parse_won_amount,
@@ -80,9 +79,6 @@ def parse_pdf_financials(raw_pdf: bytes) -> ParsedFinancials:
     except Exception as exc:  # noqa: BLE001 - pdfplumber는 손상 PDF에서 다양한 예외를 던짐
         logger.warning("PDF 파싱 실패: %s", exc)
         return ParsedFinancials(parse_status="FAILED", parse_note=f"PDF 파싱 오류: {exc}")
-
-    values_cur["gross_margin"] = compute_gross_margin(values_cur.get("revenue"), values_cur.get("cogs"))
-    values_prv["gross_margin"] = compute_gross_margin(values_prv.get("revenue"), values_prv.get("cogs"))
 
     status, note = determine_parse_status(values_cur, values_prv, found_any_table=found_any_table)
     if found_any_table:

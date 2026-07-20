@@ -25,7 +25,6 @@ import {
   FINANCIAL_GROUPS,
   formatCell,
   formatNumber,
-  type FinancialGroup,
   type FinancialItem,
 } from '../util/resultColumns'
 import DocumentSectionModal, { type DocumentSectionTarget } from './DocumentSectionModal'
@@ -38,11 +37,12 @@ interface ResultDetailDrawerProps {
 
 const DART_ORIGINAL_DOC_BASE = 'https://dart.fss.or.kr/dsaf001/main.do?rcpNo='
 
-/** 세부계정 상세를 펼칠 수 있는 항목인지 — 현금흐름표와 계산값(매출총이익율)은
- * 원문에 대응하는 대분류가 없어 하위계정이 존재하지 않는다. */
-function canExpand(group: FinancialGroup, item: FinancialItem): boolean {
-  if (group.section === 'cf') return false
-  return item.snapKey !== 'gross_margin'
+/** 세부계정 상세를 펼칠 수 있는 항목인지 — 현금흐름표(영업/투자/재무활동)도
+ * 재무상태표·손익계산서와 동일한 ALEVEL 계층 구조라 펼칠 수 있다(2026-07-20).
+ * "기말의현금"처럼 그 자체가 총계인 항목은 펼쳐도 세부 내역이 없다는 안내만
+ * 나온다(자산총계 등과 동일한 패턴 — canExpand로는 구분하지 않는다). */
+function canExpand(): boolean {
+  return true
 }
 
 /** 연도 간 계정 매칭 키 — 각주 번호("(주석3)")나 항목 번호("1.")는 연도마다
@@ -140,97 +140,6 @@ function EmptyDetailRow({ colSpan }: { colSpan: number }) {
   )
 }
 
-/** 당기·전기 표 — 대분류를 클릭하면 그 아래 세부계정을 인라인으로 펼친다. */
-function CurrentPrevTable({
-  result,
-  details,
-}: {
-  result: ResultResponse
-  details: ReturnType<typeof useAccountDetails>
-}) {
-  const [expanded, setExpanded] = useState<Set<string>>(new Set())
-  const { byRcept, ensure, loading } = details
-  const detail = result.rcept_no ? byRcept[result.rcept_no] : undefined
-
-  const toggle = (field: string) => {
-    setExpanded((prev) => {
-      const next = new Set(prev)
-      if (next.has(field)) next.delete(field)
-      else {
-        next.add(field)
-        void ensure([result.rcept_no])
-      }
-      return next
-    })
-  }
-
-  return (
-    <Table striped highlightOnHover withTableBorder>
-      <Table.Thead>
-        <Table.Tr>
-          <Table.Th>항목</Table.Th>
-          <Table.Th>당기</Table.Th>
-          <Table.Th>전기</Table.Th>
-        </Table.Tr>
-      </Table.Thead>
-      <Table.Tbody>
-        {FINANCIAL_GROUPS.map((group) => (
-          <Fragment key={group.section}>
-            <Table.Tr>
-              <Table.Td colSpan={3}>
-                <Text span fw={600} size="sm" c="dimmed">{group.title}</Text>
-              </Table.Td>
-            </Table.Tr>
-            {group.items.map((item) => {
-              const field = item.snapKey as string
-              const expandable = canExpand(group, item)
-              const isOpen = expanded.has(field)
-              const children = detail?.accounts[field] ?? []
-              return (
-                <Fragment key={item.curKey}>
-                  <Table.Tr>
-                    <Table.Td>
-                      <ItemLabelCell
-                        item={item}
-                        expandable={expandable}
-                        expanded={isOpen}
-                        onToggle={() => toggle(field)}
-                      />
-                    </Table.Td>
-                    <Table.Td>{item.format(result[item.curKey])}</Table.Td>
-                    <Table.Td>{item.format(result[item.prvKey])}</Table.Td>
-                  </Table.Tr>
-                  {isOpen && loading && !detail && (
-                    <Table.Tr>
-                      <Table.Td colSpan={3}><Loader size="xs" /></Table.Td>
-                    </Table.Tr>
-                  )}
-                  {/* 원문(rcept_no)이 아예 없는 결과도 조용히 비어 있지 않고 안내가 나오게 한다. */}
-                  {isOpen && !loading && children.length === 0 && <EmptyDetailRow colSpan={3} />}
-                  {isOpen &&
-                    children.map((row, idx) => (
-                      <Table.Tr key={`${field}-${idx}`}>
-                        <Table.Td style={{ paddingLeft: 12 + row.level * 14 }}>
-                          <Text span size="xs" c="dimmed">{row.label}</Text>
-                        </Table.Td>
-                        <Table.Td>
-                          <Text span size="xs" c="dimmed">{formatNumber(row.cur)}</Text>
-                        </Table.Td>
-                        <Table.Td>
-                          <Text span size="xs" c="dimmed">{formatNumber(row.prv)}</Text>
-                        </Table.Td>
-                      </Table.Tr>
-                    ))}
-                </Fragment>
-              )
-            })}
-          </Fragment>
-        ))}
-      </Table.Tbody>
-    </Table>
-  )
-}
-
 /** 재무이력 표에서 특정 대분류의 세부계정 행 목록을 만든다.
  * 연도마다 원문(rcept_no)이 다르고 계정 구성도 달라질 수 있어, 최신 연도부터
  * 훑으며 계정 키의 합집합을 만들고 표시 라벨은 최신 연도의 것을 쓴다. */
@@ -304,6 +213,15 @@ function FinancialHistorySection({
     }
   }, [jobId, resultId])
 
+  // 감사의견 행은 펼치기 여부와 무관하게 항상 보여야 하므로, 연도별로 세부계정을
+  // 펼치기 전에도 미리 확보해 둔다(로컬 문서 캐시만 읽어 쿼터 0건).
+  useEffect(() => {
+    if (history && history.length > 0) {
+      void ensure(history.map((s) => s.rcept_no))
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- ensure/history 참조가 매 렌더 바뀌어도 rcept_no 집합이 같으면 재실행할 필요가 없다.
+  }, [history])
+
   const toggle = (field: string) => {
     setExpanded((prev) => {
       const next = new Set(prev)
@@ -376,6 +294,17 @@ function FinancialHistorySection({
           </Table.Tr>
         </Table.Thead>
         <Table.Tbody>
+          <Table.Tr>
+            <Table.Td fw={600}>감사의견</Table.Td>
+            {history.map((snap) => {
+              const detail = snap.rcept_no ? byRcept[snap.rcept_no] : undefined
+              return (
+                <Table.Td key={snap.fiscal_year}>
+                  {detail ? (detail.audit_opinion ?? '-') : detailLoading ? <Loader size="xs" /> : '-'}
+                </Table.Td>
+              )
+            })}
+          </Table.Tr>
           {FINANCIAL_GROUPS.map((group) => (
             <Fragment key={group.section}>
               <Table.Tr>
@@ -385,7 +314,7 @@ function FinancialHistorySection({
               </Table.Tr>
               {group.items.map((item) => {
                 const field = item.snapKey as string
-                const expandable = canExpand(group, item)
+                const expandable = canExpand()
                 const isOpen = expanded.has(field)
                 const childRows = isOpen ? buildHistoryChildRows(field, history, byRcept) : []
                 return (
@@ -496,13 +425,11 @@ export default function ResultDetailDrawer({ jobId, result, onClose }: ResultDet
             ))}
           </SimpleGrid>
 
-          <Title order={5}>재무정보 (당기 · 전기)</Title>
-          <Text size="xs" c="dimmed">
-            밑줄 친 항목을 클릭하면 원문의 세부계정을 펼쳐 볼 수 있습니다.
-          </Text>
-          <CurrentPrevTable result={result} details={details} />
-
           <Title order={5}>재무 이력 (최근 N년)</Title>
+          <Text size="xs" c="dimmed">
+            가장 오른쪽 열이 최신 연도(당기)입니다. 밑줄 친 항목을 클릭하면 원문의 세부계정을
+            펼쳐 볼 수 있습니다.
+          </Text>
           <FinancialHistorySection
             jobId={jobId}
             resultId={result.id}

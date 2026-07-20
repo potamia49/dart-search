@@ -82,6 +82,11 @@ _RESULTS_NEW_COLUMNS: dict[str, str] = {
     "ref_revenue": "INTEGER",
     "ref_total_assets": "INTEGER",
     "ref_fin_year": "TEXT",
+    # 매출총이익(금액, 손실이면 음수) — 계산값이던 gross_margin_cur/prv(%,
+    # REAL)를 대체한다(2026-07-20). 기존 gross_margin_cur/prv 컬럼은 이미
+    # ALTER된 DB에 물리적으로 남아있을 수 있으나 더 이상 쓰지 않는다.
+    "gross_profit_cur": "INTEGER",
+    "gross_profit_prv": "INTEGER",
 }
 # financial_snapshots(2026-07-15 STEP7 신설)에도 §4-8 CF 4컬럼을 추가한다.
 # 이 테이블은 이미 실 데이터가 있어 create_all이 컬럼을 못 붙이므로 ALTER 필요.
@@ -94,6 +99,8 @@ _FINANCIAL_SNAPSHOTS_NEW_COLUMNS: dict[str, str] = {
     # 다음 연도 공시의 전기 열에서 임시로 채워졌는지(0). 기존 행은 후자일 수
     # 있으므로 기본값 0으로 붙인다(연도별 원문 보기 라벨에 그대로 쓰인다).
     "from_current_period": "INTEGER DEFAULT 0",
+    # 매출총이익(금액) — results.gross_profit_cur/prv와 동일한 취지(2026-07-20).
+    "gross_profit": "INTEGER",
 }
 
 

@@ -3,7 +3,7 @@
 상세개발계획.md §5 그대로 반영. 컬럼명/타입을 임의로 바꾸지 않는다.
 """
 
-from sqlalchemy import Float, ForeignKey, Integer, String
+from sqlalchemy import ForeignKey, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base
@@ -62,8 +62,12 @@ class Result(Base):
     revenue_prv: Mapped[int | None] = mapped_column(Integer, nullable=True)
     cogs_cur: Mapped[int | None] = mapped_column(Integer, nullable=True)
     cogs_prv: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    gross_margin_cur: Mapped[float | None] = mapped_column(Float, nullable=True)  # %
-    gross_margin_prv: Mapped[float | None] = mapped_column(Float, nullable=True)  # %
+    # 2026-07-20 변경: 매출액/매출원가로 계산한 매출총이익율(%)이 아니라
+    # 원문의 "매출총이익"/"매출총손실" 행을 그대로 파싱한 금액이다(손실이면
+    # 음수). 이전 gross_margin_cur/prv(REAL, %) 컬럼은 DB에 물리적으로
+    # 남아있을 수 있으나 더 이상 읽거나 쓰지 않는다(기존 관행 — 소급 없음).
+    gross_profit_cur: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    gross_profit_prv: Mapped[int | None] = mapped_column(Integer, nullable=True)
     sga_cur: Mapped[int | None] = mapped_column(Integer, nullable=True)
     sga_prv: Mapped[int | None] = mapped_column(Integer, nullable=True)
     operating_income_cur: Mapped[int | None] = mapped_column(Integer, nullable=True)

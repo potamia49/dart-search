@@ -543,6 +543,37 @@ def test_account_detail_rejects_foreign_rcept_no(client_with_db, monkeypatch, tm
     assert resp.status_code == 404
 
 
+def test_account_detail_returns_cash_flow_children_and_audit_opinion(
+    client_with_db, monkeypatch, tmp_path
+):
+    """현금흐름표 3항목(영업/투자/재무활동)도 재무상태표·손익계산서와 동일하게
+    세부계정이 반환되고("기말의현금"은 총계라 children이 비어 있는 게 정상), 감사의견도
+    함께 내려간다(재무상태표 위 안내 행에 쓴다)."""
+    client, factory = client_with_db
+    job_id, result_id = _seed_result_with_rcept(factory, "20260630000641")
+    _point_cache_at_tmp(monkeypatch, tmp_path, "20260630000641", "20260630000641")
+
+    resp = client.get(f"/api/jobs/{job_id}/results/{result_id}/account-detail")
+    assert resp.status_code == 200
+    body = resp.json()
+
+    assert body["audit_opinion"] == "적정"
+
+    operating_rows = body["accounts"]["cf_operating"]
+    assert len(operating_rows) > 3
+    assert all(row["level"] >= 1 for row in operating_rows)
+    assert any(row["cur"] is not None for row in operating_rows)
+
+    investing_rows = body["accounts"]["cf_investing"]
+    assert len(investing_rows) > 3
+
+    financing_rows = body["accounts"]["cf_financing"]
+    assert len(financing_rows) > 3
+
+    # 기말의현금은 그 자체가 총계라 하위 대분류가 없다(자산총계 등과 동일 패턴).
+    assert body["accounts"].get("cf_ending_cash", []) == []
+
+
 def test_document_section_invalid_section_returns_400(client_with_db, monkeypatch, tmp_path):
     client, factory = client_with_db
     job_id, result_id = _seed_result_with_rcept(factory, "20260630000641")
