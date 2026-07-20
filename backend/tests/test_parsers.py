@@ -23,7 +23,7 @@ from app.parsers.base import (
     parse_won_amount,
 )
 from app.parsers.pdf_parser import parse_pdf_financials
-from app.parsers.xml_parser import _decode_raw_xml, parse_xml_financials
+from app.parsers.xml_parser import _apply_sign, _decode_raw_xml, parse_xml_financials
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -73,6 +73,28 @@ def test_account_name_aliases_cover_gross_profit_and_loss_labels():
     assert ACCOUNT_NAME_ALIASES[normalize_account_label("Ⅲ.매출총이익")] == "gross_profit"
     assert ACCOUNT_NAME_ALIASES[normalize_account_label("Ⅲ. 매출총손실")] == "gross_profit"
     assert ACCOUNT_NAME_ALIASES[normalize_account_label("Ⅲ. 매출총이익(손실)(주석5)")] == "gross_profit"
+
+
+@pytest.mark.parametrize(
+    "raw_label, value, expected",
+    [
+        # "손실"만 명시된(="이익"이 없는) 행: 원문 부호와 무관하게 항상 반전한다
+        # (2026-07-20 수정).
+        ("Ⅴ. 영업손실", 2_264_996_073, -2_264_996_073),  # 실측 다수 사례: 양수로 찍힘 → 음수로
+        ("Ⅲ. 매출총손실", -1_000_000, 1_000_000),  # 이미 음수(괄호 표기)인 "손실" = 음의 손실 = 이익
+        # "영업이익(손실)" 등 흑자·적자 공용 조합형 라벨: 원문 부호를 그대로
+        # 신뢰한다(뒤집지 않는다) — 실측(EUC-KR 원문 20220127000408) "영업이익(손실)"
+        # 행이 "(6,308,961,098)"로 이미 음수 표기돼 있는 실제 사례.
+        ("Ⅴ. 영업이익(손실)", -6_308_961_098, -6_308_961_098),
+        ("Ⅹ.당기순이익(손실)", 172_184_056, 172_184_056),  # 조합형 라벨 + 실제 흑자(양수)도 그대로
+        # 순수 "이익" 행(조합형도 아니고 "손실"도 없음): 원문 부호를 그대로 신뢰한다.
+        ("Ⅴ. 영업이익", 1_843_858_188, 1_843_858_188),
+        ("Ⅴ. 영업이익", -500_000, -500_000),  # 음수 "이익" = 손실이 이미 정확히 반영됨
+        (None, None, None),
+    ],
+)
+def test_apply_sign_flips_loss_only_rows_regardless_of_raw_sign(raw_label, value, expected):
+    assert _apply_sign(raw_label or "", value) == expected
 
 
 @pytest.mark.parametrize(

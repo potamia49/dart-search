@@ -71,9 +71,13 @@ def parse_pdf_financials(raw_pdf: bytes) -> ParsedFinancials:
                         found_any_table = True
                         cur_val = amounts[0]
                         prv_val = amounts[1] if len(amounts) > 1 else None
-                        if "손실" in raw_label:
-                            cur_val = -abs(cur_val) if cur_val is not None else None
-                            prv_val = -abs(prv_val) if prv_val is not None else None
+                        # xml_parser._apply_sign과 동일 규칙(2026-07-20 수정): "손실"만
+                        # 명시된 라벨(예: "영업손실")은 부호와 무관하게 항상 반전하지만,
+                        # "이익(손실)" 조합형 라벨(예: "영업이익(손실)")은 원문 부호를
+                        # 이미 정확히 반영하고 있어 그대로 둔다.
+                        if "손실" in raw_label and "이익" not in raw_label:
+                            cur_val = -cur_val if cur_val is not None else None
+                            prv_val = -prv_val if prv_val is not None else None
                         values_cur[field] = cur_val
                         values_prv[field] = prv_val
     except Exception as exc:  # noqa: BLE001 - pdfplumber는 손상 PDF에서 다양한 예외를 던짐
