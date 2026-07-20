@@ -30,7 +30,7 @@
 | 키 | 발급처 | 용도 |
 |---|---|---|
 | `DART_API_KEY` | https://opendart.fss.or.kr/ (회원가입 → 인증키 신청/관리) | 공시목록/기업개황/감사보고서 원문 조회 |
-| `DATA_GO_KR_API_KEY` | https://www.data.go.kr/ (활용신청 → "금융위원회_기업기본정보조회서비스") | 지역 필터 사전 추림(대응 1) — 회사명으로 주소를 먼저 가볍게 확인해 DART `company.json` 호출량을 절감 |
+| `DATA_GO_KR_API_KEY` | https://www.data.go.kr/ (활용신청 → "금융위원회_기업기본정보조회서비스" + "금융위원회_기업 재무정보") | 요약재무 스냅샷(`fsc_financial_stat`) 구축 — 후보 목록의 매출액·총자산 참고 표시와 재무정보 수집 순서 결정에 사용 |
 
 두 키 모두 발급에 승인 대기 시간이 있을 수 있다(공공데이터포털은 보통 즉시~수 시간).
 
@@ -48,6 +48,38 @@ cp .env.example .env            # 위 표의 두 키 값을 채워넣기 (커밋
 uvicorn app.main:app --reload   # http://127.0.0.1:8000, 기동 시 SQLite 테이블 자동 생성
 pytest tests/ -q                # 단위 테스트
 ```
+
+## 최초 1회: 전역 인덱스 구축 ★
+
+**SQLite 파일(`backend/dart_search.db`)은 저장소에 포함되지 않는다.** 새로 받은
+환경에서는 아래 두 인덱스를 직접 구축해야 하며, 이걸 하지 않으면 검색 Job이
+"후보가 없습니다"로 즉시 실패한다. 백엔드를 띄운 상태에서 한 번씩 호출한다.
+
+```
+# 1) DART 기업개황 인덱스 — 지역/업종/corp_code의 원천 (약 50분)
+curl -X POST http://localhost:8000/api/meta/dart-index/refresh \
+     -H "Content-Type: application/json" -d '{}'
+
+# 2) 금융위 요약재무 스냅샷 — 매출액/총자산 참고값 (약 3분)
+curl -X POST http://localhost:8000/api/meta/fsc-financial/refresh \
+     -H "Content-Type: application/json" -d '{}'
+```
+
+두 작업 모두 백그라운드로 돌고, 진행 상황은 아래로 확인한다.
+
+```
+curl http://localhost:8000/api/meta/dart-index/status
+curl http://localhost:8000/api/meta/fsc-financial/status
+# → last_completed_at 값이 채워지면 완료
+```
+
+- **1번은 중분류 단위 체크포인트를 남긴다.** 중간에 끊기거나 서버를 재기동해도
+  같은 명령을 다시 호출하면 이어서 진행한다(`force: true`를 주면 처음부터).
+  실행에는 `--reload` 없이 백엔드를 띄우는 편이 안전하다 — 파일 변경으로
+  재시작되면 크롤이 중단된다.
+- 완료 기준(실측): 1번 약 118,000행, 2번 약 300,000행.
+- 갱신 주기는 1번 연 1~2회, 2번 분기 1회면 충분하다. 1번은 공식 API가 아닌
+  DART 웹 화면 엔드포인트를 사용하므로 요청 간격을 두고 동작한다.
 
 ## 프론트엔드 실행
 
