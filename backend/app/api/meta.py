@@ -14,6 +14,11 @@
                                           바로 보이게 추가했다 — 백엔드가
                                           TTL 초과를 자동으로 알려주지 않고
                                           로그에만 남기던 것의 보완.
+    POST /api/meta/dart-index/refresh    (§4-10 M8, 2026-07-20 추가) DART 기업개황
+                                          전역 인덱스(dart_corp_index) 크롤.
+                                          fsc_corp_index를 대체하며 실측 약 23분.
+    GET  /api/meta/dart-index/status      (2026-07-20 추가) 위 인덱스의 행 수/
+                                          마지막 완료 시각/진행 중 여부.
     POST /api/meta/candidates-preview    (2026-07-17 추가) 지역/업종 조건만으로
                                           Phase 1 A2(로컬 DB 필터, API 호출 없음)를
                                           미리 실행해 후보 수와 data.go.kr 일일
@@ -40,7 +45,9 @@ from pydantic import BaseModel, Field
 
 from app.api.jobs import RegionCondition
 from app.core.dart_client import DartClient, FscCorpInfoClient
+from app.core.dart_corp_index import crawl_dart_corp_index, get_dart_index_status
 from app.core.db import get_session_factory
+from app.core.fsc_financial_stat import crawl_fsc_financial_stat, get_financial_stat_status
 from app.core.fsc_index import crawl_fsc_index, filter_local_candidates, get_fsc_index_status
 from app.core.industry_data import INDUSTRIES
 from app.core.region_data import REGIONS
@@ -221,6 +228,139 @@ async def refresh_fsc_index(
         started=True,
         message="fsc_corp_index 갱신을 백그라운드로 시작했습니다.",
     )
+
+
+class DartIndexRefreshRequest(BaseModel):
+    """`max_industries`를 지정하지 않으면(None) 중분류 77개 전체를 크롤한다
+    (실측 약 23분 — A1의 10~16시간과 달리 짧아 부담이 적다, §4-10)."""
+
+    max_industries: int | None = None
+    force: bool = False
+
+
+class DartIndexRefreshResponse(BaseModel):
+    started: bool
+    message: str
+
+
+# DART 기업개황 크롤 감독 재시도 — 요청 단위 재시도는
+# `dart_corp_index._post`가 담당하고, 이 상수는 그것까지 소진돼 태스크가
+# 죽었을 때 중분류 체크포인트에서 되살리는 바깥쪽 루프용이다.
+# 전체가 약 23분이라 A1(100회)보다 적게 잡는다.
+_DART_CRAWL_OUTER_RETRIES = 20
+_DART_CRAWL_OUTER_BACKOFF_SEC = 30
+
+
+@router.post("/dart-index/refresh", response_model=DartIndexRefreshResponse)
+async def refresh_dart_index(
+    payload: DartIndexRefreshRequest,
+    background_tasks: BackgroundTasks,
+) -> DartIndexRefreshResponse:
+    """관리자용 — `dart_corp_index`(§4-10 / M8 1단계) 전역 인덱스 크롤을 백그라운드로 트리거.
+
+    `fsc-index/refresh`와 같은 원칙이다: Job 실행 안에서는 절대 트리거되지 않고
+    이 엔드포인트가 유일한 시작 경로다. 중분류 단위로 체크포인트를 남기므로
+    중단돼도 다시 호출하면 이어서 진행하고, `force=True`면 처음부터 다시 한다.
+    `max_industries`를 지정한 파일럿/테스트 호출은 의도적 부분 실행이므로
+    감독 재시도를 걸지 않는다(1회만 시도).
+    """
+
+    outer_attempts = _DART_CRAWL_OUTER_RETRIES if payload.max_industries is None else 1
+
+    async def _run_crawl() -> None:
+        for attempt in range(1, outer_attempts + 1):
+            try:
+                result = await crawl_dart_corp_index(
+                    session_factory=get_session_factory(),
+                    max_industries=payload.max_industries,
+                    # force는 최초 시도에만 — 재시도는 항상 체크포인트를 이어간다.
+                    force=payload.force if attempt == 1 else False,
+                )
+                logger.info("dart_corp_index 갱신 완료: %s", result)
+                return
+            except Exception:  # noqa: BLE001 - 백그라운드 작업은 여기서 반드시 흡수해야 한다
+                logger.exception(
+                    "dart_corp_index 갱신 중 예외 발생(attempt=%s/%s)", attempt, outer_attempts
+                )
+                if attempt < outer_attempts:
+                    await asyncio.sleep(_DART_CRAWL_OUTER_BACKOFF_SEC)
+
+    background_tasks.add_task(_run_crawl)
+    return DartIndexRefreshResponse(
+        started=True,
+        message="dart_corp_index 갱신을 백그라운드로 시작했습니다.",
+    )
+
+
+class DartIndexStatusResponse(BaseModel):
+    row_count: int
+    last_completed_at: str | None
+    crawl_in_progress: bool
+    checkpoint_industry: str | None
+
+
+@router.get("/dart-index/status", response_model=DartIndexStatusResponse)
+async def get_dart_index_status_endpoint() -> DartIndexStatusResponse:
+    """`dart_corp_index`의 행 수 / 마지막 완료 시각 / 진행 중 여부."""
+    return DartIndexStatusResponse(**get_dart_index_status())
+
+
+class FscFinancialRefreshRequest(BaseModel):
+    """수집 회계연도. 미지정 시 최근 3개년(실측 63요청 / 약 3분, §4-10-B)."""
+
+    years: list[str] | None = None
+    max_pages_per_year: int | None = None
+
+
+class FscFinancialRefreshResponse(BaseModel):
+    started: bool
+    message: str
+
+
+@router.post("/fsc-financial/refresh", response_model=FscFinancialRefreshResponse)
+async def refresh_fsc_financial_stat(
+    payload: FscFinancialRefreshRequest,
+    background_tasks: BackgroundTasks,
+) -> FscFinancialRefreshResponse:
+    """관리자용 — `fsc_financial_stat`(§4-10-B / M8 2단계) 전수 크롤을 백그라운드로 트리거.
+
+    여기 담기는 값은 **후보를 제외하는 데 쓰지 않는다**(§4-10-C) — 후보 목록의
+    참고 표시와 Phase 2 처리 순서에만 쓴다. 전체가 약 3분이라 체크포인트 재개를
+    두지 않았고, 재실행해도 `(crno, biz_year)` upsert라 멱등이다.
+    """
+
+    async def _run_crawl() -> None:
+        client = FscCorpInfoClient()
+        try:
+            result = await crawl_fsc_financial_stat(
+                client,
+                get_session_factory(),
+                years=payload.years,
+                max_pages_per_year=payload.max_pages_per_year,
+            )
+            logger.info("fsc_financial_stat 갱신 완료: %s", result)
+        except Exception:  # noqa: BLE001 - 백그라운드 작업은 여기서 반드시 흡수해야 한다
+            logger.exception("fsc_financial_stat 갱신 중 예외 발생")
+        finally:
+            await client.aclose()
+
+    background_tasks.add_task(_run_crawl)
+    return FscFinancialRefreshResponse(
+        started=True,
+        message="fsc_financial_stat 갱신을 백그라운드로 시작했습니다.",
+    )
+
+
+class FscFinancialStatusResponse(BaseModel):
+    row_count: int
+    last_completed_at: str | None
+    years: list[str]
+    crawl_in_progress: bool
+
+
+@router.get("/fsc-financial/status", response_model=FscFinancialStatusResponse)
+async def get_fsc_financial_status_endpoint() -> FscFinancialStatusResponse:
+    return FscFinancialStatusResponse(**get_financial_stat_status())
 
 
 class FscIndexStatusResponse(BaseModel):

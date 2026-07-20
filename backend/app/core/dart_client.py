@@ -408,6 +408,34 @@ class FscCorpInfoClient:
         }
         return await self._get_with_retry(url, params)
 
+    async def list_summary_financial_stats(
+        self, *, biz_year: str, page_no: int = 1, num_of_rows: int = 5000
+    ) -> dict[str, Any]:
+        """같은 오퍼레이션을 `crno` **없이** 호출해 회계연도 단위로 전수 페이징한다.
+
+        2026-07-20 스파이크에서 확인한 동작(§4-10-B) — `getCorpOutline_V2`를
+        `corp_nm` 없이 페이징하는 A1과 같은 방식이다. Job마다 후보 수만큼
+        호출하던 것(경남 4,538회)을 **3개년 63요청**으로 대체하므로
+        data.go.kr 일일 쿼터 문제가 사라진다.
+
+        - `num_of_rows`는 **5,000까지** 받는다(100건일 때와 응답속도 차이가 거의 없음).
+        - 연도별 `totalCount`: 2021 162,292 / 2022 157,604 / 2023 135,378 /
+          2024 109,130 / 2025 62,774 — 최신 연도는 적재가 진행 중이라 적다.
+        - 응답에 회사명이 없다. `crno`(법인등록번호)로만 조인한다.
+        - `fnclDcd`가 `120`(별도)/`110`(연결)/`999`(NA)로 섞여 오므로 **호출부가
+          반드시 필터**해야 한다 — 실측에서 같은 회사의 연결 매출이 별도의 1.77배였다.
+        """
+        api_key = self._require_api_key()
+        url = f"{self.settings.data_go_kr_fsc_finstat_base_url}/getSummFinaStat_V2"
+        params = {
+            "serviceKey": api_key,
+            "bizYear": biz_year,
+            "resultType": "json",
+            "pageNo": page_no,
+            "numOfRows": num_of_rows,
+        }
+        return await self._get_with_retry(url, params)
+
     async def validate_key(self) -> tuple[bool, str]:
         try:
             data = await self.get_corp_basic_info(page_no=1, num_of_rows=1)
