@@ -420,6 +420,32 @@ def test_document_section_returns_assembled_html(client_with_db, monkeypatch, tm
     assert "현" in body["html"]  # 현금흐름표 제목/내용
 
 
+@pytest.mark.parametrize(
+    "fixture_id, expected_phrase",
+    [
+        # 신서식 — <TITLE>독립된 감사인의 감사보고서</TITLE>, 적정의견
+        ("20260630000641", "공정하게"),
+        # 2012년 구서식 — <TITLE>외부감사인의 감사보고서</TITLE>, "적정하게" 문구
+        ("20120110000138", "적정하게"),
+    ],
+)
+def test_document_section_audit_covers_both_report_title_formats(
+    client_with_db, monkeypatch, tmp_path, fixture_id, expected_phrase
+):
+    """감사의견 탭(section=audit)은 신서식("독립된 감사인의...")과 2012년
+    구서식("외부감사인의...")을 공통 부분문자열 "감사보고서"로 모두 잡는다."""
+    client, factory = client_with_db
+    job_id, result_id = _seed_result_with_rcept(factory, fixture_id)
+    _point_cache_at_tmp(monkeypatch, tmp_path, fixture_id, fixture_id)
+
+    resp = client.get(f"/api/jobs/{job_id}/results/{result_id}/document-sections/audit")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["available"] is True
+    assert "감사보고서" in body["html"]
+    assert expected_phrase in body["html"]
+
+
 def test_document_section_renders_te_data_cells(client_with_db, monkeypatch, tmp_path):
     """재무제표 데이터 셀은 TD가 아니라 <TE> 태그다 — 이를 셀로 처리하지 않으면
     계정과목/금액이 전부 빈 <tr></tr>로 렌더된다(§4-8 회귀). 실제 금액 값과

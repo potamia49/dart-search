@@ -412,7 +412,7 @@ async def get_document_section(
     if section not in SECTION_TITLE_MARKS:
         raise HTTPException(
             status_code=400,
-            detail=f"지원하지 않는 섹션입니다: {section!r} (bs|is|cf|notes)",
+            detail=f"지원하지 않는 섹션입니다: {section!r} (bs|is|cf|notes|audit)",
         )
 
     target_rcept_no = _resolve_target_rcept_no(db, job_id, result_id, rcept_no)

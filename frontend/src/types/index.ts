@@ -234,7 +234,7 @@ export interface FinancialSnapshotResponse {
 }
 
 /** §4-8 원문 섹션 열람 — GET .../document-sections/{section}. */
-export type DocumentSection = 'bs' | 'is' | 'cf' | 'notes'
+export type DocumentSection = 'audit' | 'bs' | 'is' | 'cf' | 'notes'
 
 export interface DocumentSectionResponse {
   section: string

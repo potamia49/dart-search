@@ -1,4 +1,4 @@
-"""감사보고서 원문 XML에서 특정 섹션(재무상태표/손익계산서/현금흐름표/주석)을
+"""감사보고서 원문 XML에서 특정 섹션(감사의견/재무상태표/손익계산서/현금흐름표/주석)을
 잘라 **서버에서 새로 조립한 안전한 HTML**로 변환한다 (§4-8, 2026-07-19).
 
 DART document.xml의 실측 구조(backend/tests/fixtures 30건):
@@ -22,12 +22,20 @@ from lxml import etree
 
 from app.parsers.xml_parser import _decode_raw_xml
 
-# 프론트 버튼 4개와 1:1 대응하는 섹션 키 → 원문 TITLE 매칭 문자열(공백 제거 기준).
+# 프론트 탭과 1:1 대응하는 섹션 키 → 원문 TITLE 매칭 문자열(공백 제거 기준).
+#
+# "audit"(감사보고서 본문 = 감사의견 문단)은 2026-07-20 추가했다. 실측(fixtures
+# 30건 전부)상 서식이 두 가지인데 — 신서식 "독립된 감사인의 감사보고서",
+# 2012년 구서식 "외부감사인의 감사보고서" — 공통 부분문자열 "감사보고서"로
+# 잡으면 둘 다 매칭된다(30/30). 그 부모 `<SECTION-1>`이 의견 문단과 표를
+# 통째로 담고 있어 다른 섹션과 동일한 "TITLE의 부모 컨테이너" 규칙이 그대로
+# 통한다. 목차의 "목 차" TITLE에는 이 문자열이 없어 오탐하지 않는다.
 SECTION_TITLE_MARKS: dict[str, str] = {
     "bs": "재무상태표",
     "is": "손익계산서",
     "cf": "현금흐름표",
     "notes": "주석",
+    "audit": "감사보고서",
 }
 
 # DART 원문 표의 셀 태그. 실측상 커버 페이지는 TD/TH를 쓰지만 **재무제표 데이터
@@ -93,7 +101,7 @@ def _render_block(el: etree._Element, out: list[str]) -> None:
 
 
 def extract_section_html(raw_xml: bytes, section: str) -> tuple[bool, str]:
-    """`raw_xml`에서 `section`(bs|is|cf|notes)에 해당하는 구간을 HTML로 잘라 반환.
+    """`raw_xml`에서 `section`(bs|is|cf|notes|audit)에 해당하는 구간을 HTML로 잘라 반환.
 
     반환값 `(found, html)` — 해당 섹션 TITLE을 원문에서 찾지 못하면
     `(False, "")`(재무제표/주석 미첨부 등, 에러가 아니라 안내 대상).

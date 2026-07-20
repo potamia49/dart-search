@@ -4,6 +4,9 @@ import type { DocumentSection, DocumentSectionResponse } from '../types'
 import { getDocumentSection } from '../api/results'
 
 const SECTION_LABELS: { value: DocumentSection; label: string }[] = [
+  // 감사의견을 맨 앞에 둔다 — 재무 수치를 읽기 전에 그 수치를 신뢰할 수 있는지
+  // (적정/한정/의견거절)부터 확인하는 게 검수 순서상 자연스럽다.
+  { value: 'audit', label: '감사의견' },
   { value: 'bs', label: '재무상태표' },
   { value: 'is', label: '손익계산서' },
   { value: 'cf', label: '현금흐름표' },
