@@ -1,8 +1,9 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useParams } from 'react-router-dom'
 import {
   Alert,
   Button,
+  CloseButton,
   Group,
   Loader,
   Pagination,
@@ -10,13 +11,22 @@ import {
   Table,
   Tabs,
   Text,
+  TextInput,
   Title,
+  UnstyledButton,
 } from '@mantine/core'
 import { notifications } from '@mantine/notifications'
 import { getJob } from '../api/jobs'
 import { exportResults, listResults } from '../api/results'
-import type { JobResponse, ParseStatus, ResultListResponse, ResultResponse } from '../types'
+import type {
+  JobResponse,
+  ParseStatus,
+  ResultListResponse,
+  ResultResponse,
+  SortDir,
+} from '../types'
 import { ALL_COLUMNS, DEFAULT_VISIBLE_KEYS, formatCell } from '../util/resultColumns'
+import type { ResultColumn } from '../util/resultColumns'
 import { summarizeJobConditions } from '../util/jobSummary'
 import ColumnToggle from '../components/ColumnToggle'
 import ResultDetailDrawer from '../components/ResultDetailDrawer'
@@ -32,6 +42,16 @@ type FilterTab =
   | 'EXCLUDED_ASSETS'
 
 const PAGE_SIZE = 50
+
+/** 검색어 입력마다 요청을 보내지 않도록 하는 디바운스 지연(ms) — SearchPage의
+ * 후보 수 미리보기와 같은 값을 쓴다. */
+const SEARCH_DEBOUNCE_MS = 400
+
+/** 컬럼의 정렬 필드명 — `sortKey: false`면 정렬 불가 컬럼이다. */
+function sortKeyOf(column: ResultColumn): string | null {
+  if (column.sortKey === false) return null
+  return column.sortKey ?? column.key
+}
 
 function tabToParams(tab: FilterTab): {
   parse_status?: ParseStatus
@@ -73,20 +93,63 @@ function FinancialsResultsView({ jobId }: { jobId: number }) {
   )
   const [selected, setSelected] = useState<ResultResponse | null>(null)
   const [exporting, setExporting] = useState(false)
+  const [search, setSearch] = useState('')
+  const [debouncedSearch, setDebouncedSearch] = useState('')
+  const [sortBy, setSortBy] = useState<string | null>(null)
+  const [sortDir, setSortDir] = useState<SortDir>('asc')
+
+  // 타이핑 중에 매 글자마다 요청하지 않도록 입력을 디바운스한다.
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedSearch(search.trim())
+      setPage(1)
+    }, SEARCH_DEBOUNCE_MS)
+    return () => clearTimeout(timer)
+  }, [search])
+
+  // 목록 조회와 다운로드가 공유하는 필터/정렬 조건. 매 렌더마다 새 객체가 되면
+  // 아래 useEffect가 무한 루프를 도므로 값이 바뀔 때만 다시 만든다.
+  const query = useMemo(
+    () => ({
+      ...tabToParams(tab),
+      q: debouncedSearch || undefined,
+      sort_by: sortBy ?? undefined,
+      sort_dir: sortDir,
+    }),
+    [tab, debouncedSearch, sortBy, sortDir],
+  )
 
   useEffect(() => {
     setLoading(true)
     setError(null)
-    listResults(jobId, { page, page_size: PAGE_SIZE, ...tabToParams(tab) })
+    listResults(jobId, { page, page_size: PAGE_SIZE, ...query })
       .then(setData)
       .catch(() => setError('결과를 불러오지 못했습니다. 백엔드 서버가 실행 중인지 확인하세요.'))
       .finally(() => setLoading(false))
-  }, [jobId, tab, page])
+  }, [jobId, page, query])
 
   function handleTabChange(next: string | null) {
     if (!next) return
     setTab(next as FilterTab)
     setPage(1)
+  }
+
+  /** 헤더 클릭 — 같은 컬럼이면 오름차순 → 내림차순 → 정렬 해제 순으로 순환한다. */
+  function handleSort(column: ResultColumn) {
+    const key = sortKeyOf(column)
+    if (!key) return
+    setPage(1)
+    if (sortBy !== key) {
+      setSortBy(key)
+      setSortDir('asc')
+      return
+    }
+    if (sortDir === 'asc') {
+      setSortDir('desc')
+      return
+    }
+    setSortBy(null)
+    setSortDir('asc')
   }
 
   function toggleColumn(key: keyof ResultResponse, visible: boolean) {
@@ -101,7 +164,8 @@ function FinancialsResultsView({ jobId }: { jobId: number }) {
   async function handleExport(format: 'xlsx' | 'csv') {
     setExporting(true)
     try {
-      await exportResults(jobId, format, tabToParams(tab))
+      // 화면에서 걸러 놓고 정렬한 그대로를 내려받게 한다.
+      await exportResults(jobId, format, query)
     } catch {
       notifications.show({ color: 'red', message: '다운로드에 실패했습니다.' })
     } finally {
@@ -128,6 +192,15 @@ function FinancialsResultsView({ jobId }: { jobId: number }) {
         </Tabs>
 
         <Group gap="xs">
+          <TextInput
+            placeholder="회사명·주소·대표자·업종·감사인 검색"
+            value={search}
+            onChange={(event) => setSearch(event.currentTarget.value)}
+            rightSection={
+              search ? <CloseButton size="sm" onClick={() => setSearch('')} /> : null
+            }
+            w={260}
+          />
           <ColumnToggle allColumns={ALL_COLUMNS} visibleKeys={visibleKeys} onToggle={toggleColumn} />
           <Button variant="default" loading={exporting} onClick={() => handleExport('xlsx')}>
             Excel 다운로드
@@ -159,9 +232,28 @@ function FinancialsResultsView({ jobId }: { jobId: number }) {
             <Table striped highlightOnHover withTableBorder>
               <Table.Thead>
                 <Table.Tr>
-                  {visibleColumns.map((col) => (
-                    <Table.Th key={col.key}>{col.label}</Table.Th>
-                  ))}
+                  {visibleColumns.map((col) => {
+                    const key = sortKeyOf(col)
+                    const active = key !== null && key === sortBy
+                    return (
+                      <Table.Th key={col.key}>
+                        {key === null ? (
+                          col.label
+                        ) : (
+                          <UnstyledButton
+                            onClick={() => handleSort(col)}
+                            style={{ fontWeight: 'inherit', fontSize: 'inherit' }}
+                            aria-label={`${col.label} 기준 정렬`}
+                          >
+                            {col.label}
+                            <Text component="span" c={active ? undefined : 'dimmed'} ml={4}>
+                              {active ? (sortDir === 'asc' ? '▲' : '▼') : '↕'}
+                            </Text>
+                          </UnstyledButton>
+                        )}
+                      </Table.Th>
+                    )
+                  })}
                 </Table.Tr>
               </Table.Thead>
               <Table.Tbody>

@@ -8,6 +8,7 @@ import type {
   ParseStatus,
   ResultListResponse,
   ResultResponse,
+  SortDir,
 } from '../types'
 
 export interface ListResultsParams {
@@ -19,6 +20,11 @@ export interface ListResultsParams {
   /** 감사보고서 공시(rcept_no)를 찾은 건만(true)/못 찾은 건만(false).
    * parse_status='FAILED'와 함께 써서 "파싱 실패"와 "원문 없음"을 구분한다. */
   has_disclosure?: boolean
+  /** 회사명/주소/대표자/업종/감사인명 부분일치 검색. */
+  q?: string
+  /** 정렬 컬럼(백엔드 화이트리스트 밖이면 기본 정렬로 무시된다)과 방향. */
+  sort_by?: string
+  sort_dir?: SortDir
 }
 
 export async function listResults(

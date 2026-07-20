@@ -26,6 +26,12 @@ class Result(Base):
     induty_name: Mapped[str | None] = mapped_column(String, nullable=True)
     fiscal_date: Mapped[str | None] = mapped_column(String, nullable=True)
     audit_opinion: Mapped[str | None] = mapped_column(String, nullable=True)
+    # 감사인(회계법인/감사반) 이름과 사무소 주소 (2026-07-20 추가, app/parsers/auditor.py).
+    # 주소는 원문 그대로이되 첫 토큰(시도)만 표준 시도명으로 정규화해 저장한다 —
+    # 화면은 앞 두 토큰을 잘라 "안경회계법인(경상남도 창원시)"로 표시한다.
+    # 서명란이 없는 원문(실측 31건 중 2건)은 이름만 채워지고 주소는 NULL이다.
+    auditor_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    auditor_address: Mapped[str | None] = mapped_column(String, nullable=True)
 
     # 요약 재무 (PRD 3-2): 당기(_cur) / 전기(_prv), 단위: 원
     current_assets_cur: Mapped[int | None] = mapped_column(Integer, nullable=True)

@@ -132,6 +132,7 @@ from app.models.fsc_corp_index import FscCorpIndex
 from app.models.job import Job, JobPhase, JobStatus
 from app.models.result import ParseStatus, Result
 from app.parsers.audit_opinion import extract_audit_opinion
+from app.parsers.auditor import AuditorInfo, extract_auditor
 from app.parsers.base import (
     CF_FINANCIAL_FIELDS,
     DIRECT_FINANCIAL_FIELDS,
@@ -708,6 +709,7 @@ def _apply_parsed_result(
     parsed: ParsedFinancials,
     audit_opinion: str | None,
     fiscal_date: str | None,
+    auditor: AuditorInfo | None = None,
 ) -> None:
     with session_factory() as db:
         result = db.get(Result, result_id)
@@ -718,6 +720,9 @@ def _apply_parsed_result(
             setattr(result, f"{f}_prv", parsed.values_prv.get(f))
         result.audit_opinion = audit_opinion
         result.fiscal_date = fiscal_date
+        auditor = auditor or AuditorInfo()
+        result.auditor_name = auditor.name
+        result.auditor_address = auditor.address
         result.parse_status = parsed.parse_status
         result.parse_note = parsed.parse_note
         db.commit()
@@ -773,10 +778,13 @@ async def _run_financial_parsing(
         else:
             raw_bytes = doc_path.read_bytes()
             suffix = doc_path.suffix.lower()
+            auditor = AuditorInfo()
             try:
                 if suffix == ".xml":
                     parsed = parse_xml_financials(raw_bytes)
                     raw_text = raw_bytes.decode("utf-8", errors="ignore")
+                    # 감사인은 XML 원문에서만 추출한다(PDF는 미지원 — 감사의견과 동일).
+                    auditor = extract_auditor(raw_bytes)
                 elif suffix == ".pdf":
                     parsed = parse_pdf_financials(raw_bytes)
                     raw_text = ""
@@ -798,7 +806,8 @@ async def _run_financial_parsing(
                 parsed = ParsedFinancials(parse_status="FAILED", parse_note=f"파싱 중 예외 발생: {exc}")
                 opinion = None
                 fiscal_date = None
-            _apply_parsed_result(session_factory, result_id, parsed, opinion, fiscal_date)
+                auditor = AuditorInfo()
+            _apply_parsed_result(session_factory, result_id, parsed, opinion, fiscal_date, auditor)
 
         done += 1
         if done % _CHECKPOINT_INTERVAL == 0 or done == total:

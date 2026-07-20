@@ -7,6 +7,9 @@ export interface ResultColumn {
   /** 값 하나만으로 표기를 정할 수 없는 컬럼용(예: 파싱상태는 rcept_no 유무에 따라
    * "실패"와 "공시 없음"을 구분해야 한다). 지정되면 format보다 우선한다. */
   formatRow?: (row: ResultResponse) => string
+  /** 이 컬럼으로 서버 정렬을 걸 때 쓸 필드명. 생략하면 `key`를 쓰고,
+   * false면 정렬을 지원하지 않는 컬럼(헤더 클릭 비활성). */
+  sortKey?: string | false
 }
 
 /** 재무제표 구분 — 재무상태표(bs) / 손익계산서(is) / 현금흐름표(cf). */
@@ -50,7 +53,25 @@ export const BASIC_COLUMNS: ResultColumn[] = [
   { key: 'induty_code', label: '업종코드' },
   { key: 'fiscal_date', label: '결산기준일' },
   { key: 'audit_opinion', label: '감사의견' },
+  // 감사인은 이름과 주소가 별도 컬럼으로 오지만, 화면에서는 "안경회계법인(경상남도
+  // 창원시)" 한 칸으로 합쳐 보여준다(정렬은 이름 기준).
+  {
+    key: 'auditor_name',
+    label: '감사인',
+    formatRow: (row) => formatAuditor(row.auditor_name, row.auditor_address) ?? '-',
+  },
 ]
+
+/** "안경회계법인(경상남도 창원시)" — 주소는 앞 두 토큰(시도/시군구)만 쓴다.
+ * 백엔드가 저장 시점에 시도를 표준명으로 정규화해 두므로 여기서 약칭을 펴지 않는다. */
+export function formatAuditor(
+  name: string | null | undefined,
+  address: string | null | undefined,
+): string | null {
+  if (!name) return null
+  const region = (address ?? '').split(/\s+/).filter(Boolean).slice(0, 2).join(' ')
+  return region ? `${name}(${region})` : name
+}
 
 // 재무 항목의 단일 소스 — 재무상태표/손익계산서/현금흐름표로 구분한다.
 // 당기·전기 표(ResultResponse)와 재무이력 표(FinancialSnapshotResponse)가
@@ -138,6 +159,7 @@ export const DEFAULT_VISIBLE_KEYS: (keyof ResultResponse)[] = [
   'corp_name',
   'address',
   'induty_name',
+  'auditor_name',
   'revenue_cur',
   'operating_income_cur',
   'net_income_cur',

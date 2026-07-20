@@ -74,6 +74,9 @@ _RESULTS_NEW_COLUMNS: dict[str, str] = {
     "cf_financing_prv": "INTEGER",
     "cf_ending_cash_cur": "INTEGER",
     "cf_ending_cash_prv": "INTEGER",
+    # 감사인(회계법인/감사반) 이름·주소 (2026-07-20, app/parsers/auditor.py)
+    "auditor_name": "TEXT",
+    "auditor_address": "TEXT",
 }
 # financial_snapshots(2026-07-15 STEP7 신설)에도 §4-8 CF 4컬럼을 추가한다.
 # 이 테이블은 이미 실 데이터가 있어 create_all이 컬럼을 못 붙이므로 ALTER 필요.

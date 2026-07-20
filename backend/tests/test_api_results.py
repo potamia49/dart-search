@@ -82,6 +82,8 @@ def _seed_job_with_results(factory) -> int:
                     induty_name="금속가공제품 제조업",
                     fiscal_date="20251231",
                     audit_opinion="적정",
+                    auditor_name="안경회계법인",
+                    auditor_address="경상남도 창원시 중앙대로 1",
                     revenue_cur=10_000_000_000,
                     revenue_prv=9_000_000_000,
                     parse_status=ParseStatus.OK,
@@ -123,6 +125,49 @@ def test_list_results_returns_seeded_rows(client_with_db):
     body = resp.json()
     assert body["total"] == 2
     assert len(body["items"]) == 2
+
+
+def test_list_results_sorts_by_column_and_pushes_missing_values_last(client_with_db):
+    """매출액 오름차순 정렬 — 값이 없는 행(파싱 실패)은 방향과 무관하게 항상 뒤로."""
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+
+    asc = client.get(
+        f"/api/jobs/{job_id}/results", params={"sort_by": "revenue_cur", "sort_dir": "asc"}
+    ).json()
+    assert [r["corp_name"] for r in asc["items"]] == ["㈜성공테스트", "㈜실패테스트"]
+
+    desc = client.get(
+        f"/api/jobs/{job_id}/results", params={"sort_by": "revenue_cur", "sort_dir": "desc"}
+    ).json()
+    # 내림차순이어도 revenue_cur=None인 ㈜실패테스트가 앞으로 오면 안 된다.
+    assert [r["corp_name"] for r in desc["items"]] == ["㈜성공테스트", "㈜실패테스트"]
+
+
+def test_list_results_rejects_unknown_sort_column(client_with_db):
+    """화이트리스트 밖의 컬럼명은 무시하고 기본 정렬로 되돌린다(500이 아니라 200)."""
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+
+    resp = client.get(f"/api/jobs/{job_id}/results", params={"sort_by": "id; DROP TABLE results"})
+    assert resp.status_code == 200
+    assert resp.json()["total"] == 2
+
+
+def test_list_results_filters_by_keyword_including_auditor(client_with_db):
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+
+    by_name = client.get(f"/api/jobs/{job_id}/results", params={"q": "성공"}).json()
+    assert [r["corp_name"] for r in by_name["items"]] == ["㈜성공테스트"]
+
+    # 감사인명도 검색 대상이다 — "안경회계법인이 감사한 회사만" 추리는 용도.
+    by_auditor = client.get(f"/api/jobs/{job_id}/results", params={"q": "안경회계"}).json()
+    assert by_auditor["total"] == 1
+    assert by_auditor["items"][0]["auditor_name"] == "안경회계법인"
+    assert by_auditor["items"][0]["auditor_address"] == "경상남도 창원시 중앙대로 1"
+
+    assert client.get(f"/api/jobs/{job_id}/results", params={"q": "없는회사"}).json()["total"] == 0
 
 
 def test_list_results_splits_failed_by_has_disclosure(client_with_db):

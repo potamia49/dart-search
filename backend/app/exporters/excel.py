@@ -35,6 +35,8 @@ RESULT_COLUMN_LABELS: dict[str, str] = {
     "induty_name": "업종명(미확정,FSC기준)",
     "fiscal_date": "결산기준일",
     "audit_opinion": "감사의견",
+    "auditor_name": "감사인",
+    "auditor_address": "감사인주소",
     # 요약 재무 (PRD 3-2) — 당기(_cur)/전기(_prv)
     "current_assets_cur": "유동자산(당기)",
     "current_assets_prv": "유동자산(전기)",

@@ -21,7 +21,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import Select, func, select
+from sqlalchemy import Select, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
@@ -36,15 +36,58 @@ from app.parsers.document_sections import SECTION_TITLE_MARKS, extract_section_h
 router = APIRouter(prefix="/api/jobs", tags=["results"])
 
 
+# 정렬 허용 컬럼 화이트리스트 (2026-07-20) — 임의 컬럼명을 그대로 ORDER BY에
+# 넣지 않기 위해 명시적으로 열거한다. 화면에 노출되는 컬럼과 1:1로 맞춘다.
+SORTABLE_COLUMNS: tuple[str, ...] = (
+    "corp_name",
+    "address",
+    "phone",
+    "ceo_name",
+    "induty_name",
+    "induty_code",
+    "fiscal_date",
+    "audit_opinion",
+    "auditor_name",
+    "auditor_address",
+    "parse_status",
+    "current_assets_cur", "current_assets_prv",
+    "noncurrent_assets_cur", "noncurrent_assets_prv",
+    "total_assets_cur", "total_assets_prv",
+    "current_liab_cur", "current_liab_prv",
+    "noncurrent_liab_cur", "noncurrent_liab_prv",
+    "total_liab_cur", "total_liab_prv",
+    "total_equity_cur", "total_equity_prv",
+    "revenue_cur", "revenue_prv",
+    "cogs_cur", "cogs_prv",
+    "gross_margin_cur", "gross_margin_prv",
+    "sga_cur", "sga_prv",
+    "operating_income_cur", "operating_income_prv",
+    "net_income_cur", "net_income_prv",
+    "cf_operating_cur", "cf_operating_prv",
+    "cf_investing_cur", "cf_investing_prv",
+    "cf_financing_cur", "cf_financing_prv",
+    "cf_ending_cash_cur", "cf_ending_cash_prv",
+)
+
+# 키워드 검색(`q`) 대상 컬럼 — 회사명/주소/감사인으로 좁혀 찾는 용도.
+_SEARCH_COLUMNS = ("corp_name", "address", "ceo_name", "induty_name", "auditor_name")
+
+
 def _build_results_query(
     job_id: int,
     parse_status: str | None = None,
     excluded_by_revenue: bool | None = None,
     excluded_by_assets: bool | None = None,
     has_disclosure: bool | None = None,
+    q: str | None = None,
 ) -> Select:
     """`results` 조회 쿼리 빌더 — `/results`(페이징)와 `/export`(전체)가 공유한다."""
     stmt = select(Result).where(Result.job_id == job_id)
+    if q:
+        keyword = f"%{q.strip()}%"
+        stmt = stmt.where(
+            or_(*(getattr(Result, col).ilike(keyword) for col in _SEARCH_COLUMNS))
+        )
     if parse_status is not None:
         stmt = stmt.where(Result.parse_status == parse_status)
     if has_disclosure is not None:
@@ -58,6 +101,21 @@ def _build_results_query(
     if excluded_by_assets is not None:
         stmt = stmt.where(Result.excluded_by_assets == (1 if excluded_by_assets else 0))
     return stmt
+
+
+def _apply_sort(stmt: Select, sort_by: str | None, sort_dir: str) -> Select:
+    """정렬 절을 붙인다 — 허용되지 않은 컬럼명은 무시하고 기본(id 오름차순)으로 둔다.
+
+    값이 없는 행(파싱 실패/미확보)은 오름차순·내림차순 어느 쪽이든 **항상 뒤로**
+    보낸다 — SQLite 기본 동작(ASC일 때 NULL이 맨 앞)대로 두면 "매출액 낮은 순"을
+    눌렀을 때 값 없는 행이 화면을 채워 정렬이 쓸모없어진다. 같은 값끼리는 id로
+    안정 정렬해 페이지를 넘겨도 순서가 흔들리지 않게 한다.
+    """
+    if not sort_by or sort_by not in SORTABLE_COLUMNS:
+        return stmt.order_by(Result.id.asc())
+    column = getattr(Result, sort_by)
+    ordering = column.desc() if sort_dir == "desc" else column.asc()
+    return stmt.order_by(column.is_(None), ordering, Result.id.asc())
 
 
 class ResultResponse(BaseModel):
@@ -76,6 +134,8 @@ class ResultResponse(BaseModel):
     induty_name: str | None
     fiscal_date: str | None
     audit_opinion: str | None
+    auditor_name: str | None
+    auditor_address: str | None
 
     current_assets_cur: int | None
     current_assets_prv: int | None
@@ -135,6 +195,9 @@ async def list_results(
     excluded_by_revenue: bool | None = None,
     excluded_by_assets: bool | None = None,
     has_disclosure: bool | None = None,
+    q: str | None = None,
+    sort_by: str | None = None,
+    sort_dir: str = "asc",
     db: Session = Depends(get_db),
 ) -> ResultListResponse:
     """결과 목록 페이징 조회.
@@ -146,13 +209,16 @@ async def list_results(
     - `has_disclosure`: true/false — 감사보고서 공시를 찾은 건만/못 찾은 건만
       (`rcept_no` 유무, 2026-07-20 추가). `parse_status=FAILED`와 함께 쓰면
       "실제 파싱 실패(검수 필요)"와 "원문 자체가 없음"을 구분할 수 있다.
+    - `q`: 회사명/주소/대표자/업종/감사인명 부분일치 검색 (2026-07-20 추가).
+    - `sort_by`/`sort_dir`: 정렬 컬럼(`SORTABLE_COLUMNS` 화이트리스트)과 방향
+      (`asc`/`desc`, 기본 오름차순). 값이 없는 행은 항상 뒤로 보낸다.
     """
     job = db.get(Job, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job을 찾을 수 없습니다.")
 
     stmt = _build_results_query(
-        job_id, parse_status, excluded_by_revenue, excluded_by_assets, has_disclosure
+        job_id, parse_status, excluded_by_revenue, excluded_by_assets, has_disclosure, q
     )
 
     total = db.execute(select(func.count()).select_from(stmt.subquery())).scalar_one()
@@ -161,7 +227,7 @@ async def list_results(
     page_size = max(min(page_size, 500), 1)
     rows = (
         db.execute(
-            stmt.order_by(Result.id.asc()).offset((page - 1) * page_size).limit(page_size)
+            _apply_sort(stmt, sort_by, sort_dir).offset((page - 1) * page_size).limit(page_size)
         )
         .scalars()
         .all()
@@ -229,12 +295,16 @@ async def export_job_results(
     excluded_by_revenue: bool | None = None,
     excluded_by_assets: bool | None = None,
     has_disclosure: bool | None = None,
+    q: str | None = None,
+    sort_by: str | None = None,
+    sort_dir: str = "asc",
     db: Session = Depends(get_db),
 ) -> Response:
     """결과 파일 다운로드 (xlsx/csv, 페이징 없이 필터를 통과한 전체 결과).
 
-    `parse_status`/`excluded_by_revenue`/`excluded_by_assets`/`has_disclosure`는
-    `/results`와 동일한 필터 의미다. `format`이 xlsx/csv가 아니면 400.
+    `parse_status`/`excluded_by_revenue`/`excluded_by_assets`/`has_disclosure`/
+    `q`/`sort_by`/`sort_dir`는 `/results`와 동일한 의미다 — 화면에서 걸러 놓고
+    정렬한 그대로를 내려받게 된다. `format`이 xlsx/csv가 아니면 400.
     """
     if format not in _EXPORT_CONTENT_TYPES:
         raise HTTPException(
@@ -247,9 +317,9 @@ async def export_job_results(
         raise HTTPException(status_code=404, detail="Job을 찾을 수 없습니다.")
 
     stmt = _build_results_query(
-        job_id, parse_status, excluded_by_revenue, excluded_by_assets, has_disclosure
+        job_id, parse_status, excluded_by_revenue, excluded_by_assets, has_disclosure, q
     )
-    rows = db.execute(stmt.order_by(Result.id.asc())).scalars().all()
+    rows = db.execute(_apply_sort(stmt, sort_by, sort_dir)).scalars().all()
 
     content = export_results(rows, format)
     filename = f"dart_search_job{job_id}_results.{format}"

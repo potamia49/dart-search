@@ -89,6 +89,10 @@ export interface ResultResponse {
   induty_name: string | null
   fiscal_date: string | null
   audit_opinion: string | null
+  /** 감사인(회계법인/감사반) 이름과 사무소 주소 — 원문 감사보고서에서 추출한다.
+   * 서명란이 없는 원문은 이름만 채워지고 주소는 null이다. */
+  auditor_name: string | null
+  auditor_address: string | null
 
   current_assets_cur: number | null
   current_assets_prv: number | null
@@ -198,6 +202,9 @@ export interface ValidateKeyResponse {
 }
 
 export type ExportFormat = 'xlsx' | 'csv'
+
+/** 결과 목록 정렬 방향 — 컬럼 헤더를 누를 때마다 오름차순 → 내림차순 → 해제 순으로 순환한다. */
+export type SortDir = 'asc' | 'desc'
 
 /** STEP 7(최근 N년 재무이력) — 회사×회계연도 단위 스냅샷 1건.
  * GET /api/jobs/{id}/results/{result_id}/history (backend/app/api/results.py). */
