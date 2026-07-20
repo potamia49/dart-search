@@ -49,7 +49,9 @@ from app.core.dart_client import DartClient, FscCorpInfoClient
 from app.core.dart_corp_index import (
     crawl_dart_corp_index,
     filter_local_candidates,
+    find_ambiguous_corp_codes,
     get_dart_index_status,
+    reconcile_ambiguous_rows,
 )
 from app.core.db import get_session_factory
 from app.core.fsc_financial_stat import crawl_fsc_financial_stat, get_financial_stat_status
@@ -299,6 +301,60 @@ async def refresh_dart_index(
     return DartIndexRefreshResponse(
         started=True,
         message="dart_corp_index 갱신을 백그라운드로 시작했습니다.",
+    )
+
+
+class DartIndexReconcileRequest(BaseModel):
+    """`max_groups`는 파일럿 확인용 — 미지정 시 위험 그룹 전체를 교정한다."""
+
+    max_groups: int | None = None
+
+
+class DartIndexReconcileResponse(BaseModel):
+    started: bool
+    message: str
+    group_count: int
+
+
+@router.post("/dart-index/reconcile", response_model=DartIndexReconcileResponse)
+async def reconcile_dart_index(
+    payload: DartIndexReconcileRequest,
+    background_tasks: BackgroundTasks,
+) -> DartIndexReconcileResponse:
+    """관리자용 — 동명 회사끼리 교차된 인덱스 행을 `company.json` 기준으로 교정한다.
+
+    `merge_by_position()`이 위치 결합의 어긋남을 회사명으로만 감지하기 때문에
+    **같은 이름끼리 자리가 바뀌면 잡히지 않는다**(2026-07-20 M8 6단계 검증에서
+    발견). 전수 재크롤 대신 위험 그룹(전체의 3.69%)만 DART 정본으로 되돌린다.
+
+    크롤과 달리 **DART 일일 호출 한도를 소모**하므로(그룹 구성원 1건당
+    company.json 1회) 크롤 완료 후 별도로 호출하는 단계로 분리했다.
+    """
+    with get_session_factory()() as db:
+        groups = find_ambiguous_corp_codes(db)
+    target = groups if payload.max_groups is None else groups[: payload.max_groups]
+    call_estimate = sum(len(codes) for codes in target)
+
+    async def _run_reconcile() -> None:
+        try:
+            async with DartClient() as client:
+                stats = await reconcile_ambiguous_rows(
+                    client,
+                    get_session_factory(),
+                    max_groups=payload.max_groups,
+                )
+            logger.info("dart_corp_index 동명 그룹 교정 완료: %s", stats)
+        except Exception:  # noqa: BLE001 - 백그라운드 작업은 여기서 흡수한다
+            logger.exception("dart_corp_index 동명 그룹 교정 중 예외 발생")
+
+    background_tasks.add_task(_run_reconcile)
+    return DartIndexReconcileResponse(
+        started=True,
+        message=(
+            f"동명 그룹 {len(target)}개(약 {call_estimate}건 조회) 교정을 "
+            "백그라운드로 시작했습니다."
+        ),
+        group_count=len(target),
     )
 
 

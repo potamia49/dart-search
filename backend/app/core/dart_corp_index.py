@@ -41,6 +41,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import Settings, get_settings
+from app.core.dart_client import DartApiError, QuotaExceededError
 from app.core.db import get_session_factory
 from app.core.filters import (
     cond_sido_list,
@@ -437,6 +438,161 @@ def upsert_dart_corp_index(db: Session, items: list[dict[str, Any]]) -> tuple[in
             updated += 1
     db.commit()
     return inserted, updated
+
+
+# ---------------------------------------------------------------------------
+# 동명 회사 교차 교정 (2026-07-20 — M8 6단계 검증 중 발견한 버그의 수정)
+# ---------------------------------------------------------------------------
+
+# `merge_by_position()`이 순서 어긋남을 감지하는 유일한 신호는 **회사명 비교**다
+# (`_names_align`). 그래서 같은 이름을 가진 회사끼리 자리가 바뀌면 이름 검사를
+# 그대로 통과하고 주소·업종이 조용히 교차된다 — 공시목록 페이지와 업종 엑셀이
+# 동명 회사에 대해 서로 다른 타이브레이크 순서를 쓰기 때문이다.
+#
+# 실측(2026-07-20, 표본 70건):
+#   - 위험군(동일 정규화명 + 동일 크롤 업종) 40건 → 불일치 42.5%
+#   - 대조군(이름 유일) 30건                      → 불일치 0.0%
+# 인덱스 118,268행 중 위험군은 4,366행(3.69%)뿐이므로, 전체를 다시 받지 않고
+# 이 그룹만 `company.json`으로 교정한다.
+#
+# **덮어쓰기가 아니라 순열 교정을 한다.** 교차는 그룹 내부의 순열이라 그룹이
+# 보유한 속성 집합 자체는 보존된다 — 그래서 `jurir_no`(법인등록번호, 두 소스가
+# 같은 13자리 무하이픈 형식으로 준다)를 키로 제자리를 찾아주면 주소뿐 아니라
+# 업종명·대표자·설립일까지 전 필드가 한 번에 복원된다. company.json 값으로
+# 덮어쓰기만 하면 `induty_name`처럼 company.json이 주지 않는 필드가 교차된 채
+# 남는다. `jurir_no`로 짝을 못 찾은 경우에만 company.json 값으로 폴백한다.
+
+# 순열 교정 시 corp_code를 제외하고 통째로 옮기는 필드 — 전부 엑셀 유래다.
+_PERMUTED_FIELDS = (
+    "corp_name",
+    "corp_name_norm",
+    "eng_name",
+    "disclosure_name",
+    "stock_code",
+    "corp_cls",
+    "ceo_name",
+    "jurir_no",
+    "bizr_no",
+    "address",
+    "sido",
+    "sigungu",
+    "homepage",
+    "induty_code",
+    "induty_name",
+    "est_date",
+    "acc_month",
+)
+
+
+def find_ambiguous_corp_codes(db: Session) -> list[list[str]]:
+    """속성 교차가 일어날 수 있는 그룹(동일 정규화명 + 동일 크롤 업종)을 돌려준다.
+
+    같은 업종 배치 안에서만 위치 결합이 일어나므로, 이름이 같아도 크롤 업종이
+    다르면 서로 섞일 수 없다 — 그룹 키에 `crawl_induty_code`를 포함하는 이유다.
+    """
+    rows = db.execute(
+        select(
+            DartCorpIndex.corp_code,
+            DartCorpIndex.corp_name_norm,
+            DartCorpIndex.crawl_induty_code,
+        )
+    ).all()
+    groups: dict[tuple[str, str], list[str]] = {}
+    for corp_code, name_norm, crawl_code in rows:
+        if not name_norm or not corp_code:
+            continue
+        groups.setdefault((name_norm, crawl_code or ""), []).append(corp_code)
+    return [codes for codes in groups.values() if len(codes) > 1]
+
+
+def _normalize_jurir_no(value: str | None) -> str | None:
+    return (value or "").replace("-", "").strip() or None
+
+
+def _apply_company_json(row: DartCorpIndex, company: dict[str, Any]) -> None:
+    """`jurir_no`로 짝을 못 찾았을 때의 폴백 — company.json이 주는 필드만 덮어쓴다.
+
+    `induty_name`은 company.json에 없으므로 지운다. 코드는 정본으로 바꿔 놓고
+    이름만 교차된 값으로 남겨두면 화면에 서로 어긋난 업종이 표시된다.
+    """
+    address = (company.get("adres") or "").strip() or None
+    sido, sigungu = parse_address(address or "")
+    row.address = address
+    row.sido = sido
+    row.sigungu = sigungu
+    row.ceo_name = company.get("ceo_nm") or None
+    row.jurir_no = _normalize_jurir_no(company.get("jurir_no"))
+    row.bizr_no = _normalize_jurir_no(company.get("bizr_no"))
+    row.induty_code = company.get("induty_code") or None
+    row.induty_name = None
+    row.est_date = company.get("est_dt") or None
+    row.acc_month = company.get("acc_mt") or None
+
+
+async def reconcile_ambiguous_rows(
+    dart_client: Any,
+    session_factory: sessionmaker[Session],
+    *,
+    max_groups: int | None = None,
+) -> dict[str, int]:
+    """동명 그룹의 교차된 속성을 `company.json` 기준으로 제자리에 돌려놓는다.
+
+    `QuotaExceededError`는 그대로 올려보내 호출부가 Job과 같은 방식으로 멈출 수
+    있게 한다 — 이미 교정한 그룹은 커밋돼 있으므로 다시 호출하면 이어서 진행된다
+    (교정이 끝난 그룹은 재실행해도 결과가 같은 멱등 연산이다).
+    """
+    with session_factory() as db:
+        groups = find_ambiguous_corp_codes(db)
+    if max_groups is not None:
+        groups = groups[:max_groups]
+
+    stats = {"groups": 0, "checked": 0, "repaired": 0, "fallback": 0, "failed": 0}
+    for codes in groups:
+        companies: dict[str, dict[str, Any]] = {}
+        for corp_code in codes:
+            try:
+                companies[corp_code] = await dart_client.get_company(corp_code)
+            except QuotaExceededError:
+                raise
+            except DartApiError as exc:
+                logger.warning("동명 그룹 교정 — company.json 실패 %s: %s", corp_code, exc)
+                stats["failed"] += 1
+            stats["checked"] += 1
+        if not companies:
+            continue
+
+        with session_factory() as db:
+            rows = {
+                row.corp_code: row
+                for row in db.execute(
+                    select(DartCorpIndex).where(DartCorpIndex.corp_code.in_(codes))
+                ).scalars()
+            }
+            # 교정 전 스냅샷 — 그룹이 보유한 속성 집합을 jurir_no로 색인한다.
+            snapshots = {
+                row.jurir_no: {field: getattr(row, field) for field in _PERMUTED_FIELDS}
+                for row in rows.values()
+                if row.jurir_no
+            }
+            for corp_code, company in companies.items():
+                row = rows.get(corp_code)
+                if row is None:
+                    continue
+                want = _normalize_jurir_no(company.get("jurir_no"))
+                source = snapshots.get(want) if want else None
+                if source is not None:
+                    if source["jurir_no"] != row.jurir_no:
+                        stats["repaired"] += 1
+                    for field, value in source.items():
+                        setattr(row, field, value)
+                else:
+                    # 그룹 안에 이 법인등록번호를 가진 행이 없다 — 엑셀이 애초에
+                    # 다른 회사를 담고 있었던 경우다. 정본으로 덮어쓴다.
+                    _apply_company_json(row, company)
+                    stats["fallback"] += 1
+            db.commit()
+        stats["groups"] += 1
+    return stats
 
 
 def _set_checkpoint(factory: sessionmaker[Session], code: str) -> None:

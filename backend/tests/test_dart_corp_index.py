@@ -17,10 +17,12 @@ from app.core.dart_corp_index import (
     DartIndexCrawlError,
     build_induty_code_lookup,
     filter_local_candidates,
+    find_ambiguous_corp_codes,
     merge_by_position,
     mid_level_codes,
     parse_industry_excel,
     parse_search_page,
+    reconcile_ambiguous_rows,
     upsert_dart_corp_index,
 )
 from app.core.filters import parse_address
@@ -387,3 +389,152 @@ def test_upsert_dart_corp_index_dedupes_within_batch(db_session_factory):
     )
     with db_session_factory() as db:
         assert upsert_dart_corp_index(db, merged) == (1, 0)
+
+
+# ---------------------------------------------------------------------------
+# 동명 회사 교차 교정 (2026-07-20, M8 6단계 검증에서 발견한 버그)
+# ---------------------------------------------------------------------------
+
+
+class _FakeCompanyClient:
+    """DartClient.get_company 대체 — corp_code -> company.json 페이로드."""
+
+    def __init__(self, payloads: dict[str, dict]) -> None:
+        self.payloads = payloads
+        self.calls: list[str] = []
+
+    async def get_company(self, corp_code: str) -> dict:
+        self.calls.append(corp_code)
+        return self.payloads[corp_code]
+
+
+def _seed_pair(db) -> None:
+    """실측 사례(동산밸브)를 그대로 옮긴 시드 — 두 행의 속성이 서로 뒤바뀐 상태다."""
+    from app.models.dart_corp_index import DartCorpIndex
+
+    db.add(
+        DartCorpIndex(
+            corp_code="01179565", corp_name="동산밸브 주식회사", corp_name_norm="동산밸브",
+            crawl_induty_code="29", jurir_no="2062110003835",
+            address="전라남도 여수시 화산1길 48-9", sido="전라남도", sigungu="여수시",
+            induty_code="2913", induty_name="펌프 및 압축기 제조업", ceo_name="여수대표",
+        )
+    )
+    db.add(
+        DartCorpIndex(
+            corp_code="00929714", corp_name="(주)동산밸브", corp_name_norm="동산밸브",
+            crawl_induty_code="29", jurir_no="1955110200281",
+            address="경상남도 김해시 진례면 고모로324번안길 167-2", sido="경상남도", sigungu="김해시",
+            induty_code="29133", induty_name="탭, 밸브 및 유사장치 제조업", ceo_name="김해대표",
+        )
+    )
+    db.commit()
+
+
+def test_find_ambiguous_corp_codes_groups_same_name_within_industry(db_session_factory):
+    """같은 이름이라도 크롤 업종이 다르면 위치 결합에서 섞일 수 없어 위험군이 아니다."""
+    from app.models.dart_corp_index import DartCorpIndex
+
+    with db_session_factory() as db:
+        _seed_pair(db)
+        db.add(
+            DartCorpIndex(
+                corp_code="00000009", corp_name="동산밸브(주)", corp_name_norm="동산밸브",
+                crawl_induty_code="68", jurir_no="9999999999999",
+            )
+        )
+        db.commit()
+        groups = find_ambiguous_corp_codes(db)
+
+    assert [sorted(g) for g in groups] == [["00929714", "01179565"]]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_restores_crossed_attributes_by_jurir_no(db_session_factory):
+    """핵심 회귀 — 교차된 주소/업종/대표자가 jurir_no 기준으로 제자리를 찾아야 한다.
+
+    company.json이 주지 않는 `induty_name`까지 복원되는 것이 덮어쓰기가 아니라
+    순열 교정을 택한 이유다.
+    """
+    from app.models.dart_corp_index import DartCorpIndex
+
+    with db_session_factory() as db:
+        _seed_pair(db)
+
+    client = _FakeCompanyClient(
+        {
+            # 정본: 01179565가 김해, 00929714가 여수 (인덱스와 정반대)
+            "01179565": {"jurir_no": "1955110200281", "adres": "경상남도 김해시 ..."},
+            "00929714": {"jurir_no": "2062110003835", "adres": "전라남도 여수시 ..."},
+        }
+    )
+    stats = await reconcile_ambiguous_rows(client, db_session_factory)
+
+    assert stats["repaired"] == 2
+    assert stats["fallback"] == 0
+    with db_session_factory() as db:
+        kimhae = db.get(DartCorpIndex, "01179565")
+        yeosu = db.get(DartCorpIndex, "00929714")
+    assert (kimhae.sido, kimhae.sigungu) == ("경상남도", "김해시")
+    assert kimhae.induty_code == "29133"
+    assert kimhae.induty_name == "탭, 밸브 및 유사장치 제조업"
+    assert kimhae.ceo_name == "김해대표"
+    assert (yeosu.sido, yeosu.sigungu) == ("전라남도", "여수시")
+    assert yeosu.induty_name == "펌프 및 압축기 제조업"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_leaves_already_correct_rows_untouched(db_session_factory):
+    """교차가 없던 그룹은 값이 그대로여야 한다(멱등) — repaired가 0으로 잡힌다."""
+    from app.models.dart_corp_index import DartCorpIndex
+
+    with db_session_factory() as db:
+        _seed_pair(db)
+
+    client = _FakeCompanyClient(
+        {
+            "01179565": {"jurir_no": "2062110003835", "adres": "전라남도 여수시 ..."},
+            "00929714": {"jurir_no": "1955110200281", "adres": "경상남도 김해시 ..."},
+        }
+    )
+    stats = await reconcile_ambiguous_rows(client, db_session_factory)
+
+    assert stats["repaired"] == 0
+    with db_session_factory() as db:
+        assert db.get(DartCorpIndex, "00929714").sigungu == "김해시"
+        assert db.get(DartCorpIndex, "01179565").sigungu == "여수시"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_falls_back_to_company_json_when_jurir_no_unknown(db_session_factory):
+    """그룹 안에 해당 법인등록번호가 없으면 정본 값으로 덮어쓴다.
+
+    엑셀이 애초에 다른 회사를 담고 있던 경우로, 순열 교정으로는 복원할 수 없다.
+    이때 `induty_name`은 지운다 — 코드만 정본으로 바꾸고 이름을 남겨두면
+    화면에 서로 어긋난 업종이 표시된다.
+    """
+    from app.models.dart_corp_index import DartCorpIndex
+
+    with db_session_factory() as db:
+        _seed_pair(db)
+
+    client = _FakeCompanyClient(
+        {
+            "01179565": {
+                "jurir_no": "7777777777777",
+                "adres": "부산광역시 사하구 다대로 1",
+                "induty_code": "29119",
+                "ceo_nm": "부산대표",
+            },
+            "00929714": {"jurir_no": "1955110200281", "adres": "경상남도 김해시 ..."},
+        }
+    )
+    stats = await reconcile_ambiguous_rows(client, db_session_factory)
+
+    assert stats["fallback"] == 1
+    with db_session_factory() as db:
+        row = db.get(DartCorpIndex, "01179565")
+    assert (row.sido, row.sigungu) == ("부산광역시", "사하구")
+    assert row.induty_code == "29119"
+    assert row.induty_name is None
+    assert row.ceo_name == "부산대표"
