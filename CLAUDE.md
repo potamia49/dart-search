@@ -1306,9 +1306,8 @@ API를 0건 호출하는 로컬 쿼리 단계가 됐다**는 것이다:
   #16/#17/#19(Phase 1 후보 목록)와 #22/#24다.
 - **`pytest tests/ -q` 247 passed**(기존 243 + 신규 4: 그룹 판별/순열 교정/멱등성/
   jurir_no 미매칭 폴백).
-- **다음 세션에서 판단할 것**: (a) 실전 Job을 더 완주시켜 `fsc_corp_index` 삭제 조건
-  ("실전 3건 이상 + 오매칭 0 유지")을 채울지, (b) 다른 시군구로도 오매칭 0이 유지되는지
-  표본 확인할지. (c) reconcile 자동화는 아래에서 완료했다.
+- (c) reconcile 자동화는 아래에서 완료했다. (a)/(b)는 다음 기록("`fsc_corp_index` 삭제
+  완료")에서 함께 처리했다.
 
 **크롤 → 동명 회사 교정 자동 연결 완료(2026-07-20, 위 (c)).** "재크롤 시
 `reconcile`을 반드시 이어서 호출할 것"을 사람이 기억해야 하는 수동 2단계로 둔 것
@@ -1459,6 +1458,51 @@ API를 0건 호출하는 로컬 쿼리 단계가 됐다**는 것이다:
   fixture `20260630000641`로 영업/투자/재무활동 각각 3개 초과 세부계정 +
   감사의견 "적정" + "기말의현금" children 빈 배열까지 확인) 포함
   `pytest tests/ -q` **249 passed**, `npm run build`/`npm run lint` 통과.
+
+**`fsc_corp_index` 삭제 완료 — 삭제 조건을 3개 시도로 채웠다(2026-07-21).**
+2026-07-20에 "실전 3건 이상 완주 + 오매칭 0 유지"를 삭제 조건으로 걸어두고
+보류했던 것을 이번 세션에서 채웠다. 서로 다른 시도 3곳(경상남도 김해시 —
+Job #24, 부산광역시 사상구 — Job #25, 전라남도 여수시 — Job #26)으로
+Phase 1+2를 전부 완주시켜 **지역 오매칭 0 / 상장사 혼입 0 / corp_code 중복
+0 / 진짜 파싱 실패 0**(FAILED는 전부 `rcept_no IS NULL`, 즉 감사보고서
+자체가 없는 정상 케이스)을 확인했다 — 표는 상세개발계획.md
+"`fsc_corp_index` 정리 판단" 참고.
+- **Job #26 진행 중 실제 인프라 문제를 겪었다**: 이 저장소 환경에서 반복
+  관찰돼 온 "uvicorn 중복 기동" 패턴이 이번엔 Job을 완전히 정지시켰다 —
+  두 프로세스가 동시에 port 8000을 두고 있다가(원인 불명, Windows 소켓
+  레벨의 포트 탈취로 추정) 실제 백그라운드 태스크를 돌리던 프로세스가
+  아웃바운드 연결 없이 멈췄고(CPU 사용량도 0에 가까움), job 상태는
+  DB에서 계속 RUNNING으로 남아 `resume`(PAUSED_QUOTA/FAILED만 허용)으로도
+  복구할 수 없었다. 중복 프로세스를 모두 정리하고 **DB에서 job 상태를
+  수동으로 FAILED로 되돌린 뒤** `resume`으로 재개해 완주시켰다 — B1
+  백필 루프가 `rcept_no IS NULL` 조건으로 스코프돼 있어 이미 처리된
+  23건을 건너뛰고 안전하게 이어졌다(멱등 확인됨). 이 우연한 사고가
+  결과적으로 "orphaned RUNNING job을 우회 복구하는 절차"를 실전
+  검증한 셈이다 — 별도 API/자동화는 추가하지 않았다(발생 빈도가 낮고
+  수동 개입으로 충분).
+- **삭제 범위**: `fsc_corp_index` 테이블(633,968행, `DROP TABLE` + `VACUUM`),
+  `app/core/fsc_index.py`, `app/models/fsc_corp_index.py`,
+  `tests/test_fsc_index.py`, `POST /api/meta/fsc-index/refresh` +
+  `GET /api/meta/fsc-index/status`(`app/api/meta.py`),
+  `Settings.fsc_index_ttl_days`, 프론트 `getFscIndexStatus()`/`FscIndexStatus`
+  (M8 5단계 이후 이미 호출처 0이던 죽은 코드). `cache_meta`의 체크포인트
+  키(`fsc_index_last_page`/`fsc_index_updated_at`)도 함께 정리했다.
+  **`fsc_financial_stat`(M8 2단계, 매출액/총자산 참고값)은 이름이 비슷하지만
+  완전히 별개 테이블이라 전혀 건드리지 않았다** — 혼동하기 쉬운 지점이라
+  명시해 둔다.
+- **검증**: `pytest tests/ -q` **249 passed**(회귀 없음 — 삭제로 줄어든
+  `test_fsc_index.py`의 테스트 수만큼 감소, 다른 세션이 그 사이 커밋한
+  `xml_parser.py`/`pipeline.py` 변경과도 충돌 없이 통과), `npm run build`/
+  `npm run lint` 통과. 실제 DB에서 테이블을 드롭한 뒤 백엔드를 재기동해
+  `GET /api/meta/fsc-index/status`가 404로 사라졌음을, `GET /api/meta/
+  dart-index/status`는 정상 응답함을 확인했다.
+- **동시 편집 주의**: 이 작업 도중 다른 세션이 같은 워킹트리에서 독립적으로
+  커밋 2건(`e723b90` 매출총이익 금액 교체 + 현금흐름표 세부계정 펼치기,
+  `260c7f9` "손실" 라벨 부호 반전 규칙 정교화)을 올렸다 — 파일 충돌은
+  없었다(내가 건드린 파일은 `app/api/meta.py`/`app/core/fsc_index.py`/
+  `app/models/*`/프론트 `api/meta.ts`·`types/index.ts`·
+  `IndexStatusNote.tsx`뿐이고, 다른 세션은 `xml_parser.py`/
+  `pipeline.py`/`account_detail.py`/`ResultDetailDrawer` 계열을 건드렸다).
 
 작업을 시작하기 전에 반드시 아래 두 문서를 먼저 읽으세요 —
 이 저장소의 유일한 진실 소스(source of truth)입니다.

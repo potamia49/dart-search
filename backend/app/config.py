@@ -47,11 +47,8 @@ class Settings(BaseSettings):
     # --- 캐시 갱신 주기 (일) ---
     corp_cache_ttl_days: int = 7
     corp_profile_ttl_days: int = 180
-    # fsc_corp_index(§4-7 Phase 1 A1) 전역 인덱스 TTL. corp_profile_ttl_days와
-    # 같은 철학(180일)이지만 완전히 다른 캐시 테이블의 갱신 주기라 별도 설정으로 둔다.
-    fsc_index_ttl_days: int = 180
-    # dart_corp_index(§4-10 M8, fsc_corp_index 대체) TTL. 기업개황은 연 1~2회
-    # 갱신을 전제로 하며, 전수 크롤이 약 23분이라 위 인덱스보다 갱신이 훨씬 싸다.
+    # dart_corp_index(§4-10 M8) TTL. 기업개황은 연 1~2회 갱신을 전제로 하며,
+    # 전수 크롤이 약 23분이라 갱신 비용이 낮다.
     dart_index_ttl_days: int = 180
 
     # --- 외부 API Base URL (하드코딩 X 대상은 아니지만, 한 곳에서 관리) ---

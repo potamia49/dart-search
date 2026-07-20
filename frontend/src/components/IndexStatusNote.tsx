@@ -4,7 +4,8 @@ import type { DartIndexStatus, FscFinancialStatus } from '../types'
 /**
  * Phase 1이 쓰는 두 전역 인덱스의 갱신 상태를 함께 보여준다(M8 5단계).
  *
- * 기존 `FscIndexStatusNote`(fsc_corp_index 1종)를 대체한다 — M8에서 후보를
+ * 구 `FscIndexStatusNote`(fsc_corp_index 1종, 2026-07-21 관련 코드 전체 삭제)를
+ * 대체한다 — M8에서 후보를
  * 찾는 정본이 `dart_corp_index`로 바뀌었고, 매출액/총자산 참고값이
  * `fsc_financial_stat`이라는 별도 인덱스로 분리됐기 때문이다.
  *

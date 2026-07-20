@@ -10,7 +10,6 @@ from app.models.corp_cache import CacheMeta, CorpCache
 from app.models.corp_profile import CorpProfile
 from app.models.dart_corp_index import DartCorpIndex
 from app.models.financial_snapshot import FinancialSnapshot
-from app.models.fsc_corp_index import FscCorpIndex
 from app.models.fsc_financial_stat import FscFinancialStat
 from app.models.job import Job
 from app.models.result import Result
@@ -23,7 +22,6 @@ __all__ = [
     "CorpProfile",
     "DartCorpIndex",
     "FinancialSnapshot",
-    "FscCorpIndex",
     "FscFinancialStat",
     "Job",
     "Result",

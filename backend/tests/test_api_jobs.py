@@ -132,7 +132,7 @@ def test_create_job_rejects_invalid_history_years(monkeypatch):
 
 def test_create_job_rejects_sigungu_for_unselected_sido(monkeypatch):
     """시군구를 지정한 시도가 선택된 시도 목록에 없으면 422 — filter_local_candidates가
-    sido 선필터(SQL IN) 없이 fsc_corp_index 전체를 메모리로 로드하는 것을 막는다."""
+    sido 선필터(SQL IN) 없이 dart_corp_index 전체를 메모리로 로드하는 것을 막는다."""
     client, _calls, _phase2_calls = _build_test_client(monkeypatch)
     try:
         payload = _sample_payload()

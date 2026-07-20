@@ -168,18 +168,6 @@ export interface QuotaResponse {
   remaining: number
 }
 
-/** GET /api/meta/fsc-index/status (2026-07-15 추가) — Phase 1이 쓰는
- * fsc_corp_index 전역 인덱스의 마지막 완료 갱신 시각/TTL 초과 여부.
- * 백엔드는 TTL이 지나도 자동 갱신하지 않고 로그에만 남기므로, 화면에서
- * 바로 확인할 수 있게 노출한다. */
-export interface FscIndexStatus {
-  row_count: number
-  last_completed_at: string | null
-  ttl_days: number
-  is_stale: boolean
-  crawl_in_progress: boolean
-}
-
 /** GET /api/meta/dart-index/status (M8 1단계) — Phase 1이 후보를 찾는 정본
  * 인덱스(`dart_corp_index`). **이게 비어 있으면 후보 확정이 즉시 실패한다.**
  * fsc_corp_index를 대체했으므로 화면에서 먼저 보여야 하는 쪽이다. */

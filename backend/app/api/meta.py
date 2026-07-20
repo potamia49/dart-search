@@ -5,18 +5,8 @@
     GET  /api/meta/industries            KSIC 대/중분류 트리
     GET  /api/meta/quota                 오늘 API 호출량 / 잔여량
     POST /api/meta/validate-key          .env의 DART API 키 유효성 확인
-    POST /api/meta/fsc-index/refresh     (§4-7 A1, 2026-07-15 추가) 금융위 전역
-                                          인덱스(fsc_corp_index) 전수/부분 크롤
-    GET  /api/meta/fsc-index/status      (2026-07-15 추가) 위 인덱스의 마지막
-                                          완료 갱신 시각/행 수/TTL 초과 여부.
-                                          사용자가 "다음 갱신은 내가 먼저
-                                          물어봐야 아나?"라고 물어 화면에서
-                                          바로 보이게 추가했다 — 백엔드가
-                                          TTL 초과를 자동으로 알려주지 않고
-                                          로그에만 남기던 것의 보완.
     POST /api/meta/dart-index/refresh    (§4-10 M8, 2026-07-20 추가) DART 기업개황
                                           전역 인덱스(dart_corp_index) 크롤.
-                                          fsc_corp_index를 대체하며 실측 약 23분.
     GET  /api/meta/dart-index/status      (2026-07-20 추가) 위 인덱스의 행 수/
                                           마지막 완료 시각/진행 중 여부.
     POST /api/meta/candidates-preview    (2026-07-17 추가) 지역/업종 조건만으로
@@ -28,10 +18,10 @@
 모두 정적 데이터(`app/core/region_data.py`/`app/core/industry_data.py`)를
 그대로 직렬화해 반환할 뿐 DB/외부 API 호출이 없다.
 
-`/api/meta/fsc-index/refresh`는 관리자 전용 — Job 실행(run_job_phase1)
-안에서는 절대 트리거되지 않는 A1(전수 크롤, 약 12,821페이지/10시간 소요
-추정)을 명시적으로 시작하는 유일한 경로다. 이번 세션에서는 실제로 호출되지
-않았고 구현/테스트만 됐다(CLAUDE.md 참고).
+`fsc-index/refresh`·`fsc-index/status`(구 A1, `fsc_corp_index` 전역 인덱스)는
+M8 3단계에서 `dart_corp_index` 기반 파이프라인으로 교체된 뒤 삭제 조건
+("신 파이프라인 실전 Job 3건 이상 완주 + 오매칭 0 유지")을 채워
+2026-07-21 함께 제거했다 — 상세개발계획.md 참고.
 """
 
 from __future__ import annotations
@@ -55,7 +45,6 @@ from app.core.dart_corp_index import (
 )
 from app.core.db import get_session_factory
 from app.core.fsc_financial_stat import crawl_fsc_financial_stat, get_financial_stat_status
-from app.core.fsc_index import crawl_fsc_index, get_fsc_index_status
 from app.core.industry_data import INDUSTRIES
 from app.core.region_data import REGIONS
 
@@ -164,82 +153,6 @@ async def validate_key(payload: ValidateKeyRequest) -> ValidateKeyResponse:
         result.data_go_kr = KeyCheckResult(valid=valid, message=message)
 
     return result
-
-
-# 전수 크롤(A1) 감독 재시도 정책 — 페이지 단위 요청 자체의 재시도는
-# `FscCorpInfoClient._get_with_retry`가 담당하고, 이 상수는 그 재시도까지
-# 소진된 뒤 크롤 태스크 전체가 죽었을 때 체크포인트에서 다시 살리는 바깥쪽
-# 루프(`_run_crawl`)용이다.
-_FSC_CRAWL_OUTER_RETRIES = 100
-_FSC_CRAWL_OUTER_BACKOFF_SEC = 30
-
-
-class FscIndexRefreshRequest(BaseModel):
-    """`max_pages`를 지정하지 않으면(None) 전체 페이징(약 12,821페이지, 실측
-    약 10.2시간 예상)을 시도한다 — 신중히 호출할 것(§4-7)."""
-
-    max_pages: int | None = None
-    force: bool = False
-
-
-class FscIndexRefreshResponse(BaseModel):
-    started: bool
-    message: str
-
-
-@router.post("/fsc-index/refresh", response_model=FscIndexRefreshResponse)
-async def refresh_fsc_index(
-    payload: FscIndexRefreshRequest,
-    background_tasks: BackgroundTasks,
-) -> FscIndexRefreshResponse:
-    """관리자용 — `fsc_corp_index`(§4-7 Phase 1 A1) 전역 인덱스 크롤을 백그라운드로 트리거.
-
-    `app/core/pipeline.py::run_job_phase1()`은 이 크롤을 절대 직접 실행하지
-    않는다(Job 하나의 실행 안에서 10시간짜리 작업을 트리거하면 안 되므로) —
-    이 엔드포인트가 그 크롤을 시작하는 유일한 경로다. `max_pages`를 지정하면
-    그 페이지 수만큼만 처리하고 체크포인트를 남긴 뒤 중단하며(파일럿/테스트용),
-    다시 호출하면 이어서 진행한다. `force=True`면 체크포인트를 무시하고
-    1페이지부터 다시 시작한다.
-    """
-
-    outer_attempts = _FSC_CRAWL_OUTER_RETRIES if payload.max_pages is None else 1
-
-    async def _run_crawl() -> None:
-        """전수 크롤(`max_pages=None`)은 실행에 수십 시간 걸리는 장시간 작업이라
-        네트워크 일시 단절(DNS 실패, 타임아웃 등) 한 번에 통째로 죽으면 그때마다
-        사람이 상태를 확인해 수동으로 재트리거해야 했다(2026-07-16 실측, 약 4시간
-        사이 2회 발생). `crawl_fsc_index`가 체크포인트로 이어하기 가능하다는 점을
-        이용해, 예외 발생 시 일정 대기 후 자동으로 다시 호출하는 감독 루프를
-        추가했다. `max_pages`가 지정된 파일럿/테스트 호출은 의도적으로 부분
-        실행이므로 재시도하지 않는다(기존 동작 그대로 1회만 시도).
-        """
-        for attempt in range(1, outer_attempts + 1):
-            client = FscCorpInfoClient()
-            try:
-                result = await crawl_fsc_index(
-                    client,
-                    get_session_factory(),
-                    max_pages=payload.max_pages,
-                    # force는 최초 시도에만 적용한다 — 재시도는 이전 시도가 남긴
-                    # 체크포인트를 그대로 이어서 진행해야 하므로 항상 force=False.
-                    force=payload.force if attempt == 1 else False,
-                )
-                logger.info("fsc_corp_index 갱신 완료: %s", result)
-                return
-            except Exception:  # noqa: BLE001 - 백그라운드 작업은 여기서 반드시 흡수해야 한다
-                logger.exception(
-                    "fsc_corp_index 갱신 중 예외 발생(attempt=%s/%s)", attempt, outer_attempts
-                )
-                if attempt < outer_attempts:
-                    await asyncio.sleep(_FSC_CRAWL_OUTER_BACKOFF_SEC)
-            finally:
-                await client.aclose()
-
-    background_tasks.add_task(_run_crawl)
-    return FscIndexRefreshResponse(
-        started=True,
-        message="fsc_corp_index 갱신을 백그라운드로 시작했습니다.",
-    )
 
 
 class DartIndexRefreshRequest(BaseModel):
@@ -454,25 +367,6 @@ class FscFinancialStatusResponse(BaseModel):
 @router.get("/fsc-financial/status", response_model=FscFinancialStatusResponse)
 async def get_fsc_financial_status_endpoint() -> FscFinancialStatusResponse:
     return FscFinancialStatusResponse(**get_financial_stat_status())
-
-
-class FscIndexStatusResponse(BaseModel):
-    row_count: int
-    last_completed_at: str | None
-    ttl_days: int
-    is_stale: bool
-    crawl_in_progress: bool
-
-
-@router.get("/fsc-index/status", response_model=FscIndexStatusResponse)
-async def get_fsc_index_status_endpoint() -> FscIndexStatusResponse:
-    """`fsc_corp_index`의 마지막 완료 갱신 시각/행 수/TTL 초과 여부.
-
-    Phase 1 Job(`run_job_phase1`)은 TTL이 지나도 자동으로 갱신하지 않고
-    로그에만 경고를 남긴다 — 화면에서 이 상태를 바로 확인할 수 있게
-    SearchPage/JobsPage가 이 엔드포인트를 호출한다.
-    """
-    return FscIndexStatusResponse(**get_fsc_index_status())
 
 
 # data.go.kr GetFinaStatInfoService_V2(A3가 호출하는 금융위 재무정보 API)의
