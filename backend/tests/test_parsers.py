@@ -125,6 +125,20 @@ def test_account_name_aliases_cover_gross_profit_and_loss_labels():
         ("Ⅴ. 영업이익", 1_843_858_188, 1_843_858_188),
         ("Ⅴ. 영업이익", -500_000, -500_000),  # 음수 "이익" = 손실이 이미 정확히 반영됨
         (None, None, None),
+        # 라벨 글자 사이에 공백을 넣어 쓰는 회사(2026-07-21 dart-qa 실측 버그 —
+        # 부호 판정을 raw 라벨 그대로 하면 "손실"/"이익" 부분문자열 매칭이 깨져
+        # 오분류됐다. alias 조회와 동일하게 normalize_account_label로 공백을 제거한
+        # 뒤 판정하도록 고쳐 두 오류 모드를 모두 잡는다).
+        # B형: 순수손실인데 공백 때문에 "손실"이 안 잡혀 미반전됐던 케이스 →
+        # 이제 반전된다(실측 20260413003038 "영    업    손    실").
+        ("Ⅴ.영    업    손    실", 3_340_597_574, -3_340_597_574),
+        ("V.영  업  손 실", 145_517_403, -145_517_403),  # 실측 20250324000071
+        # A형: 조합형인데 공백 때문에 "이익"이 안 잡혀 순수손실로 오인·반전됐던
+        # 케이스 → 이제 원문 부호를 그대로 신뢰한다(뒤집지 않는다).
+        # 실측 20230404002324: 원문 괄호 음수(손실) → 그대로 음수 저장.
+        ("Ⅲ.매  출 총 이 익(손실)", -2_146_389_859, -2_146_389_859),
+        # 실측 20260406000276: 원문 양수(흑자) → 그대로 양수 저장(예전엔 손실로 반전).
+        ("Ⅹ.당 기 순 이 익(손실)", 1_516_598_502, 1_516_598_502),
     ],
 )
 def test_apply_sign_flips_loss_only_rows_regardless_of_raw_sign(raw_label, value, expected):
@@ -318,6 +332,31 @@ def test_parse_xml_financials_service_format_missing_cogs_sga():
     assert parsed.values_cur["total_assets"] is not None
 
 
+def test_determine_parse_status_missing_gross_profit_subtotal_is_partial():
+    """매출원가는 있지만 매출총이익 소계 행이 생략된 서식은 PARTIAL이어야 한다.
+
+    위 test_..._missing_cogs_sga(cogs 자체가 없는 케이스)와 달리, cogs는 원문에
+    정상 존재하고 "매출총이익" 소계 행만 생략된 서식을 고정한다 — 이때
+    gross_profit만 None으로 남고 나머지 12항목은 모두 채워진다.
+
+    회귀 배경(의도된 승격): 커밋 e723b90에서 계산값 gross_margin을 원문 직접
+    파싱값 gross_profit으로 교체하면서 DIRECT_FINANCIAL_FIELDS가 표준 13항목과
+    동일해졌고, gross_profit이 determine_parse_status의 필수 판정 항목으로 자동
+    승격됐다. 이 승격은 의도된 동작이다(표준 13항목 정합성 기준으로 엄격하게
+    검수 대상을 남긴다 — 사용자 확정 2026-07-21). 이 테스트는 그 판정이 우발적
+    회귀가 아니라 의도임을 고정한다.
+    """
+    values_cur = {f: 1.0 for f in DIRECT_FINANCIAL_FIELDS}
+    values_cur["gross_profit"] = None  # 매출총이익 소계 행이 원문에 없음
+    assert values_cur["cogs"] is not None  # 매출원가는 정상 존재(cogs 결측 케이스와 구분)
+    values_prv = dict(values_cur)
+
+    status, note = determine_parse_status(values_cur, values_prv, found_any_table=True)
+
+    assert status == "PARTIAL"
+    assert "gross_profit" in note
+
+
 def test_parse_xml_financials_recovers_from_malformed_entities():
     """2012년 원문(rcept_no=20120110000251)은 본문에 이스케이프 안 된 "&cr;"
     이 섞여 있어 엄격 XML 파싱은 실패한다 — recover 모드로 구조를 살려
@@ -490,6 +529,57 @@ def test_parse_xml_financials_recovers_cf_item_reference_suffix():
     assert parsed.values_cur["cf_operating"] == 2_911_566_054
     assert parsed.values_cur["cf_investing"] == -2_346_232_906
     assert parsed.values_cur["cf_financing"] == 493_727_628
+
+
+def test_parse_xml_financials_spaced_label_sign_type_a_combined():
+    """A형 부호 버그(2026-07-21 dart-qa 실측): 라벨 글자 사이 공백이 들어간
+    조합형 "매  출 총 이 익(손실)"(이익-primary)은 raw 라벨로는 "이익"이 안 잡혀
+    순수손실로 오인·반전됐다. 정규화 라벨로 판정하면 원문 부호를 그대로 신뢰해야
+    한다 — 당기 원문은 전부 괄호(손실)이므로 음수로 저장돼야 한다(태영에스티엠).
+    """
+    parsed = parse_xml_financials(_read_fixture("20230404002324"))
+    assert parsed.parse_status == "OK"
+    # 당기: 매출 74.6억 < 매출원가 96.1억 → 매출총손실. 조합형 원문 부호(괄호)를 신뢰.
+    assert parsed.values_cur["gross_profit"] == -2_146_389_859
+    assert parsed.values_cur["operating_income"] == -3_041_861_373
+    assert parsed.values_cur["net_income"] == -3_914_280_052
+    # 전기는 흑자(양수)로 그대로 유지.
+    assert parsed.values_prv["gross_profit"] == 1_942_965_125
+    assert parsed.values_prv["net_income"] == 699_523_641
+    # 회계 항등식: 매출총이익 == 매출액 - 매출원가.
+    assert parsed.values_cur["gross_profit"] == parsed.values_cur["revenue"] - parsed.values_cur["cogs"]
+
+
+def test_parse_xml_financials_spaced_label_sign_type_b_pure_loss():
+    """B형 부호 버그(2026-07-21 dart-qa 실측): 라벨 글자 사이 공백이 들어간
+    순수손실 "영    업    손    실"은 raw 라벨로는 "손실"이 안 잡혀 미반전됐다.
+    정규화 라벨로 판정하면 반전돼 음수(영업손실)로 저장돼야 한다. 이 문서는
+    손실-primary 조합형 "매출총손실(이익)"도 함께 담고 있다(원프렌지).
+    """
+    parsed = parse_xml_financials(_read_fixture("20260413003038"))
+    assert parsed.parse_status == "OK"
+    # 순수손실 "영업손실" 당기 원문 3,340,597,574(양수) → 반전 → 음수.
+    assert parsed.values_cur["operating_income"] == -3_340_597_574
+    # 손실-primary "매출총손실(이익)" 당기 원문 2,574,766,473(양수=손실) → 반전 → 음수.
+    assert parsed.values_cur["gross_profit"] == -2_574_766_473
+    assert parsed.values_cur["gross_profit"] == parsed.values_cur["revenue"] - parsed.values_cur["cogs"]
+
+
+def test_parse_xml_financials_loss_primary_combined_labels_are_reversed():
+    """손실-primary 조합형 라벨("매출총손실(이익)"/"영업손실(이익)"/"당기순손실
+    (이익)")은 이익-primary와 원문 부호 의미가 반대다 — 양수=손실, 괄호=이익이라
+    반드시 반전해야 한다(2026-07-21 dart-qa 실측 검증 중 회계 항등식으로 발견,
+    공백 없는 깔끔한 표기의 템스코로 whitespace 교란 없이 규칙 자체를 잠근다).
+    """
+    parsed = parse_xml_financials(_read_fixture("20250414000612"))
+    assert parsed.parse_status == "OK"
+    # 당기 전부 손실(원문 양수) → 반전 → 음수.
+    assert parsed.values_cur["gross_profit"] == -166_892_583
+    assert parsed.values_cur["operating_income"] == -1_682_630_773
+    assert parsed.values_cur["net_income"] == -2_986_414_346
+    # 전기는 원문 괄호(=이익) → 반전 → 양수.
+    assert parsed.values_prv["net_income"] == 367_054_034
+    assert parsed.values_cur["gross_profit"] == parsed.values_cur["revenue"] - parsed.values_cur["cogs"]
 
 
 def test_parse_xml_financials_invalid_xml_returns_failed():
