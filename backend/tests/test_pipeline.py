@@ -756,6 +756,61 @@ async def test_run_document_download_skips_existing_local_cache(db_session_facto
 
 
 # ---------------------------------------------------------------------------
+# Phase 2 처리 순서 — 조건 밴드 근접도 정렬 (§4-10-D)
+# ---------------------------------------------------------------------------
+
+
+def test_band_proximity_scores_ranks_near_band_first_and_places_unknown_in_middle():
+    cond_revenue = {"min_krw": 6_000_000_000, "max_krw": 15_000_000_000}
+    # 밴드 중심(기하평균)은 약 94.9억. 참고값이 없는 후보는 제외되지 않고 중간 순위.
+    refs = [
+        (100_000_000, None),  # 1억 — 밴드에서 아주 멀다
+        (9_000_000_000, None),  # 90억 — 중심에 가장 가깝다
+        (None, None),  # 참고값 없음 → 중간
+        (40_000_000_000, None),  # 400억 — 멀다
+    ]
+
+    scores = pipeline._band_proximity_scores(refs, cond_revenue, {})
+    order = [i for _, i in sorted(zip(scores, range(len(refs))), key=lambda p: p[0])]
+
+    assert order[0] == 1  # 가장 가까운 후보가 먼저
+    assert order.index(2) not in (0, len(refs) - 1)  # 참고값 없는 후보는 중간
+
+
+def test_band_proximity_scores_keep_original_order_without_conditions():
+    refs = [(9_000_000_000, None), (100_000_000, None), (None, None)]
+
+    scores = pipeline._band_proximity_scores(refs, {}, {})
+
+    assert scores == [0.0, 0.0, 0.0]  # 조건이 없으면 동점 → 안정 정렬로 id順 유지
+
+
+@pytest.mark.asyncio
+async def test_run_document_download_processes_near_band_candidates_first(
+    db_session_factory, tmp_path
+):
+    settings = Settings(document_cache_dir=str(tmp_path / "documents"))
+    job_id = _make_job(
+        db_session_factory,
+        cond_revenue={"min_krw": 6_000_000_000, "max_krw": 15_000_000_000},
+    )
+    with db_session_factory() as db:
+        # 삽입 순서는 "먼 후보 → 참고값 없음 → 가까운 후보" — 정렬이 없으면 이 순서 그대로 처리된다.
+        db.add(Result(job_id=job_id, corp_code="A1", rcept_no="R_FAR", ref_revenue=100_000_000))
+        db.add(Result(job_id=job_id, corp_code="A2", rcept_no="R_UNKNOWN"))
+        db.add(Result(job_id=job_id, corp_code="A3", rcept_no="R_NEAR", ref_revenue=9_000_000_000))
+        db.commit()
+
+    client = FakeDartClient(
+        documents={key: _make_zip(f"{key}.xml") for key in ("R_FAR", "R_UNKNOWN", "R_NEAR")}
+    )
+
+    await pipeline._run_document_download(client, db_session_factory, settings, job_id)
+
+    assert client.document_calls == ["R_NEAR", "R_UNKNOWN", "R_FAR"]
+
+
+# ---------------------------------------------------------------------------
 # run_job — Job 생명주기 / 체크포인트 / 쿼터 일시정지 / 취소
 # ---------------------------------------------------------------------------
 

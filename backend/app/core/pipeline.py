@@ -101,7 +101,9 @@ import json
 import logging
 import re
 import zipfile
+from collections.abc import Sequence
 from datetime import datetime, timedelta
+from math import log
 from pathlib import Path
 from typing import Any
 
@@ -630,6 +632,109 @@ async def _ensure_document_cached(
     return target_dir
 
 
+# ---------------------------------------------------------------------------
+# Phase 2 처리 순서 — 조건 밴드 근접도 정렬 (§4-10-D, 2026-07-20 추가)
+# ---------------------------------------------------------------------------
+#
+# M8에서 A3(FSC 기반 사전 스크리닝)를 폐기해(§4-10-C) Phase 2가 다뤄야 할
+# 후보 수가 늘었다. 끝까지 돌리면 결과는 순서와 무관하게 동일하지만, 일일
+# 한도로 중단(PAUSED_QUOTA)되면 그날 확보되는 결과가 무작위 표본이 된다.
+# 그래서 Phase 2의 세 루프를 "조건 밴드 중심에 가까운 후보부터" 처리한다
+# — Phase 1이 남긴 참고값(`results.ref_revenue`/`ref_total_assets`, FSC
+# 스냅샷 유래)을 정렬에만 쓰고 **제외에는 절대 쓰지 않으므로** false
+# negative 위험이 0이다(판정은 여전히 B4 한 곳). 실측 효과는 §4-10-D 참고
+# (처리 상위 30%에서 실제 대상의 92.2% 확보).
+
+
+def _band_center(cond: dict[str, Any]) -> float | None:
+    """조건 밴드의 중심값. 상·하한이 모두 있으면 기하평균(로그 척도의 중앙)."""
+    min_krw = cond.get("min_krw")
+    max_krw = cond.get("max_krw")
+    if min_krw and max_krw and min_krw > 0 and max_krw > 0:
+        return (float(min_krw) * float(max_krw)) ** 0.5
+    if min_krw and min_krw > 0:
+        return float(min_krw)
+    if max_krw and max_krw > 0:
+        return float(max_krw)
+    return None
+
+
+def _band_distance(value: int | None, center: float | None) -> float | None:
+    """참고값과 밴드 중심의 로그 거리. 금액은 자릿수 차이가 크므로 로그 척도를 쓴다."""
+    if value is None or center is None or value <= 0:
+        return None
+    return abs(log(float(value)) - log(center))
+
+
+def _band_proximity_scores(
+    refs: Sequence[tuple[int | None, int | None]],
+    cond_revenue: dict[str, Any],
+    cond_total_assets: dict[str, Any],
+) -> list[float]:
+    """후보별 정렬 점수(작을수록 먼저 처리)를 계산한다.
+
+    매출액·총자산 조건이 둘 다 있으면 두 로그 거리의 평균을 쓰고, 한쪽만
+    있으면 그쪽만 쓴다. **참고값이 없는 후보는 제외하지 않고 중간 순위**에
+    배치한다(§4-10-D) — 확보된 점수들의 중앙값을 부여하면 자연스럽게
+    "가까운 것 뒤, 먼 것 앞"에 놓인다. 조건이 아예 없거나 참고값이 하나도
+    없으면 전원 동점이 되어 기존 순서(id順)가 그대로 유지된다.
+    """
+    revenue_center = _band_center(cond_revenue)
+    assets_center = _band_center(cond_total_assets)
+
+    known: list[float | None] = []
+    for ref_revenue, ref_total_assets in refs:
+        distances = [
+            d
+            for d in (
+                _band_distance(ref_revenue, revenue_center),
+                _band_distance(ref_total_assets, assets_center),
+            )
+            if d is not None
+        ]
+        known.append(sum(distances) / len(distances) if distances else None)
+
+    measured = sorted(d for d in known if d is not None)
+    if not measured:
+        return [0.0] * len(known)
+    mid = len(measured) // 2
+    # 짝수 개일 때 위쪽 값을 그대로 쓰면 참고값 없는 후보가 그 후보와 동점이 되어
+    # 안정 정렬상 항상 뒤로 밀린다 — 두 중앙값의 평균을 써서 정확히 중간에 놓는다.
+    median = measured[mid] if len(measured) % 2 else (measured[mid - 1] + measured[mid]) / 2
+    return [median if d is None else d for d in known]
+
+
+def _sort_rows_by_band_proximity(
+    rows: Sequence[tuple[Any, ...]],
+    cond_revenue: dict[str, Any],
+    cond_total_assets: dict[str, Any],
+) -> list[tuple[Any, ...]]:
+    """`(..., ref_revenue, ref_total_assets)` 꼴의 행들을 밴드 근접도順으로 정렬.
+
+    참고값 두 컬럼은 행의 마지막 두 원소여야 한다. 동점은 원래 순서(쿼리의
+    id順)를 유지하는 안정 정렬이라 페이지를 넘겨도 순서가 흔들리지 않는다.
+    """
+    scores = _band_proximity_scores([(row[-2], row[-1]) for row in rows], cond_revenue, cond_total_assets)
+    return [row for _, row in sorted(zip(scores, rows), key=lambda pair: pair[0])]
+
+
+def _load_band_conditions(
+    session_factory: sessionmaker[Session], job_id: int
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Job의 매출액·총자산 조건을 정렬용으로 읽는다(없으면 빈 dict).
+
+    세 루프의 시그니처를 바꾸지 않고 정렬을 넣기 위해 각 루프가 직접
+    호출한다 — 구 파이프라인(`run_job`)과 `retry_failed_parsing`도 별도
+    수정 없이 같은 순서를 따르게 된다.
+    """
+    job = _load_job(session_factory, job_id)
+    if job is None:
+        return {}, {}
+    cond_revenue = json.loads(job.cond_revenue) if job.cond_revenue else {}
+    cond_total_assets = json.loads(job.cond_total_assets) if job.cond_total_assets else {}
+    return cond_revenue, cond_total_assets
+
+
 async def _run_document_download(
     dart_client: DartClient,
     session_factory: sessionmaker[Session],
@@ -641,14 +746,23 @@ async def _run_document_download(
     실제 다운로드/캐시 재사용/zip 해제는 `_ensure_document_cached()`가
     담당한다 — 실제 재무제표 파싱은 다음 STEP인 `_run_financial_parsing`
     (STEP 5)이 별도로 맡는다.
+
+    처리 순서는 조건 밴드 근접도順이다(§4-10-D) — 쿼터로 중단돼도 실제
+    대상이 될 확률이 높은 후보의 원문이 먼저 확보된다.
     """
+    cond_revenue, cond_total_assets = _load_band_conditions(session_factory, job_id)
     with session_factory() as db:
         rows = db.execute(
-            select(Result.rcept_no).where(
-                Result.job_id == job_id, Result.rcept_no.is_not(None)
+            select(
+                Result.rcept_no, Result.ref_revenue, Result.ref_total_assets
             )
+            .where(Result.job_id == job_id, Result.rcept_no.is_not(None))
+            .order_by(Result.id)
         ).all()
-    rcept_nos = sorted({row[0] for row in rows if row[0]})
+
+    ordered = _sort_rows_by_band_proximity(rows, cond_revenue, cond_total_assets)
+    # 같은 rcept_no가 여러 결과에 걸릴 수 있으므로 가장 앞선 순위만 남긴다.
+    rcept_nos = list(dict.fromkeys(row[0] for row in ordered if row[0]))
 
     total = len(rcept_nos)
     _checkpoint(
@@ -735,15 +849,26 @@ async def _run_financial_parsing(
     쿼터와 무관하다. `parse_status IS NULL`을 재시도 조건으로 삼아 이미
     파싱된 건은 다시 열지 않는다(resume/재시도 겸용, retry_failed_parsing도
     동일 함수를 재사용한다).
+
+    처리 순서는 STEP 4와 동일하게 조건 밴드 근접도順이다(§4-10-D) — 파싱
+    자체는 쿼터를 쓰지 않지만, 중단 시 결과 테이블에 유용한 행이 먼저
+    쌓이도록 다운로드와 같은 순서를 유지한다.
     """
+    cond_revenue, cond_total_assets = _load_band_conditions(session_factory, job_id)
     with session_factory() as db:
         rows = db.execute(
-            select(Result.id, Result.rcept_no).where(
+            select(
+                Result.id, Result.rcept_no, Result.ref_revenue, Result.ref_total_assets
+            )
+            .where(
                 Result.job_id == job_id,
                 Result.rcept_no.is_not(None),
                 Result.parse_status.is_(None),
             )
+            .order_by(Result.id)
         ).all()
+
+    rows = [(row[0], row[1]) for row in _sort_rows_by_band_proximity(rows, cond_revenue, cond_total_assets)]
 
     total = len(rows)
     _checkpoint(
@@ -1094,16 +1219,25 @@ async def _run_history_collection(
     최종 결과 건수에만 비례하게 한다. `excluded_by_assets`는 §4-7-2(2026-07-15
     추가) 총자산 필터 컬럼이다 — 이 조건을 쓰지 않는 기존 run_job() 흐름에서는
     모든 행이 기본값 0이라 이 조건 추가로 동작이 바뀌지 않는다.
+
+    처리 순서는 STEP 4/5와 동일하게 조건 밴드 근접도順이다(§4-10-D).
     """
+    cond_revenue, cond_total_assets = _load_band_conditions(session_factory, job_id)
     with session_factory() as db:
         rows = db.execute(
-            select(Result.id, Result.corp_code).where(
+            select(
+                Result.id, Result.corp_code, Result.ref_revenue, Result.ref_total_assets
+            )
+            .where(
                 Result.job_id == job_id,
                 Result.excluded_by_revenue == 0,
                 Result.excluded_by_assets == 0,
                 Result.corp_code.is_not(None),
             )
+            .order_by(Result.id)
         ).all()
+
+    rows = [(row[0], row[1]) for row in _sort_rows_by_band_proximity(rows, cond_revenue, cond_total_assets)]
 
     total = len(rows)
     _checkpoint(
