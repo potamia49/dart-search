@@ -582,6 +582,40 @@ def test_parse_xml_financials_loss_primary_combined_labels_are_reversed():
     assert parsed.values_cur["gross_profit"] == parsed.values_cur["revenue"] - parsed.values_cur["cogs"]
 
 
+def test_parse_xml_financials_hangul_pseudo_tags_do_not_collapse_table():
+    """미이스케이프 한글 유령 태그 회귀(2026-07-21, 제이에스원 rcept
+    20260413001757). 셀 안의 "1. 현금및현금성자산 <주석3>", "<당기>"/"<전기>" 등을
+    recover 파서가 유효한 시작 태그로 인식해, 그 지점 이후 재무상태표/손익계산서
+    전체를 한 셀로 붕괴시켰다. 그 결과 자산총계/부채총계/자본총계/영업이익/
+    당기순이익 등이 통째로 유실돼 값이 원문에 멀쩡히 있는데도 PARTIAL로 떨어졌다.
+    _HANGUL_PSEUDO_TAG_RE가 유령 태그만 제거해 트리 붕괴를 막는다 — 13항목 전부
+    복구되고 OK가 돼야 한다. 금액은 원문 TE 셀 값을 그대로 옮겨 왔다.
+    """
+    parsed = parse_xml_financials(_read_fixture("20260413001757"))
+
+    assert parsed.parse_status == "OK"
+    assert parsed.parse_note is None
+
+    # 붕괴 지점 이후로 유실됐던 항목들 — 이제 전부 복구된다.
+    assert parsed.values_cur["noncurrent_assets"] == 15_386_629_551
+    assert parsed.values_cur["total_assets"] == 23_159_224_723
+    assert parsed.values_prv["total_assets"] == 20_866_654_242
+    assert parsed.values_cur["current_liab"] == 2_095_940_030
+    assert parsed.values_cur["noncurrent_liab"] == 6_991_107
+    assert parsed.values_cur["total_liab"] == 2_102_931_137
+    assert parsed.values_cur["total_equity"] == 21_056_293_586
+    assert parsed.values_cur["operating_income"] == 1_884_679_027
+    assert parsed.values_cur["net_income"] == 1_743_952_060
+    # 붕괴 전에 이미 잡히던 항목도 그대로 유지.
+    assert parsed.values_cur["current_assets"] == 7_772_595_172
+    assert parsed.values_cur["revenue"] == 19_165_612_869
+    # 회계 항등식으로 교차 검증: 자산총계 == 부채총계 + 자본총계.
+    assert (
+        parsed.values_cur["total_assets"]
+        == parsed.values_cur["total_liab"] + parsed.values_cur["total_equity"]
+    )
+
+
 def test_parse_xml_financials_invalid_xml_returns_failed():
     parsed = parse_xml_financials(b"not xml at all &&&")
     assert parsed.parse_status == "FAILED"
