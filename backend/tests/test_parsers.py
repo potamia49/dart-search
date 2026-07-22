@@ -57,6 +57,8 @@ def _read_fixture(rcept_no: str) -> bytes:
         ("자　산　　총　계", "자산총계"),  # 전각 공백(2012년 원문 실측)
         ("Ⅳ. 판매비와관리비(주석13)", "판매비와관리비"),  # "주석13" 각주 제거
         ("Ⅱ.매출원가(주6)", "매출원가"),  # "주6" 축약 각주도 제거 (티디케이전자한국 실측)
+        ("Ⅱ. 매출원가(주석10과 13)", "매출원가"),  # 각주 번호를 한글 접속사 "과"로 이은 표기 (물맑은고기팜 실측, 2026-07-23)
+        ("매출원가(주석3와 5)", "매출원가"),  # "와" 접속사도 마커가 있으면 각주로 인식
         ("Ⅷ. 당기순이익(손실)(주석10)", "당기순이익(손실)"),  # 각주만 제거, 의미있는 (손실)은 보존
         ("수익(매출액)", "수익(매출액)"),  # 괄호가 각주가 아니라 항목명 자체라 보존
         ("Ⅱ . 비유동자산", "비유동자산"),  # 로마숫자-마침표 사이 공백 (주식회사 신진팩 실측, 2026-07-21)
@@ -102,6 +104,30 @@ def test_normalize_account_label_does_not_map_net_income_attribution_line():
 def test_account_name_aliases_cover_combined_loss_labels():
     """(손실) 접미가 붙은 라벨도 정규화 후 표준 필드로 매핑돼야 한다."""
     assert ACCOUNT_NAME_ALIASES[normalize_account_label("Ⅷ. 당기순이익(손실)(주석10)")] == "net_income"
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        "X. 연결당기순이익(주석 15)",  # (주)한미프렉시블 실측 (2026-07-23)
+        "연결당기순손실",
+        "연결당기순이익(손실)",
+        "연결당기순이익(순손실)",
+    ],
+)
+def test_account_name_aliases_cover_consolidated_net_income_labels(label):
+    """연결재무제표의 당기순이익 요약 행("연결당기순이익" 계열)도 net_income으로
+    매핑돼야 한다(2026-07-23, 로컬 캐시 4,922건 전수 스캔 — "연결" 접두어가 표준
+    필드로 매핑되는 것은 net_income 계열 369건뿐이라 실측된 4종만 등록)."""
+    assert ACCOUNT_NAME_ALIASES[normalize_account_label(label)] == "net_income"
+
+
+def test_consolidated_net_income_attribution_line_not_mapped():
+    """"연결당기순이익(손실)의 귀속"은 지배기업/비지배지분 귀속분을 나누는 분석
+    행이라 요약 행과 달라 매핑되면 안 된다 — "연결" alias 추가가 이 보호를 깨지
+    않는지 고정한다(비-연결 귀속 행 테스트와 동일 취지)."""
+    norm = normalize_account_label("XII. 연결당기순이익(손실)의 귀속")
+    assert norm not in ACCOUNT_NAME_ALIASES
 
 
 def test_account_name_aliases_cover_gross_profit_and_loss_labels():
@@ -787,6 +813,51 @@ def test_parse_xml_financials_ifrs_attached_contra_cogs_abs_normalized():
     assert parsed.values_cur["operating_income"] == 38_597_107_239
     assert parsed.values_cur["net_income"] == 15_694_757_080
     # abs 정규화 덕분에 회계 항등식이 성립한다(정규화 전에는 rev-cogs가 2배로 어긋났다).
+    assert parsed.values_cur["gross_profit"] == (
+        parsed.values_cur["revenue"] - parsed.values_cur["cogs"]
+    )
+    assert parsed.values_cur["total_assets"] == (
+        parsed.values_cur["total_liab"] + parsed.values_cur["total_equity"]
+    )
+
+
+def test_parse_xml_financials_footnote_with_hangul_conjunction_recovers_cogs():
+    """(주)물맑은고기팜농업회사법인(rcept 20260408002307) — 매출원가 각주 참조가
+    "Ⅱ. 매출원가(주석10과 13)"처럼 한글 접속사 "과"를 끼고 있어, 각주를 못 벗기고
+    "매출원가(주석10과13)"가 alias 조회에 실패해 cogs가 통째로 누락되던 케이스
+    (2026-07-23 사용자 실측). _FOOTNOTE_SUFFIX_RE가 "주석/주" 마커가 있을 때 한해
+    "과"/"와"를 허용하도록 확장해 cogs 당기·전기가 복구되고 OK가 돼야 한다.
+    금액은 원문 TE 셀 값을 그대로 옮겨 왔다(gross_profit==revenue-cogs 자체검증).
+    """
+    parsed = parse_xml_financials(_read_fixture("20260408002307"))
+    assert parsed.parse_status == "OK"
+    assert parsed.parse_note is None
+    assert parsed.values_cur["cogs"] == 15_764_916_952
+    assert parsed.values_prv["cogs"] == 15_851_618_669
+    assert parsed.values_cur["revenue"] == 17_140_576_742
+    assert parsed.values_cur["gross_profit"] == 1_375_659_790
+    # 회계 항등식으로 부호·값 교차 검증.
+    assert parsed.values_cur["gross_profit"] == (
+        parsed.values_cur["revenue"] - parsed.values_cur["cogs"]
+    )
+    assert parsed.values_cur["total_assets"] == (
+        parsed.values_cur["total_liab"] + parsed.values_cur["total_equity"]
+    )
+
+
+def test_parse_xml_financials_consolidated_net_income_recovers():
+    """(주)한미프렉시블(rcept 20260424000057) — 연결재무제표라 당기순이익 요약 행이
+    "X. 연결당기순이익(주석 15)"(정규화 "연결당기순이익")로 표기돼 net_income alias
+    매칭에 실패, net_income이 통째로 누락되던 케이스(2026-07-23 사용자 실측).
+    "연결당기순이익" 계열 alias 추가로 net_income 당기·전기가 복구되고 OK가 돼야
+    한다. 금액은 원문 TE 셀 값을 그대로 옮겨 왔다.
+    """
+    parsed = parse_xml_financials(_read_fixture("20260424000057"))
+    assert parsed.parse_status == "OK"
+    assert parsed.parse_note is None
+    assert parsed.values_cur["net_income"] == 3_293_885_531
+    assert parsed.values_prv["net_income"] == 2_194_667_989
+    assert parsed.values_cur["revenue"] == 88_622_283_999
     assert parsed.values_cur["gross_profit"] == (
         parsed.values_cur["revenue"] - parsed.values_cur["cogs"]
     )
