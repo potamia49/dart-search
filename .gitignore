@@ -21,6 +21,8 @@ env/
 *.db-shm
 *.sqlite
 *.sqlite3
+*.bak.*
+*.bak
 backend/data/corp_cache/*
 !backend/data/corp_cache/.gitkeep
 backend/data/documents/*
