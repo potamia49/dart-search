@@ -41,3 +41,9 @@ Thumbs.db
 
 # --- 로그 ---
 *.log
+
+# --- PyInstaller 빌드 산출물 (실행파일은 소스가 아니라 빌드 결과물) ---
+backend/build/
+backend/dist/
+backend/*.spec
+backend/exe_test*/

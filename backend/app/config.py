@@ -7,13 +7,29 @@
 실제 `.env` 파일은 저장소에 커밋하지 않는다. `.env.example`을 복사해 사용할 것.
 """
 
+import os
 from functools import lru_cache
 from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+
+def _default_backend_dir() -> Path:
+    """DB/캐시/.env가 위치할 쓰기 가능한 기준 디렉터리.
+
+    PyInstaller로 빌드된 exe에서는 launcher.py가 `DART_SEARCH_APP_DIR`에
+    exe가 놓인 폴더를 넣어준다(빌드 시 번들 임시폴더가 아니라 exe 옆에
+    DB/.env가 영구히 남아야 하므로). 그 값이 없으면(=일반 소스 실행) 기존과
+    동일하게 backend/ 디렉터리를 쓴다.
+    """
+    env_dir = os.environ.get("DART_SEARCH_APP_DIR")
+    if env_dir:
+        return Path(env_dir)
+    return Path(__file__).resolve().parent.parent
+
+
 # backend/ 디렉터리 (이 파일 기준 두 단계 위: app/config.py -> app/ -> backend/)
-BACKEND_DIR = Path(__file__).resolve().parent.parent
+BACKEND_DIR = _default_backend_dir()
 
 
 class Settings(BaseSettings):

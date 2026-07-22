@@ -427,3 +427,41 @@ npm run dev     # Vite dev 서버, /api는 vite.config.ts의 proxy로 백엔드(
 npm run build   # tsc 타입체크 포함
 npm run lint    # oxlint
 ```
+
+### 배포용 실행파일(.exe) 빌드 (2026-07-23 추가)
+
+Python/Node가 설치되지 않은 사무실 PC에도 배포할 수 있도록, PyInstaller로
+백엔드(FastAPI+uvicorn)와 프론트엔드 빌드 산출물을 단일 exe로 묶는다.
+API 키는 exe에 하드코딩하지 않는다 — `backend/launcher.py`가 exe 옆에
+`.env`가 없으면 `.env.example`을 복사해 메모장으로 열고 안내창을 띄운 뒤
+종료하며, 사용자가 키를 채워 저장하고 재실행하면 정상 구동된다(최초 1회).
+
+```
+cd frontend && npm run build          # frontend/dist 생성 (exe에 번들됨)
+cd backend && source .venv/Scripts/activate
+pip install pyinstaller
+pyinstaller --noconfirm --onefile --name dart-search \
+  --add-data "../frontend/dist;frontend_dist" \
+  --add-data ".env.example;." \
+  --collect-all fastapi --collect-all starlette --collect-all uvicorn \
+  --collect-all pydantic --collect-all pydantic_core --collect-all sqlalchemy \
+  --collect-all lxml --collect-all pdfplumber --collect-all pandas \
+  --collect-all openpyxl --collect-all multipart --collect-all olefile \
+  --collect-all httpx --collect-all anyio \
+  --hidden-import app.api.jobs --hidden-import app.api.meta --hidden-import app.api.results \
+  launcher.py
+# 결과물: backend/dist/dart-search.exe (약 83MB)
+```
+
+구조: `app/config.py`의 `BACKEND_DIR`은 환경변수 `DART_SEARCH_APP_DIR`(exe가
+놓인 폴더)을 우선 사용하도록 분기돼 있어, DB(`dart_search.db`)/캐시/`.env`가
+exe 옆에 영구히 남는다(PyInstaller onefile의 임시 압축해제 폴더가 아님).
+`app/main.py`는 `DART_SEARCH_RESOURCE_DIR`(PyInstaller 번들 임시폴더,
+`sys._MEIPASS`) 아래 `frontend_dist`가 있으면 `/assets`를 정적 서빙하고
+나머지 모든 경로를 `index.html`로 폴백하는 catch-all 라우트를 API 라우터들
+**뒤에** 등록해 React Router(BrowserRouter) 클라이언트 라우팅을 지원한다 —
+두 환경변수 모두 없으면(=일반 소스 실행) 기존 동작과 100% 동일하다.
+`launcher.py`는 `DART_SEARCH_PORT`(기본 8000)로 uvicorn을 띄우고, 이미 그
+포트가 쓰이는 중이면(중복 실행) 새 서버를 띄우지 않고 브라우저 창만 새로
+연다. `backend/dist/`·`backend/build/`·`backend/*.spec`은 빌드 산출물이라
+`.gitignore`에 등록돼 있다(커밋 대상 아님).
