@@ -26,7 +26,10 @@ export interface ListResultsParams {
   has_disclosure?: boolean
   /** 회사명/주소/대표자/업종/감사인명 부분일치 검색. */
   q?: string
-  /** 정렬 컬럼(백엔드 화이트리스트 밖이면 기본 정렬로 무시된다)과 방향. */
+  /** 다중 컬럼 정렬 — 콤마 구분 `field:dir` 목록(예: `corp_name:asc,induty_name:desc`).
+   * 앞쪽이 1순위, 뒤쪽이 보조 정렬이다. 백엔드 화이트리스트 밖 컬럼/형식 오류는 무시된다. */
+  sort?: string
+  /** 레거시 단일 정렬 컬럼과 방향 — `sort`가 있으면 백엔드가 무시한다(하위호환). */
   sort_by?: string
   sort_dir?: SortDir
 }

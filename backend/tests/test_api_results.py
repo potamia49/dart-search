@@ -144,6 +144,62 @@ def test_list_results_sorts_by_column_and_pushes_missing_values_last(client_with
     assert [r["corp_name"] for r in desc["items"]] == ["㈜성공테스트", "㈜실패테스트"]
 
 
+def test_list_results_multi_sort_by_name_then_industry(client_with_db):
+    """다중 정렬 — `sort=corp_name:asc,induty_name:asc`면 회사명이 같은 행끼리는
+    업종명 오름차순으로 2차 정렬된다(프론트 Shift+클릭 다중 정렬의 서버측 계약)."""
+    client, factory = client_with_db
+    db = factory()
+    try:
+        job = Job(
+            created_at="2026-07-15T00:00:00",
+            name="다중정렬 Job",
+            cond_region="{}",
+            cond_revenue="{}",
+            cond_industry="[]",
+            cond_period="{}",
+            status=JobStatus.DONE,
+            current_step=6,
+            progress_done=3,
+            progress_total=3,
+            error_msg=None,
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        db.add_all(
+            [
+                Result(job_id=job.id, corp_code="c1", corp_name="가나기업",
+                       induty_name="소프트웨어 개발업", parse_status=ParseStatus.OK),
+                Result(job_id=job.id, corp_code="c2", corp_name="가나기업",
+                       induty_name="금속가공제품 제조업", parse_status=ParseStatus.OK),
+                Result(job_id=job.id, corp_code="c3", corp_name="다라기업",
+                       induty_name="건설업", parse_status=ParseStatus.OK),
+            ]
+        )
+        db.commit()
+        job_id = job.id
+    finally:
+        db.close()
+
+    body = client.get(
+        f"/api/jobs/{job_id}/results",
+        params={"sort": "corp_name:asc,induty_name:asc"},
+    ).json()
+    # 가나기업 두 건은 업종명 오름차순("금속..." < "소프트..."), 그다음 다라기업.
+    assert [(r["corp_name"], r["induty_name"]) for r in body["items"]] == [
+        ("가나기업", "금속가공제품 제조업"),
+        ("가나기업", "소프트웨어 개발업"),
+        ("다라기업", "건설업"),
+    ]
+
+    # 화이트리스트 밖/형식오류 항목은 무시하고 유효한 기준만 적용한다.
+    safe = client.get(
+        f"/api/jobs/{job_id}/results",
+        params={"sort": "bogus:asc,corp_name:desc"},
+    ).json()
+    assert [r["corp_name"] for r in safe["items"]][0] == "다라기업"
+
+
 def test_list_results_rejects_unknown_sort_column(client_with_db):
     """화이트리스트 밖의 컬럼명은 무시하고 기본 정렬로 되돌린다(500이 아니라 200)."""
     client, factory = client_with_db

@@ -105,8 +105,9 @@ function FinancialsResultsView({ jobId }: { jobId: number }) {
   const [exporting, setExporting] = useState(false)
   const [search, setSearch] = useState('')
   const [debouncedSearch, setDebouncedSearch] = useState('')
-  const [sortBy, setSortBy] = useState<string | null>(null)
-  const [sortDir, setSortDir] = useState<SortDir>('asc')
+  // 다중 컬럼 정렬 — 배열 앞쪽이 1순위(주 정렬), 뒤쪽이 보조 정렬이다. 일반 클릭은
+  // 단일 정렬로 초기화하고, Shift+클릭은 기존 기준에 이 컬럼을 보조 정렬로 추가/토글한다.
+  const [sorts, setSorts] = useState<{ key: string; dir: SortDir }[]>([])
   // "휴면·폐업 추정"으로 기본 숨김 처리된 건수 — 무통보로 사라지지 않도록 탭
   // 뱃지와 "총 N건" 옆 안내 문구로 항상 고지한다(2026-07-22 디자인 리뷰 반영).
   const [staleCount, setStaleCount] = useState<number | null>(null)
@@ -132,10 +133,10 @@ function FinancialsResultsView({ jobId }: { jobId: number }) {
     () => ({
       ...tabToParams(tab),
       q: debouncedSearch || undefined,
-      sort_by: sortBy ?? undefined,
-      sort_dir: sortDir,
+      // 다중 정렬은 콤마 구분 `field:dir` 목록으로 백엔드에 전달한다(서버 사이드 정렬).
+      sort: sorts.length ? sorts.map((s) => `${s.key}:${s.dir}`).join(',') : undefined,
     }),
-    [tab, debouncedSearch, sortBy, sortDir],
+    [tab, debouncedSearch, sorts],
   )
 
   useEffect(() => {
@@ -153,22 +154,34 @@ function FinancialsResultsView({ jobId }: { jobId: number }) {
     setPage(1)
   }
 
-  /** 헤더 클릭 — 같은 컬럼이면 오름차순 → 내림차순 → 정렬 해제 순으로 순환한다. */
-  function handleSort(column: ResultColumn) {
+  /** 헤더 클릭 — 정렬 기준을 갱신한다.
+   *
+   * - 일반 클릭(`additive=false`): 이 컬럼 단독 정렬로 초기화한다. 이미 이 컬럼
+   *   하나만 걸려 있으면 오름차순 → 내림차순 → 정렬 해제 순으로 순환한다(기존
+   *   단일 정렬 UX 그대로 유지).
+   * - Shift+클릭(`additive=true`): 이 컬럼을 정렬 우선순위에 추가/토글한다 —
+   *   없으면 맨 뒤(가장 낮은 우선순위)에 오름차순으로 추가, 오름차순이면 내림차순으로,
+   *   내림차순이면 이 기준을 제거한다(AG Grid/Excel 다중 정렬 관례). */
+  function handleSort(column: ResultColumn, additive: boolean) {
     const key = sortKeyOf(column)
     if (!key) return
     setPage(1)
-    if (sortBy !== key) {
-      setSortBy(key)
-      setSortDir('asc')
-      return
-    }
-    if (sortDir === 'asc') {
-      setSortDir('desc')
-      return
-    }
-    setSortBy(null)
-    setSortDir('asc')
+    setSorts((prev) => {
+      const idx = prev.findIndex((s) => s.key === key)
+      if (additive) {
+        if (idx === -1) return [...prev, { key, dir: 'asc' }]
+        if (prev[idx].dir === 'asc') {
+          const next = [...prev]
+          next[idx] = { key, dir: 'desc' }
+          return next
+        }
+        return prev.filter((s) => s.key !== key)
+      }
+      if (prev.length === 1 && idx === 0) {
+        return prev[0].dir === 'asc' ? [{ key, dir: 'desc' }] : []
+      }
+      return [{ key, dir: 'asc' }]
+    })
   }
 
   function toggleColumn(key: keyof ResultResponse, visible: boolean) {
@@ -280,6 +293,22 @@ function FinancialsResultsView({ jobId }: { jobId: number }) {
         <>
           <Text size="sm" c="dimmed">
             총 {data.total.toLocaleString()}건
+            {sorts.length > 0 && (
+              <>
+                {' '}· 정렬 {sorts.length}개 기준 (헤더 클릭은 그 컬럼 단독 정렬, Shift+클릭은 보조
+                정렬 추가){' '}
+                <UnstyledButton
+                  component="span"
+                  td="underline"
+                  onClick={() => {
+                    setSorts([])
+                    setPage(1)
+                  }}
+                >
+                  정렬 초기화
+                </UnstyledButton>
+              </>
+            )}
             {tab !== 'STALE_DISCLOSURE' && !!staleCount && (
               <> · 휴면·폐업 추정 {staleCount.toLocaleString()}건 숨김 (
               <UnstyledButton
@@ -298,21 +327,32 @@ function FinancialsResultsView({ jobId }: { jobId: number }) {
                 <Table.Tr>
                   {visibleColumns.map((col) => {
                     const key = sortKeyOf(col)
-                    const active = key !== null && key === sortBy
+                    const sortIndex = key === null ? -1 : sorts.findIndex((s) => s.key === key)
+                    const active = sortIndex >= 0
+                    const dir = active ? sorts[sortIndex].dir : null
                     return (
                       <Table.Th key={col.key}>
                         {key === null ? (
                           col.label
                         ) : (
                           <UnstyledButton
-                            onClick={() => handleSort(col)}
+                            onClick={(event) => handleSort(col, event.shiftKey)}
                             style={{ fontWeight: 'inherit', fontSize: 'inherit' }}
-                            aria-label={`${col.label} 기준 정렬`}
+                            aria-label={`${col.label} 기준 정렬 (클릭 시 이 컬럼 단독 정렬로 초기화, Shift+클릭 시 보조 정렬 기준으로 추가)`}
                           >
-                            {col.label}
-                            <Text component="span" c={active ? undefined : 'dimmed'} ml={4}>
-                              {active ? (sortDir === 'asc' ? '▲' : '▼') : '↕'}
-                            </Text>
+                            <Group component="span" gap={4} wrap="nowrap" display="inline-flex">
+                              <span>{col.label}</span>
+                              <Text component="span" c={active ? undefined : 'dimmed'}>
+                                {active ? (dir === 'asc' ? '▲' : '▼') : '↕'}
+                              </Text>
+                              {/* 정렬 우선순위(1, 2, 3...) — 다중 정렬일 때만 뱃지로 표시해
+                                  몇 번째 기준인지 알 수 있게 한다. */}
+                              {active && sorts.length > 1 && (
+                                <Badge size="xs" circle variant="filled" color="blue">
+                                  {sortIndex + 1}
+                                </Badge>
+                              )}
+                            </Group>
                           </UnstyledButton>
                         )}
                       </Table.Th>

@@ -113,19 +113,51 @@ def _build_results_query(
     return stmt
 
 
-def _apply_sort(stmt: Select, sort_by: str | None, sort_dir: str) -> Select:
-    """정렬 절을 붙인다 — 허용되지 않은 컬럼명은 무시하고 기본(id 오름차순)으로 둔다.
+def _resolve_sort_specs(
+    sort: str | None, sort_by: str | None, sort_dir: str
+) -> list[tuple[str, str]]:
+    """다중 정렬 스펙 `[(컬럼, 방향), ...]`을 정규화한다(앞선 항목이 1순위).
 
-    값이 없는 행(파싱 실패/미확보)은 오름차순·내림차순 어느 쪽이든 **항상 뒤로**
-    보낸다 — SQLite 기본 동작(ASC일 때 NULL이 맨 앞)대로 두면 "매출액 낮은 순"을
-    눌렀을 때 값 없는 행이 화면을 채워 정렬이 쓸모없어진다. 같은 값끼리는 id로
-    안정 정렬해 페이지를 넘겨도 순서가 흔들리지 않게 한다.
+    `sort`(콤마 구분 `field:dir` 목록, 예: ``"corp_name:asc,induty_name:desc"``)가
+    우선하며, 없으면 레거시 단일 ``sort_by``/``sort_dir``로 폴백한다(하위호환 — 기존
+    호출·테스트는 그대로 동작). 화이트리스트(`SORTABLE_COLUMNS`) 밖의 컬럼과 형식
+    오류(방향 값이 asc/desc 아님)는 조용히 버리고, 같은 컬럼이 중복되면 처음 것만 남긴다.
     """
-    if not sort_by or sort_by not in SORTABLE_COLUMNS:
+    specs: list[tuple[str, str]] = []
+    if sort:
+        for pair in (p.strip() for p in sort.split(",")):
+            if not pair:
+                continue
+            field, _, direction = pair.partition(":")
+            field = field.strip()
+            direction = direction.strip().lower() or "asc"
+            if field not in SORTABLE_COLUMNS or direction not in ("asc", "desc"):
+                continue
+            if any(existing == field for existing, _ in specs):
+                continue
+            specs.append((field, direction))
+    elif sort_by and sort_by in SORTABLE_COLUMNS:
+        specs.append((sort_by, "desc" if sort_dir == "desc" else "asc"))
+    return specs
+
+
+def _apply_sort(stmt: Select, specs: list[tuple[str, str]]) -> Select:
+    """다중 컬럼 정렬 절을 붙인다 — 스펙 앞쪽이 1순위, 뒤쪽이 보조 정렬 기준이다.
+
+    값이 없는 행(파싱 실패/미확보)은 오름차순·내림차순 어느 쪽이든 각 컬럼마다
+    **항상 뒤로** 보낸다 — SQLite 기본 동작(ASC일 때 NULL이 맨 앞)대로 두면 "매출액
+    낮은 순"을 눌렀을 때 값 없는 행이 화면을 채워 정렬이 쓸모없어진다. 마지막에 id로
+    안정 정렬해 페이지를 넘겨도 순서가 흔들리지 않게 한다. 스펙이 비면 기본(id 오름차순).
+    """
+    if not specs:
         return stmt.order_by(Result.id.asc())
-    column = getattr(Result, sort_by)
-    ordering = column.desc() if sort_dir == "desc" else column.asc()
-    return stmt.order_by(column.is_(None), ordering, Result.id.asc())
+    order_cols = []
+    for field, direction in specs:
+        column = getattr(Result, field)
+        order_cols.append(column.is_(None))
+        order_cols.append(column.desc() if direction == "desc" else column.asc())
+    order_cols.append(Result.id.asc())
+    return stmt.order_by(*order_cols)
 
 
 class ResultResponse(BaseModel):
@@ -215,6 +247,7 @@ async def list_results(
     excluded_by_stale_disclosure: bool | None = None,
     has_disclosure: bool | None = None,
     q: str | None = None,
+    sort: str | None = None,
     sort_by: str | None = None,
     sort_dir: str = "asc",
     db: Session = Depends(get_db),
@@ -232,8 +265,11 @@ async def list_results(
       (`rcept_no` 유무, 2026-07-20 추가). `parse_status=FAILED`와 함께 쓰면
       "실제 파싱 실패(검수 필요)"와 "원문 자체가 없음"을 구분할 수 있다.
     - `q`: 회사명/주소/대표자/업종/감사인명 부분일치 검색 (2026-07-20 추가).
-    - `sort_by`/`sort_dir`: 정렬 컬럼(`SORTABLE_COLUMNS` 화이트리스트)과 방향
-      (`asc`/`desc`, 기본 오름차순). 값이 없는 행은 항상 뒤로 보낸다.
+    - `sort`: 다중 컬럼 정렬 — 콤마 구분 `field:dir` 목록(예:
+      `corp_name:asc,induty_name:desc`). 앞쪽이 1순위, 뒤쪽이 보조 정렬이다.
+      화이트리스트(`SORTABLE_COLUMNS`) 밖 컬럼/형식 오류는 무시한다.
+    - `sort_by`/`sort_dir`: 레거시 단일 정렬 컬럼과 방향(`asc`/`desc`, 기본
+      오름차순). `sort`가 있으면 무시된다(하위호환). 값이 없는 행은 항상 뒤로 보낸다.
     """
     job = db.get(Job, job_id)
     if job is None:
@@ -253,9 +289,10 @@ async def list_results(
 
     page = max(page, 1)
     page_size = max(min(page_size, 500), 1)
+    sort_specs = _resolve_sort_specs(sort, sort_by, sort_dir)
     rows = (
         db.execute(
-            _apply_sort(stmt, sort_by, sort_dir).offset((page - 1) * page_size).limit(page_size)
+            _apply_sort(stmt, sort_specs).offset((page - 1) * page_size).limit(page_size)
         )
         .scalars()
         .all()
@@ -325,6 +362,7 @@ async def export_job_results(
     excluded_by_stale_disclosure: bool | None = None,
     has_disclosure: bool | None = None,
     q: str | None = None,
+    sort: str | None = None,
     sort_by: str | None = None,
     sort_dir: str = "asc",
     db: Session = Depends(get_db),
@@ -332,9 +370,9 @@ async def export_job_results(
     """결과 파일 다운로드 (xlsx/csv, 페이징 없이 필터를 통과한 전체 결과).
 
     `parse_status`/`excluded_by_revenue`/`excluded_by_assets`/
-    `excluded_by_stale_disclosure`/`has_disclosure`/`q`/`sort_by`/`sort_dir`는
-    `/results`와 동일한 의미다 — 화면에서 걸러 놓고 정렬한 그대로를 내려받게
-    된다. `format`이 xlsx/csv가 아니면 400.
+    `excluded_by_stale_disclosure`/`has_disclosure`/`q`/`sort`/`sort_by`/`sort_dir`는
+    `/results`와 동일한 의미다(다중 정렬 `sort` 포함) — 화면에서 걸러 놓고 정렬한
+    그대로를 내려받게 된다. `format`이 xlsx/csv가 아니면 400.
     """
     if format not in _EXPORT_CONTENT_TYPES:
         raise HTTPException(
@@ -355,7 +393,8 @@ async def export_job_results(
         has_disclosure,
         q,
     )
-    rows = db.execute(_apply_sort(stmt, sort_by, sort_dir)).scalars().all()
+    sort_specs = _resolve_sort_specs(sort, sort_by, sort_dir)
+    rows = db.execute(_apply_sort(stmt, sort_specs)).scalars().all()
 
     content = export_results(rows, format)
     filename = f"dart_search_job{job_id}_results.{format}"
