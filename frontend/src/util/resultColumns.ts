@@ -168,7 +168,7 @@ export const ALL_COLUMNS: ResultColumn[] = [
   ...STATUS_COLUMNS,
 ]
 
-/** 기본 표시 컬럼 (요구사항: 회사명/주소/업종/매출액_당기/영업이익_당기/당기순이익_당기/parse_status). */
+/** 기본 표시 컬럼 (실제 렌더링 순서는 ALL_COLUMNS 선언 순서를 따름: 회사명/주소/업종/감사의견/감사인/자산총계_당기/매출액_당기/영업이익_당기/parse_status). */
 export const DEFAULT_VISIBLE_KEYS: (keyof ResultResponse)[] = [
   'corp_name',
   'address',
@@ -176,7 +176,8 @@ export const DEFAULT_VISIBLE_KEYS: (keyof ResultResponse)[] = [
   'auditor_name',
   'revenue_cur',
   'operating_income_cur',
-  'net_income_cur',
+  'total_assets_cur',
+  'audit_opinion',
   'parse_status',
 ]
 
