@@ -46,7 +46,7 @@ class Settings(BaseSettings):
 
     # --- 캐시 갱신 주기 (일) ---
     corp_cache_ttl_days: int = 7
-    corp_profile_ttl_days: int = 180
+    # (구 corp_profile_ttl_days는 STEP 3/CorpProfile 삭제와 함께 2026-07-22 제거됨)
     # dart_corp_index(§4-10 M8) TTL. 기업개황은 연 1~2회 갱신을 전제로 하며,
     # 전수 크롤이 약 23분이라 갱신 비용이 낮다.
     dart_index_ttl_days: int = 180

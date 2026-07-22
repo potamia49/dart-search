@@ -379,34 +379,11 @@ class FscCorpInfoClient:
             params["corpNm"] = corp_nm
         return await self._get_with_retry("/getCorpOutline_V2", params)
 
-    async def get_summary_financial_stat(self, *, crno: str, biz_year: str) -> dict[str, Any]:
-        """금융위원회_기업 재무정보 API(`GetFinaStatInfoService_V2`)의 `getSummFinaStat_V2`.
-
-        상세개발계획.md §4-7 Phase 1 A3에서 사용. 매출액/총자산/총부채/총자본이
-        한 응답에 모두 들어있음을 실제 호출로 확인했다(2026-07-15 스파이크) —
-        필드 매핑: `enpSaleAmt`=매출액, `enpTastAmt`=총자산, `enpTdbtAmt`=총부채,
-        `enpTcptAmt`=총자본, `enpCptlAmt`=자본금, `fnclDebtRto`=부채비율(%).
-        값은 원 단위 정수 문자열이다. 최신 연도 1개년만 보유하므로(전기 조회 시
-        totalCount=0) 호출부가 필요하면 연도를 바꿔가며 재시도해야 한다.
-
-        `self._client`의 base_url은 `get_corp_basic_info`가 쓰는
-        GetCorpBasicInfoService_V2로 고정돼 있어(기업기본정보), 이 오퍼레이션은
-        별도 서비스(GetFinaStatInfoService_V2)라 절대경로 URL을 조립해 같은
-        httpx 클라이언트로 요청한다 — httpx는 절대경로 URL을 넘기면 base_url을
-        무시하고 그대로 사용하므로, 이 방식이 별도 클라이언트를 새로 만드는
-        것보다 단순하다.
-        """
-        api_key = self._require_api_key()
-        url = f"{self.settings.data_go_kr_fsc_finstat_base_url}/getSummFinaStat_V2"
-        params = {
-            "serviceKey": api_key,
-            "crno": crno,
-            "bizYear": biz_year,
-            "resultType": "json",
-            "pageNo": 1,
-            "numOfRows": 10,
-        }
-        return await self._get_with_retry(url, params)
+    # 구 A3(`get_summary_financial_stat`, `getSummFinaStat_V2`를 `crno`+`bizYear`로
+    # 건별 호출하던 재무 사전 스크리닝 메서드)은 M8 재설계로 호출 경로가 끊긴
+    # 죽은 코드였고 2026-07-22에 물리 삭제됐다. 매출액/총자산 참고값은 이제
+    # 아래 `list_summary_financial_stats`(같은 오퍼레이션을 `crno` 없이 연도
+    # 단위로 전수 페이징 — fsc_financial_stat.py가 사용)로만 적재한다.
 
     async def list_summary_financial_stats(
         self, *, biz_year: str, page_no: int = 1, num_of_rows: int = 5000

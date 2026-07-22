@@ -13,8 +13,9 @@
                                            financial_snapshots 포함). RUNNING/PENDING은 거부.
 
 **M6 재설계(2026-07-15)로 `POST /api/jobs`가 실행하는 백그라운드 작업이
-`run_job()`(구 STEP 1~7 전체)에서 `run_job_phase1()`(A2~A4, 후보 확정까지만)로
-바뀌었다** — Job은 Phase 1 완료 시 `status=DONE`/`phase=CANDIDATES`로 멈추고,
+구 `run_job()`(STEP 1~7 전체)에서 `run_job_phase1()`(후보 확정까지만)로
+바뀌었다** (구 `run_job()`은 호출 경로가 끊긴 죽은 코드였고 2026-07-22에
+물리 삭제됐다) — Job은 Phase 1 완료 시 `status=DONE`/`phase=CANDIDATES`로 멈추고,
 사용자가 `POST /api/jobs/{id}/start-financials`를 명시적으로 호출해야
 Phase 2(`run_job_phase2`, 구 STEP 4~7 재사용)가 시작된다(§4-7-1). 이 라우터는
 FastAPI `BackgroundTasks`로 `app/core/pipeline.py`의 이 함수들을 트리거/조회/
@@ -119,10 +120,10 @@ class TotalAssetsCondition(BaseModel):
 class PeriodCondition(BaseModel):
     """cond_period: {"bgn_de": "20250101", "end_de": "20251231"} — STEP 2 list.json 파라미터.
 
-    M6 재설계(§4-7-1) 이후 Phase 1(A2~A4)은 FSC 전역 인덱스 스냅샷 기반이라
-    이 값을 사용하지 않는다 — 구 파이프라인(run_job, STEP 1~7, 현재 API에서는
-    호출되지 않고 단위 테스트에서만 직접 호출됨) 호환을 위해 컬럼은 유지하되,
-    2026-07-15 이 필드를 요청 스키마에서 optional로 바꿨다. Phase 1 전용
+    M6 재설계(§4-7-1) 이후 Phase 1(A2)은 dart_corp_index 로컬 인덱스 기반이라
+    이 값을 사용하지 않는다 — 구 파이프라인(run_job, STEP 1~7)이 2026-07-22
+    삭제되기 전 호환을 위해 optional로 남긴 컬럼이며, 지금은 아무도 쓰지 않지만
+    요청 스키마 하위호환을 위해 필드 자체는 유지한다. Phase 1 전용
     엔드포인트에 강제로 채워야 할 이유가 없는 필드를 required로 두면 프론트가
     의미 없는 더미 날짜를 만들어 보내야 하는 문제가 있었다(SearchPage에서
     "공시 대상 기간" 입력 자체를 제거했으므로).
@@ -246,7 +247,8 @@ async def cancel_job(job_id: int, db: Session = Depends(get_db)) -> JobResponse:
 
     이미 종료(DONE/CANCELLED)된 Job은 그대로 반환한다. 실행 중(RUNNING)인
     Job은 여기서 상태만 CANCELLED로 표시하고, 실제 중단은
-    `pipeline.run_job()`이 다음 체크포인트에서 감지해 처리한다.
+    Phase 1/2 오케스트레이터(`run_job_phase1`/`run_job_phase2`)가 다음
+    체크포인트에서 감지해 처리한다.
     """
     job = db.get(Job, job_id)
     if job is None:

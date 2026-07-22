@@ -3,6 +3,14 @@
 상세개발계획.md §4 STEP 0~7을 구현한다(STEP 1~4는 M2, STEP 5~6은 M3,
 STEP 7은 2026-07-15 추가된 "최근 N년 재무이력" 확장).
 
+> **주의(2026-07-22 갱신):** 아래 STEP 1~7 표는 구 오케스트레이터 `run_job()`의
+> 설계이며, M8 재설계 후 실제 프로덕션 경로는 Phase 1(`run_job_phase1`)/Phase 2
+> (`run_job_phase2`) 두 함수다. 구 `run_job()`과 그 STEP 1~3(특히 STEP 3
+> 지역/업종 필터 `_run_region_industry_filter`·`CorpProfile` 캐시)은 호출 경로가
+> 끊긴 죽은 코드였고 2026-07-22에 물리 삭제됐다. STEP 4~7 함수는 그대로 남아
+> Phase 2가 재사용한다. 따라서 아래 표의 STEP 1~3 항목과 corp_profiles 관련
+> 서술은 역사적 설명으로만 읽을 것.
+
 각 STEP은 `jobs.current_step`/`progress_done`/`progress_total`을 DB에
 체크포인트로 남겨 중단 후 이어하기(resume)가 가능해야 한다
 (CLAUDE.md 핵심 제약 5번). `dart_client.QuotaExceededError` 발생 시
@@ -111,12 +119,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import Settings, get_settings
-from app.core.corp_cache import refresh_corp_cache
-from app.core.dart_client import DartApiError, DartClient, FscCorpInfoClient, QuotaExceededError
+from app.core.dart_client import DartApiError, DartClient, QuotaExceededError
 from app.core.dart_corp_index import filter_local_candidates, is_dart_index_stale
 from app.core.db import get_session_factory
 from app.core.filters import (
-    industry_matches,
     normalize_corp_name,
     parse_address,
     region_matches,
@@ -124,7 +130,6 @@ from app.core.filters import (
 )
 from app.core.fsc_financial_stat import get_latest_stat_by_crno
 from app.models.corp_cache import CorpCache
-from app.models.corp_profile import CorpProfile
 from app.models.dart_corp_index import DartCorpIndex
 from app.models.financial_snapshot import FinancialSnapshot
 from app.models.job import Job, JobPhase, JobStatus
@@ -353,238 +358,15 @@ async def _collect_candidates(
 
 
 # ---------------------------------------------------------------------------
-# STEP 3 — 지역 사전 추림 + 기업개황 확정 + corp_profiles 캐시 적재 + 필터
+# STEP 3 (구 파이프라인, 2026-07-22 삭제됨)
 # ---------------------------------------------------------------------------
-
-
-def _profile_is_fresh(profile: CorpProfile, ttl_days: int) -> bool:
-    if profile is None or not profile.fetched_at:
-        return False
-    try:
-        fetched = datetime.fromisoformat(profile.fetched_at)
-    except ValueError:
-        return False
-    return datetime.now() - fetched <= timedelta(days=ttl_days)
-
-
-async def _fsc_lookup_region(
-    fsc_client: FscCorpInfoClient, corp_name: str
-) -> tuple[str | None, str | None] | None:
-    """금융위 기업기본정보 API(getCorpOutline_V2)로 회사명 조회 후 (시도, 시군구)를 반환.
-
-    반환값 의미:
-    - `None`: 매칭되는 회사가 없거나(이름 검색 결과 없음) FSC 호출 자체가
-      실패했다 — 호출부는 이 경우 "보수적으로" company.json을 직접 호출해
-      확정해야 한다 (상세개발계획.md §4-1, 스파이크 결과 커버리지 100%지만
-      안전망으로 유지).
-    - `(sido, sigungu)`: 매칭은 됐다는 뜻(주소 파싱에 실패해 둘 다 None일
-      수도 있음 — 이 경우도 지역 조건이 있으면 `region_matches`가 자연히
-      탈락시킨다).
-
-    corp_name이 비어 있으면 애초에 검색 자체가 무의미하므로(빈 문자열은
-    `FscCorpInfoClient`가 필터 파라미터를 아예 안 붙여 전체 목록을 반환할
-    위험이 있다) FSC를 호출하지 않고 곧바로 None(미매칭 취급)을 반환한다.
-    """
-    corp_nm_norm = normalize_corp_name(corp_name or "")
-    if not corp_nm_norm:
-        return None
-
-    try:
-        fsc_data = await fsc_client.get_corp_basic_info(
-            page_no=1, num_of_rows=5, corp_nm=corp_nm_norm
-        )
-    except Exception as exc:  # noqa: BLE001 - FSC는 DART와 별도 쿼터라 여기서만 흡수하고 폴백
-        logger.warning("FSC 기업기본정보 조회 실패 corp_name=%s: %s", corp_name, exc)
-        return None
-
-    # 실측 확인된 응답 스키마(spike_financial_committee_coverage.py 참고):
-    # response.body.items.item = [...] (리스트). 결과 없음일 때도 items는
-    # {"item": []}로 비어있지 않은 dict라서 "if items:" 식의 truthy 판정은
-    # 항상 참이 되므로, 반드시 item 리스트 자체의 길이로 매칭 여부를 판정한다.
-    body = fsc_data.get("response", {}).get("body", {})
-    item_list = body.get("items", {}).get("item") or []
-    if isinstance(item_list, dict):  # 단건 응답 시 dict로 오는 경우 대비
-        item_list = [item_list]
-    if not item_list:
-        return None
-
-    address = (item_list[0].get("enpBsadr") or "").strip() or None
-    return parse_address(address)
-
-
-async def _resolve_candidate_profile(
-    dart_client: DartClient,
-    fsc_client: FscCorpInfoClient,
-    session_factory: sessionmaker[Session],
-    settings: Settings,
-    corp_code: str,
-    corp_name: str,
-    cond_region: dict[str, Any],
-) -> CorpProfile | None:
-    """후보 1건의 지역/업종 판정에 필요한 corp_profiles 레코드를 확정한다.
-
-    ★ 지역 사전 추림 경계 지점 (상세개발계획.md §4-1, 대응 1) ★
-    1. corp_profiles 캐시에 TTL 이내로 신선한 레코드가 있으면 API 호출 없이
-       그대로 재사용한다 (대응 2와 동일, 변경 없음).
-    2. 캐시 미스면 DART company.json(회사당 1건, 일일 쿼터 20,000건 소모)을
-       바로 부르지 않고, 먼저 금융위 기업기본정보 API(별도 쿼터, 무료)로
-       회사명을 조회해 주소를 가볍게 확인한다.
-       - 지역이 맞거나(cond_region이 비어 지역 필터 자체가 없는 경우 포함)
-         FSC에서 매칭되지 않으면(이름 검색 결과 없음 — 보수적으로 놓치는
-         것보다 낫다는 판단), company.json을 호출해 전화번호/대표자/
-         업종코드까지 확정하고 corp_profiles를 풀 데이터로 upsert한다
-         (기존 대응 2 로직과 동일).
-       - FSC에서 매칭됐는데 지역이 명백히 다르면 company.json 호출을
-         생략해 DART 쿼터를 아낀다. 대신 FSC에서 얻은 sido/sigungu만
-         corp_profiles에 upsert해 두면(phone/ceo_name/induty_code는
-         null) 다음 Job 실행 때도 캐시가 fresh하면 FSC/DART 모두
-         재호출하지 않는다. 이 후보는 `region_matches`가 False를
-         반환해 자연히 필터에서 탈락한다.
-
-    company.json 조회가 (쿼터 초과가 아닌) 실패하면 None을 반환해 해당
-    후보를 이번 STEP에서는 건너뛰게 한다 — Job 전체를 실패시키지 않는다.
-    """
-    with session_factory() as db:
-        profile = db.get(CorpProfile, corp_code)
-        if profile is not None and _profile_is_fresh(profile, settings.corp_profile_ttl_days):
-            db.expunge(profile)
-            return profile
-
-    fsc_result = await _fsc_lookup_region(fsc_client, corp_name)
-    if fsc_result is not None:
-        fsc_sido, fsc_sigungu = fsc_result
-        if not region_matches(fsc_sido, fsc_sigungu, cond_region):
-            # FSC로 지역 불일치가 명백 → company.json 호출 생략, 부분 데이터만 upsert.
-            now_iso = datetime.now().isoformat(timespec="seconds")
-            with session_factory() as db:
-                profile = db.get(CorpProfile, corp_code)
-                if profile is None:
-                    profile = CorpProfile(corp_code=corp_code)
-                    db.add(profile)
-                profile.corp_name = profile.corp_name or corp_name
-                profile.sido = fsc_sido
-                profile.sigungu = fsc_sigungu
-                profile.fetched_at = now_iso
-                db.commit()
-                db.refresh(profile)
-                db.expunge(profile)
-                logger.info(
-                    "STEP3: FSC로 지역 불일치 확인, company.json 호출 생략 corp_code=%s (sido=%s)",
-                    corp_code,
-                    fsc_sido,
-                )
-                return profile
-
-    # 여기 도달하는 경우: (a) FSC에서 지역이 맞다고 확인됨, (b) cond_region이
-    # 비어 지역 필터가 없음, (c) FSC 매칭 자체가 안 되거나 호출 실패 — 모두
-    # company.json으로 직접 확정한다 (기존 대응 2 로직과 동일).
-    try:
-        company = await dart_client.get_company(corp_code)
-    except QuotaExceededError:
-        raise
-    except DartApiError as exc:
-        logger.warning("company.json 조회 실패 corp_code=%s: %s", corp_code, exc)
-        return None
-
-    address = (company.get("adres") or "").strip() or None
-    sido, sigungu = parse_address(address)
-    now_iso = datetime.now().isoformat(timespec="seconds")
-
-    with session_factory() as db:
-        profile = db.get(CorpProfile, corp_code)
-        if profile is None:
-            profile = CorpProfile(corp_code=corp_code)
-            db.add(profile)
-        profile.corp_name = company.get("corp_name")
-        profile.address = address
-        profile.sido = sido
-        profile.sigungu = sigungu
-        profile.induty_code = company.get("induty_code")
-        profile.phone = company.get("phn_no")
-        profile.ceo_name = company.get("ceo_nm")
-        profile.fetched_at = now_iso
-        db.commit()
-        db.refresh(profile)
-        db.expunge(profile)
-        return profile
-
-
-async def _run_region_industry_filter(
-    dart_client: DartClient,
-    fsc_client: FscCorpInfoClient,
-    session_factory: sessionmaker[Session],
-    settings: Settings,
-    job_id: int,
-    candidates: list[dict[str, str]],
-    cond_region: dict[str, Any],
-    cond_industry: list[str],
-) -> None:
-    """STEP 3: 후보 전체에 대해 지역/업종 필터를 적용하고 통과 건만 results에 선삽입."""
-    total = len(candidates)
-    _checkpoint(
-        session_factory,
-        job_id,
-        current_step=STEP_REGION_INDUSTRY_FILTER,
-        progress_done=0,
-        progress_total=total,
-    )
-
-    with session_factory() as db:
-        existing_corp_codes = {
-            row[0]
-            for row in db.execute(
-                select(Result.corp_code).where(Result.job_id == job_id)
-            ).all()
-        }
-
-    done = 0
-    for candidate in candidates:
-        if done % _CHECKPOINT_INTERVAL == 0:
-            _raise_if_cancelled(session_factory, job_id)
-
-        corp_code = candidate["corp_code"]
-        profile = await _resolve_candidate_profile(
-            dart_client,
-            fsc_client,
-            session_factory,
-            settings,
-            corp_code,
-            candidate.get("corp_name") or "",
-            cond_region,
-        )
-        done += 1
-
-        if (
-            profile is not None
-            and corp_code not in existing_corp_codes
-            and region_matches(profile.sido, profile.sigungu, cond_region)
-            and industry_matches(profile.induty_code, cond_industry)
-        ):
-            with session_factory() as db:
-                db.add(
-                    Result(
-                        job_id=job_id,
-                        corp_code=corp_code,
-                        rcept_no=candidate.get("rcept_no"),
-                        corp_name=profile.corp_name or candidate.get("corp_name"),
-                        address=profile.address,
-                        phone=profile.phone,
-                        ceo_name=profile.ceo_name,
-                        induty_code=profile.induty_code,
-                    )
-                )
-                db.commit()
-            existing_corp_codes.add(corp_code)
-
-        if done % _CHECKPOINT_INTERVAL == 0 or done == total:
-            _checkpoint(session_factory, job_id, progress_done=done, progress_total=total)
-
-    logger.info(
-        "STEP3 완료: 후보 %s개사 중 %s개사 필터 통과 (job_id=%s)",
-        total,
-        len(existing_corp_codes),
-        job_id,
-    )
+#
+# 구 `run_job()`(STEP 1~7)의 지역/업종 필터 STEP 3(`_run_region_industry_filter`
+# 와 그 하위 `_resolve_candidate_profile`/`_fsc_lookup_region`/`_profile_is_fresh`)은
+# M8 재설계로 프로덕션 호출 경로가 완전히 끊긴 죽은 코드였고, 2026-07-22에
+# `run_job()`·`CorpProfile` 모델과 함께 물리 삭제됐다. 지역/업종 확정은 이제
+# Phase 1(`run_job_phase1` → `filter_local_candidates`, dart_corp_index 로컬
+# 쿼리)이 담당한다. 자세한 경위는 개발이력.md 참고.
 
 
 # ---------------------------------------------------------------------------
@@ -729,8 +511,7 @@ def _load_band_conditions(
     """Job의 매출액·총자산 조건을 정렬용으로 읽는다(없으면 빈 dict).
 
     세 루프의 시그니처를 바꾸지 않고 정렬을 넣기 위해 각 루프가 직접
-    호출한다 — 구 파이프라인(`run_job`)과 `retry_failed_parsing`도 별도
-    수정 없이 같은 순서를 따르게 된다.
+    호출한다 — `retry_failed_parsing`도 별도 수정 없이 같은 순서를 따르게 된다.
     """
     job = _load_job(session_factory, job_id)
     if job is None:
@@ -1247,11 +1028,11 @@ async def _run_history_collection(
     """STEP 7: 최종 결과(`excluded_by_revenue=0` and `excluded_by_assets=0`)에
     남은 회사만 최근 N년 이력을 채운다.
 
-    STEP 3의 FSC 사전 추림과 동일한 "값비싼 호출은 후보를 최대한 추린 뒤에"
-    원칙 — 매출액·총자산 필터까지 다 통과한 회사만 대상으로 해 쿼터 영향을
-    최종 결과 건수에만 비례하게 한다. `excluded_by_assets`는 §4-7-2(2026-07-15
-    추가) 총자산 필터 컬럼이다 — 이 조건을 쓰지 않는 기존 run_job() 흐름에서는
-    모든 행이 기본값 0이라 이 조건 추가로 동작이 바뀌지 않는다.
+    "값비싼 호출은 후보를 최대한 추린 뒤에" 원칙 — 매출액·총자산 필터까지
+    다 통과한 회사만 대상으로 해 쿼터 영향을 최종 결과 건수에만 비례하게
+    한다. `excluded_by_assets`는 §4-7-2(2026-07-15 추가) 총자산 필터
+    컬럼이다 — 이 조건을 쓰지 않는 흐름에서는 모든 행이 기본값 0이라
+    이 조건 추가로 동작이 바뀌지 않는다.
     `excluded_by_stale_disclosure=0`도 같은 이유로 추가한다(2026-07-21) —
     최근 1년 이내 공시가 없는(=폐업/휴면 추정) 회사는 B2 단계에서 이미 판정이
     끝나 있으므로, 그 회사의 다년치 이력까지 추가로 내려받는 것은 쿼터 낭비다.
@@ -1337,111 +1118,13 @@ async def retry_failed_parsing(job_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Job 실행 엔트리포인트 (BackgroundTasks에서 호출)
-# ---------------------------------------------------------------------------
-
-
-async def run_job(job_id: int) -> None:
-    """Job 1건을 STEP 1~7까지 실행한다.
-
-    - `QuotaExceededError`: Job을 PAUSED_QUOTA로 전환하고 정상 반환한다
-      (예외를 상위로 전파하지 않는다 — CLAUDE.md 핵심 제약 4번).
-    - `JobCancelledError`: 체크포인트에서 취소를 감지 — 상태는 이미
-      CANCELLED이므로 그대로 반환한다.
-    - 그 외 예외: FAILED + error_msg를 기록하고 반환한다. `BackgroundTasks`로
-      실행되므로 예외를 그대로 던지면 로그에만 남고 Job 상태가 갱신되지
-      않는다 — 반드시 이 함수 내부에서 흡수해야 한다.
-    """
-    settings = get_settings()
-    settings.ensure_dirs()
-    session_factory = get_session_factory()
-
-    job = _load_job(session_factory, job_id)
-    if job is None:
-        logger.error("run_job: job_id=%s 를 찾을 수 없습니다.", job_id)
-        return
-    if job.status == JobStatus.CANCELLED:
-        logger.info("run_job: job_id=%s 는 이미 CANCELLED 상태 — 실행하지 않음.", job_id)
-        return
-
-    _checkpoint(session_factory, job_id, status=JobStatus.RUNNING, error_msg=None)
-
-    cond_region: dict[str, Any] = json.loads(job.cond_region) if job.cond_region else {}
-    cond_revenue: dict[str, Any] = json.loads(job.cond_revenue) if job.cond_revenue else {}
-    cond_industry: list[str] = json.loads(job.cond_industry) if job.cond_industry else []
-    cond_period: dict[str, Any] = json.loads(job.cond_period) if job.cond_period else {}
-
-    dart_client = DartClient(settings=settings, session_factory=session_factory)
-    # 금융위 기업기본정보 API 클라이언트 — DART와 별도 쿼터라 dart_client와
-    # 독립적으로 생성/종료한다 (상세개발계획.md §4-1 대응 1).
-    fsc_client = FscCorpInfoClient(settings=settings)
-    try:
-        # STEP 1: corp_cache 갱신 (TTL 이내면 사실상 즉시 반환)
-        _raise_if_cancelled(session_factory, job_id)
-        _checkpoint(session_factory, job_id, current_step=STEP_CORP_CACHE)
-        await refresh_corp_cache(dart_client, session_factory, settings)
-
-        # STEP 2: 외부감사관련 공시 목록 수집
-        _raise_if_cancelled(session_factory, job_id)
-        candidates = await _collect_candidates(dart_client, session_factory, job_id, cond_period)
-
-        # STEP 3: 지역 사전 추림(FSC) + 지역/업종 필터 + corp_profiles 캐시 적재 + results 선삽입
-        _raise_if_cancelled(session_factory, job_id)
-        await _run_region_industry_filter(
-            dart_client,
-            fsc_client,
-            session_factory,
-            settings,
-            job_id,
-            candidates,
-            cond_region,
-            cond_industry,
-        )
-
-        # STEP 4: 감사보고서 원문 다운로드
-        _raise_if_cancelled(session_factory, job_id)
-        await _run_document_download(dart_client, session_factory, settings, job_id)
-
-        # STEP 5: 재무제표 파싱(당기/전기 13항목) + 감사의견 추출 (API 호출 없음)
-        _raise_if_cancelled(session_factory, job_id)
-        await _run_financial_parsing(session_factory, settings, job_id)
-
-        # STEP 6: 매출액 범위 사후 필터
-        _raise_if_cancelled(session_factory, job_id)
-        _run_revenue_filter(session_factory, job_id, cond_revenue)
-
-        # STEP 7: 최근 N년 재무 이력 수집 (excluded_by_revenue=0인 최종 결과만 대상,
-        # 2026-07-15 추가) — Job 완료(DONE) 시점이 STEP 6에서 이 지점으로 이동했다
-        # (M3에서 STEP4->STEP6로 옮긴 전례와 동일한 패턴).
-        _raise_if_cancelled(session_factory, job_id)
-        await _run_history_collection(
-            dart_client, session_factory, settings, job_id, job.history_years or DEFAULT_HISTORY_YEARS
-        )
-
-        _checkpoint(session_factory, job_id, status=JobStatus.DONE, current_step=STEP_HISTORY_COLLECTION)
-        logger.info("Job %s 완료 (STEP1~7)", job_id)
-
-    except JobCancelledError:
-        logger.info("Job %s 취소 감지 — 중단.", job_id)
-        # 상태는 이미 CANCELLED (cancel API가 기록) — 여기서 덮어쓰지 않는다.
-    except QuotaExceededError as exc:
-        logger.warning("Job %s 쿼터 초과로 일시정지: %s", job_id, exc)
-        _checkpoint(session_factory, job_id, status=JobStatus.PAUSED_QUOTA, error_msg=str(exc))
-    except Exception as exc:  # noqa: BLE001 - 백그라운드 작업은 여기서 반드시 흡수해야 한다
-        logger.exception("Job %s 실행 중 예외 발생", job_id)
-        _checkpoint(session_factory, job_id, status=JobStatus.FAILED, error_msg=str(exc))
-    finally:
-        await dart_client.aclose()
-        await fsc_client.aclose()
-
-
-# ---------------------------------------------------------------------------
 # Phase 1 — 후보 발굴 (A2, §4-7/§4-7-1 M6 재설계 → §4-10 M8 3단계로 인덱스 교체)
 # ---------------------------------------------------------------------------
 #
-# run_job()(위, STEP 1~7)은 손대지 않고 그대로 둔다 — Phase 2(아래 run_job_phase2)가
-# 그 STEP 4~7 함수를 그대로 재사용한다. run_job_phase1()은 run_job()을 참고해
-# 만든 새 오케스트레이터로, STEP 1~3(corp_cache 갱신 + list.json 전국 수집 +
+# 구 `run_job()`(STEP 1~7 전체 오케스트레이터)과 그 STEP 3(지역/업종 필터,
+# CorpProfile 캐시)은 M8 재설계로 호출 경로가 끊긴 죽은 코드였고 2026-07-22에
+# 물리 삭제됐다. Phase 2(아래 run_job_phase2)가 구 STEP 4~7 함수를 그대로 재사용하고,
+# run_job_phase1()이 구 STEP 1~3(corp_cache 갱신 + list.json 전국 수집 +
 # company.json 지역 필터)을 완전히 대체한다 — 외부 API를 전혀 호출하지 않는다.
 #
 # **M8 3단계(2026-07-20)에서 A3/A4가 제거됐다.** 후보 확정은 이제 A2
@@ -1523,7 +1206,7 @@ async def run_job_phase1(job_id: int) -> None:
 
     완료 시 `status=DONE`, `phase=CANDIDATES`로 멈춘다 — Phase 2(재무정보
     수집)는 사용자가 `POST /api/jobs/{id}/start-financials`를 호출해야
-    시작된다(§4-7-1). `run_job()`과 마찬가지로 예외는 이 함수 내부에서
+    시작된다(§4-7-1). `run_job_phase2`와 마찬가지로 예외는 이 함수 내부에서
     흡수해 Job 상태에 반영한다(BackgroundTasks가 예외를 그냥 삼켜버리므로).
     """
     settings = get_settings()
