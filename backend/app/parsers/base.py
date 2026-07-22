@@ -65,6 +65,21 @@ CF_FINANCIAL_FIELDS: tuple[str, ...] = (
     "cf_ending_cash",  # 기말의 현금
 )
 
+# 영업외수익/영업외비용 2항목 (2026-07-22). CF_FINANCIAL_FIELDS와 완전히 동형인
+# best-effort 항목이다 — 표준 13항목(STANDARD/DIRECT_FINANCIAL_FIELDS)에 절대
+# 넣지 않으며 `determine_parse_status()` 판정에도 관여하지 않는다(결측이어도
+# PARTIAL/FAILED로 떨어지지 않음). 이유는 CF와 동일하다: 이미 OK로 완료된 Job이
+# 새 필드 결측으로 재분류되면 검수 기준이 깨진다. 손익계산서 세부계정 펼치기에서
+# "영업외수익"/"영업외비용" 대분류(L0)와 그 하위 세부계정(이자수익/외환차익 등)이
+# 유실되던 것을 복구하기 위해 신설했다. 순수 수익/비용 항목이라 "이익(손실)"
+# 조합형 부호 반전 대상이 아니고, 실측(로컬 캐시 4,922건 전수 스캔)상 FINANCE
+# 서식은 둘 다 양수 크기로 표기하므로 원문 부호를 그대로 신뢰한다(영업외수익
+# 4,529건 양수/1건 음수, 영업외비용 4,531건 전부 양수).
+NON_OPERATING_FINANCIAL_FIELDS: tuple[str, ...] = (
+    "non_operating_income",   # 영업외수익
+    "non_operating_expense",  # 영업외비용
+)
+
 # 계정과목 표기 변형(공백 제거 후 기준) → 표준 필드 매핑 사전 (v1).
 # 실측 샘플(한국학술정보/홈마리나속초호텔 등)에서 확인된 표기를 반영했다.
 # 검수 과정(M5)에서 지속 보강한다.
@@ -102,6 +117,14 @@ ACCOUNT_NAME_ALIASES: dict[str, str] = {
     "당기순이익(손실)": "net_income",
     "당기순이익(순손실)": "net_income",
     "당기순손실(이익)": "net_income",
+    # 영업외수익/영업외비용 (best-effort, NON_OPERATING_FINANCIAL_FIELDS 참고).
+    # 로컬 캐시 4,922건 전수 스캔 결과 정규화 라벨은 정확히 "영업외수익"(4,531건)/
+    # "영업외비용"(4,531건)이 지배적이고, 로마숫자 접두어·글자 사이 공백·유사문자
+    # (Vl/Vll 등) 변형은 전부 normalize_account_label이 이미 흡수한다. "기타수익"/
+    # "기타비용"/"기타영업외수익" 등은 회사마다 계정 체계가 달라 영업외수익과
+    # 동일 개념이 아닐 수 있어 억지로 합치지 않는다(오매핑 방지).
+    "영업외수익": "non_operating_income",
+    "영업외비용": "non_operating_expense",
 }
 
 # 현금흐름표 전용 계정과목 alias (§4-8). fixtures 30건 중 CF 섹션 보유 19건을

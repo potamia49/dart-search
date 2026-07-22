@@ -67,6 +67,8 @@ SORTABLE_COLUMNS: tuple[str, ...] = (
     "cf_investing_cur", "cf_investing_prv",
     "cf_financing_cur", "cf_financing_prv",
     "cf_ending_cash_cur", "cf_ending_cash_prv",
+    "non_operating_income_cur", "non_operating_income_prv",
+    "non_operating_expense_cur", "non_operating_expense_prv",
     "latest_disclosure_date",
 )
 
@@ -213,6 +215,10 @@ class ResultResponse(BaseModel):
     cf_financing_prv: int | None
     cf_ending_cash_cur: int | None
     cf_ending_cash_prv: int | None
+    non_operating_income_cur: int | None
+    non_operating_income_prv: int | None
+    non_operating_expense_cur: int | None
+    non_operating_expense_prv: int | None
 
     # 금융위 요약재무 참고값 + 기준연도 (§4-10-C/D) — 후보 목록에서 "재무정보 수집을
     # 시작할지" 판단할 근거로만 쓴다. 필터 판정은 항상 `_cur`(원문 파싱값) 기준이다.
@@ -432,6 +438,8 @@ class FinancialSnapshotResponse(BaseModel):
     cf_investing: int | None
     cf_financing: int | None
     cf_ending_cash: int | None
+    non_operating_income: int | None
+    non_operating_expense: int | None
 
     parse_status: str | None
     parse_note: str | None

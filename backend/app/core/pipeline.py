@@ -134,6 +134,7 @@ from app.parsers.auditor import AuditorInfo, extract_auditor
 from app.parsers.base import (
     CF_FINANCIAL_FIELDS,
     DIRECT_FINANCIAL_FIELDS,
+    NON_OPERATING_FINANCIAL_FIELDS,
     STANDARD_FINANCIAL_FIELDS,
     ParsedFinancials,
 )
@@ -829,7 +830,7 @@ def _apply_parsed_result(
         result = db.get(Result, result_id)
         if result is None:
             return
-        for f in DIRECT_FINANCIAL_FIELDS + CF_FINANCIAL_FIELDS:
+        for f in DIRECT_FINANCIAL_FIELDS + CF_FINANCIAL_FIELDS + NON_OPERATING_FINANCIAL_FIELDS:
             setattr(result, f"{f}_cur", parsed.values_cur.get(f))
             setattr(result, f"{f}_prv", parsed.values_prv.get(f))
         result.audit_opinion = audit_opinion
@@ -1096,7 +1097,8 @@ def _upsert_financial_snapshot(
             existing = FinancialSnapshot(result_id=result_id, fiscal_year=fiscal_year)
             db.add(existing)
         existing.rcept_no = rcept_no
-        for f in STANDARD_FINANCIAL_FIELDS + CF_FINANCIAL_FIELDS:  # gross_profit·CF 포함
+        for f in STANDARD_FINANCIAL_FIELDS + CF_FINANCIAL_FIELDS + NON_OPERATING_FINANCIAL_FIELDS:
+            # gross_profit·CF·영업외수익/영업외비용 포함
             setattr(existing, f, values.get(f))
         existing.parse_status = parse_status
         existing.parse_note = parse_note

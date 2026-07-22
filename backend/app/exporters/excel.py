@@ -75,6 +75,11 @@ RESULT_COLUMN_LABELS: dict[str, str] = {
     "cf_financing_prv": "재무활동현금흐름(전기)",
     "cf_ending_cash_cur": "기말의현금(당기)",
     "cf_ending_cash_prv": "기말의현금(전기)",
+    # 영업외수익/영업외비용 2항목 (2026-07-22)
+    "non_operating_income_cur": "영업외수익(당기)",
+    "non_operating_income_prv": "영업외수익(전기)",
+    "non_operating_expense_cur": "영업외비용(당기)",
+    "non_operating_expense_prv": "영업외비용(전기)",
     # 금융위 요약재무 참고값 (§4-10-C/D) — 필터 판정에 쓰이지 않는 참고 표시용이고
     # 기준연도가 회사마다 다르므로 라벨에 "참고"와 연도 컬럼을 함께 둔다.
     "ref_revenue": "매출액(참고)",

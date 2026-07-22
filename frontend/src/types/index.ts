@@ -118,6 +118,12 @@ export interface ResultResponse {
   sga_prv: number | null
   operating_income_cur: number | null
   operating_income_prv: number | null
+  // 영업외수익/영업외비용 (2026-07-22) — 표준 13항목엔 없는 best-effort 추가
+  // 항목이라 파싱상태가 OK여도 값이 없을 수 있다(CF 4항목과 동형).
+  non_operating_income_cur: number | null
+  non_operating_income_prv: number | null
+  non_operating_expense_cur: number | null
+  non_operating_expense_prv: number | null
   net_income_cur: number | null
   net_income_prv: number | null
   // 현금흐름표 4항목 (§4-8)
@@ -258,6 +264,9 @@ export interface FinancialSnapshotResponse {
   gross_profit: number | null
   sga: number | null
   operating_income: number | null
+  // 영업외수익/영업외비용 (2026-07-22) — best-effort, CF 4항목과 동형.
+  non_operating_income: number | null
+  non_operating_expense: number | null
   net_income: number | null
   // 현금흐름표 4항목 (§4-8)
   cf_operating: number | null

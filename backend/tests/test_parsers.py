@@ -18,6 +18,8 @@ from app.parsers.audit_opinion import extract_audit_opinion
 from app.parsers.base import (
     ACCOUNT_NAME_ALIASES,
     DIRECT_FINANCIAL_FIELDS,
+    NON_OPERATING_FINANCIAL_FIELDS,
+    STANDARD_FINANCIAL_FIELDS,
     determine_parse_status,
     normalize_account_label,
     parse_won_amount,
@@ -273,6 +275,55 @@ def test_cash_flow_absence_does_not_change_parse_status_but_notes():
     assert parsed.parse_status == "PARTIAL"
     assert parsed.values_cur.get("cf_operating") is None
     assert "현금흐름표 미확보" not in (parsed.parse_note or "")
+
+
+def test_account_name_aliases_cover_non_operating_labels():
+    """영업외수익/영업외비용은 로마숫자 접두어·글자 사이 공백·유사문자 변형을
+    normalize한 뒤 정확히 "영업외수익"/"영업외비용"으로 매핑돼야 한다(2026-07-22,
+    로컬 캐시 4,922건 전수 스캔 — 두 라벨이 각각 4,531건으로 지배적)."""
+    assert ACCOUNT_NAME_ALIASES[normalize_account_label("Ⅵ. 영업외수익")] == "non_operating_income"
+    assert ACCOUNT_NAME_ALIASES[normalize_account_label("Ⅶ.영업외비용")] == "non_operating_expense"
+    # 글자 사이 공백(20230404002324 실측)과 유사문자 Vl/Vll(20230405001652 실측)도 흡수.
+    assert ACCOUNT_NAME_ALIASES[normalize_account_label("Ⅵ.영  업  외  수  익")] == "non_operating_income"
+    assert ACCOUNT_NAME_ALIASES[normalize_account_label("Vll.영업외비용")] == "non_operating_expense"
+
+
+def test_non_operating_fields_excluded_from_standard_and_status():
+    """영업외수익/영업외비용은 best-effort 항목이라 표준 13항목·parse_status 판정에서
+    완전히 제외된다(CF와 동일 원칙) — 결측이어도 PARTIAL/FAILED로 떨어지면 안 된다."""
+    assert "non_operating_income" not in STANDARD_FINANCIAL_FIELDS
+    assert "non_operating_expense" not in STANDARD_FINANCIAL_FIELDS
+    assert "non_operating_income" not in DIRECT_FINANCIAL_FIELDS
+    assert set(NON_OPERATING_FINANCIAL_FIELDS) == {"non_operating_income", "non_operating_expense"}
+    # 표준 13항목은 다 채우고 영업외 2항목만 비워도 OK여야 한다.
+    values = {f: 1.0 for f in DIRECT_FINANCIAL_FIELDS}
+    status, note = determine_parse_status(values, values, found_any_table=True)
+    assert status == "OK"
+    assert note is None
+
+
+def test_parse_xml_financials_extracts_non_operating_items():
+    """한국학술정보(20260630000641)의 영업외수익/영업외비용 당기·전기 실측값.
+
+    원문 손익계산서 FINANCE 테이블의 "Ⅵ.영업외수익"/"Ⅶ.영업외비용" TE 셀 값을
+    그대로 옮겨 왔다. 순수 수익/비용 항목이라 부호 반전 대상이 아니며, best-effort
+    라 정상 추출돼도 parse_status는 오염되지 않는다.
+    """
+    parsed = parse_xml_financials(_read_fixture("20260630000641"))
+    assert parsed.values_cur["non_operating_income"] == 235_085_178
+    assert parsed.values_prv["non_operating_income"] == 526_475_539
+    assert parsed.values_cur["non_operating_expense"] == 1_866_659_699
+    assert parsed.values_prv["non_operating_expense"] == 2_092_546_996
+    assert parsed.parse_status == "OK"
+    assert parsed.parse_note is None
+
+
+def test_parse_xml_financials_non_operating_letter_spaced_label():
+    """라벨 글자 사이 공백("영   업   외   수   익")도 normalize로 흡수해 매핑된다
+    (20260413003038 실측). 순수 수익/비용이라 원문 양수를 그대로 신뢰한다."""
+    parsed = parse_xml_financials(_read_fixture("20260413003038"))
+    assert parsed.values_cur["non_operating_income"] == 129_804_230
+    assert parsed.values_cur["non_operating_expense"] == 659_246_052
 
 
 def test_parse_xml_financials_qualified_opinion_flips_loss_sign():

@@ -145,6 +145,22 @@ Job은 `phase` 컬럼(`CANDIDATES`/`FINANCIALS`)으로 2단계로 나뉜다 —
   (`auditor_name`/`auditor_address`), 원문 섹션 열람 API**(재무상태표/
   손익계산서/현금흐름표/주석/감사의견 — 로컬 캐시만 읽어 쿼터 0건)가 모두
   구현돼 있다.
+- **영업외수익/영업외비용 2항목**(2026-07-22, `non_operating_income`/
+  `non_operating_expense`)이 CF 4항목과 완전히 동형인 best-effort 필드로
+  추가됐다 — 파서(`app/parsers/base.py::NON_OPERATING_FINANCIAL_FIELDS`,
+  `ACCOUNT_NAME_ALIASES`)와 세부계정 펼치기(`account_detail.py`)는
+  dart-parser가, `results`/`financial_snapshots` 테이블 컬럼(`_cur`/`_prv`
+  4개 + snapshot 2개, `app/core/db.py` ad-hoc `ALTER TABLE`로 기존 DB에도
+  적용) · Phase 2 파이프라인 매핑(`app/core/pipeline.py`의 두 매핑 루프에
+  `NON_OPERATING_FINANCIAL_FIELDS`를 추가하는 것만으로 충분— 필드명 순회
+  구조라 CF 때처럼 별도 분기가 필요 없었다) · API 응답(`ResultResponse`/
+  `FinancialSnapshotResponse`/`SORTABLE_COLUMNS`) · Excel/CSV 내보내기
+  (`RESULT_COLUMN_LABELS`)는 dart-backend가 이어서 배선했다. CF와 동일하게
+  `determine_parse_status()` 판정에는 관여하지 않고(결측이어도 PARTIAL/
+  FAILED로 안 떨어짐), **기존 완료 Job은 소급 재파싱 없이 NULL로 남고
+  신규 Phase 2 실행분부터만 채워진다.** `account-detail` 엔드포인트는
+  `accounts` 응답이 애초에 `dict[str, list[...]]` 범용 구조라 코드 변경 없이
+  새 키가 자동으로 실린다. pytest 298 passed(회귀 0).
 - **스키마 확장은 항상 "컬럼 추가 + 소급 재파싱 없음"** 패턴을 따른다(신규
   Phase 2 실행분부터만 채워짐). **소급 재파싱 대기 후보 4종은 2026-07-21
   일괄 처리 완료**(사용자 명시 요청에 의한 일회성 예외 — 쿼터 0건, 스크립트

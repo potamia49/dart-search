@@ -671,6 +671,31 @@ def test_account_detail_returns_cash_flow_children_and_audit_opinion(
     assert body["accounts"].get("cf_ending_cash", []) == []
 
 
+def test_account_detail_returns_non_operating_children(client_with_db, monkeypatch, tmp_path):
+    """손익계산서 세부계정 펼치기에서 영업외수익/영업외비용 대분류(L0)와 그 하위
+    세부계정(이자수익/이자비용/외환차익 등)이 유실 없이 반환되는지 검증(2026-07-22).
+
+    이 두 항목은 표준 13항목에 없어 이전에는 _collect_table이 L0에서 current_field를
+    닫아 항목 자체와 children이 통째로 스킵됐다 — valid_fields 확장으로 복구된다.
+    """
+    client, factory = client_with_db
+    job_id, result_id = _seed_result_with_rcept(factory, "20260630000641")
+    _point_cache_at_tmp(monkeypatch, tmp_path, "20260630000641", "20260630000641")
+
+    resp = client.get(f"/api/jobs/{job_id}/results/{result_id}/account-detail")
+    assert resp.status_code == 200
+    accounts = resp.json()["accounts"]
+
+    income_rows = accounts["non_operating_income"]
+    assert len(income_rows) > 3
+    assert all(row["level"] >= 1 for row in income_rows)
+    assert any(row["cur"] is not None for row in income_rows)
+
+    expense_rows = accounts["non_operating_expense"]
+    assert len(expense_rows) > 3
+    assert any(row["cur"] is not None for row in expense_rows)
+
+
 def test_document_section_invalid_section_returns_400(client_with_db, monkeypatch, tmp_path):
     client, factory = client_with_db
     job_id, result_id = _seed_result_with_rcept(factory, "20260630000641")

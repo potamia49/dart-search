@@ -80,6 +80,11 @@ class FinancialSnapshot(Base):
     cf_financing: Mapped[int | None] = mapped_column(Integer, nullable=True)
     cf_ending_cash: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
+    # 영업외수익/영업외비용 2항목 (2026-07-22) — results의 non_operating_*_cur/prv와
+    # 동일 필드셋, 접미어 없음(CF 4항목과 동일 패턴).
+    non_operating_income: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    non_operating_expense: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
     parse_status: Mapped[str | None] = mapped_column(String, nullable=True)  # OK/PARTIAL/FAILED
     parse_note: Mapped[str | None] = mapped_column(String, nullable=True)
 

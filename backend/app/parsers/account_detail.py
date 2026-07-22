@@ -34,9 +34,16 @@ from app.parsers.base import (
     CF_ACCOUNT_NAME_ALIASES,
     CF_FINANCIAL_FIELDS,
     DIRECT_FINANCIAL_FIELDS,
+    NON_OPERATING_FINANCIAL_FIELDS,
     normalize_account_label,
     parse_won_amount,
 )
+
+# 손익계산서 세부계정 펼치기에서 대분류(L0)로 인식할 필드 = 표준 13항목 +
+# 영업외수익/영업외비용(best-effort). 후자를 valid_fields에 넣지 않으면 원문의
+# "영업외수익"/"영업외비용" L0 행에서 current_field가 닫혀 그 하위 세부계정
+# (이자수익/외환차익/이자비용/외환차손 등)까지 통째로 유실된다(2026-07-22).
+_BS_IS_VALID_FIELDS: tuple[str, ...] = DIRECT_FINANCIAL_FIELDS + NON_OPERATING_FINANCIAL_FIELDS
 from app.parsers.xml_parser import (
     _BS_TITLE_MARK,
     _CF_TITLE_MARK,
@@ -120,8 +127,9 @@ def _collect_table(
         prv = _first_amount(value_texts[cur_span : cur_span + prv_span])
 
         if level == 0:
-            # 새 대분류. 요약 필드로 매핑되면 그 필드의 children 수집을 시작하고,
-            # 아니면(자산/부채 헤더, 영업외수익 등) 현재 수집을 닫는다.
+            # 새 대분류. 요약 필드(valid_fields)로 매핑되면 그 필드의 children
+            # 수집을 시작하고, 아니면(자산/부채 헤더 등 valid_fields 밖 항목)
+            # 현재 수집을 닫는다.
             mapped = aliases.get(normalize_account_label(label))
             if mapped in valid_fields:
                 current_field = mapped
@@ -173,7 +181,7 @@ def parse_account_detail(raw_xml: bytes) -> AccountDetail:
             continue
 
         if local_tag == "TABLE" and section in ("bs", "is") and el.get("ACLASS") == "FINANCE":
-            _collect_table(el, accounts, ACCOUNT_NAME_ALIASES, DIRECT_FINANCIAL_FIELDS)
+            _collect_table(el, accounts, ACCOUNT_NAME_ALIASES, _BS_IS_VALID_FIELDS)
             section = None  # 구간당 첫 FINANCE 테이블만 사용(xml_parser와 동일)
 
         elif local_tag == "TABLE" and section == "cf" and el.get("ACLASS") == "FINANCE":

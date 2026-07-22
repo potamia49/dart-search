@@ -99,6 +99,11 @@ export const FINANCIAL_GROUPS: FinancialGroup[] = [
       { label: '매출총이익', curKey: 'gross_profit_cur', prvKey: 'gross_profit_prv', snapKey: 'gross_profit', format: formatNumber, expandable: false },
       { label: '판매비와관리비', curKey: 'sga_cur', prvKey: 'sga_prv', snapKey: 'sga', format: formatNumber },
       { label: '영업이익', curKey: 'operating_income_cur', prvKey: 'operating_income_prv', snapKey: 'operating_income', format: formatNumber, expandable: false },
+      // 영업외수익/영업외비용 (2026-07-22) — 표준 13항목엔 없는 best-effort 추가
+      // 항목이라 파싱상태가 OK여도 값이 없을 수 있다(CF 4항목과 동형 패턴). 세부계정
+      // (이자수익/이자비용/외환차익/외환차손 등)이 있는 경우가 흔해 펼치기 가능.
+      { label: '영업외수익', curKey: 'non_operating_income_cur', prvKey: 'non_operating_income_prv', snapKey: 'non_operating_income', format: formatNumber },
+      { label: '영업외비용', curKey: 'non_operating_expense_cur', prvKey: 'non_operating_expense_prv', snapKey: 'non_operating_expense', format: formatNumber },
       { label: '당기순이익', curKey: 'net_income_cur', prvKey: 'net_income_prv', snapKey: 'net_income', format: formatNumber, expandable: false },
     ],
   },
@@ -122,7 +127,7 @@ function itemsToColumns(items: FinancialItem[]): ResultColumn[] {
   ])
 }
 
-// 재무상태표 + 손익계산서 13항목 (당기/전기 = 26컬럼).
+// 재무상태표 + 손익계산서 (표준 13항목 + 영업외수익/영업외비용 best-effort 2항목, §4-8).
 export const FINANCIAL_COLUMNS: ResultColumn[] = FINANCIAL_GROUPS
   .filter((group) => group.section !== 'cf')
   .flatMap((group) => itemsToColumns(group.items))

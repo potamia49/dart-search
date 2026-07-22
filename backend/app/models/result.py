@@ -86,6 +86,14 @@ class Result(Base):
     cf_ending_cash_cur: Mapped[int | None] = mapped_column(Integer, nullable=True)
     cf_ending_cash_prv: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
+    # 영업외수익/영업외비용 2항목 (2026-07-22, base.py NON_OPERATING_FINANCIAL_FIELDS
+    # 참고) — CF 4항목과 완전히 동형인 best-effort 컬럼이다. parse_status 판정에는
+    # 반영하지 않으며, 누락 시 parse_note에도 부기하지 않는다(CF와 동일한 설계).
+    non_operating_income_cur: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    non_operating_income_prv: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    non_operating_expense_cur: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    non_operating_expense_prv: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
     # 상태
     parse_status: Mapped[str | None] = mapped_column(String, nullable=True)  # OK/PARTIAL/FAILED
     parse_note: Mapped[str | None] = mapped_column(String, nullable=True)
