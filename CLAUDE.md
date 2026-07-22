@@ -428,7 +428,7 @@ npm run build   # tsc 타입체크 포함
 npm run lint    # oxlint
 ```
 
-### 배포용 실행파일(.exe) 빌드 (2026-07-23 추가)
+### 배포용 실행파일(.exe) 빌드 (2026-07-23 추가, 2026-07-23 배포 위치 분리)
 
 Python/Node가 설치되지 않은 사무실 PC에도 배포할 수 있도록, PyInstaller로
 백엔드(FastAPI+uvicorn)와 프론트엔드 빌드 산출물을 단일 exe로 묶는다.
@@ -436,11 +436,17 @@ API 키는 exe에 하드코딩하지 않는다 — `backend/launcher.py`가 exe 
 `.env`가 없으면 `.env.example`을 복사해 메모장으로 열고 안내창을 띄운 뒤
 종료하며, 사용자가 키를 채워 저장하고 재실행하면 정상 구동된다(최초 1회).
 
+**배포 산출물은 개발 저장소(`c:\claude\dart-search`)와 분리해 `C:\claude\dart-search-배포`에
+둔다** (2026-07-23, 사용자 명시 요청 — 개발용 소스/DB와 실제 사무실에서 쓰는
+배포본을 물리적으로 구분하기 위함). `--distpath`로 그 경로를 직접 지정해
+빌드 결과가 바로 그리로 나가게 한다.
+
 ```
 cd frontend && npm run build          # frontend/dist 생성 (exe에 번들됨)
 cd backend && source .venv/Scripts/activate
 pip install pyinstaller
 pyinstaller --noconfirm --onefile --name dart-search \
+  --distpath "C:/claude/dart-search-배포" \
   --add-data "../frontend/dist;frontend_dist" \
   --add-data ".env.example;." \
   --collect-all fastapi --collect-all starlette --collect-all uvicorn \
@@ -450,7 +456,9 @@ pyinstaller --noconfirm --onefile --name dart-search \
   --collect-all httpx --collect-all anyio \
   --hidden-import app.api.jobs --hidden-import app.api.meta --hidden-import app.api.results \
   launcher.py
-# 결과물: backend/dist/dart-search.exe (약 83MB)
+# 결과물: C:\claude\dart-search-배포\dart-search.exe (약 83MB)
+# (재빌드해도 같은 폴더의 기존 .env/dart_search.db/data는 그대로 남고 exe만 갱신됨 —
+#  onefile 모드는 exe 하나만 --distpath에 쓰고 나머지는 손대지 않기 때문)
 ```
 
 구조: `app/config.py`의 `BACKEND_DIR`은 환경변수 `DART_SEARCH_APP_DIR`(exe가
@@ -463,5 +471,7 @@ exe 옆에 영구히 남는다(PyInstaller onefile의 임시 압축해제 폴더
 두 환경변수 모두 없으면(=일반 소스 실행) 기존 동작과 100% 동일하다.
 `launcher.py`는 `DART_SEARCH_PORT`(기본 8000)로 uvicorn을 띄우고, 이미 그
 포트가 쓰이는 중이면(중복 실행) 새 서버를 띄우지 않고 브라우저 창만 새로
-연다. `backend/dist/`·`backend/build/`·`backend/*.spec`은 빌드 산출물이라
-`.gitignore`에 등록돼 있다(커밋 대상 아님).
+연다. `backend/build/`·`backend/*.spec`은 PyInstaller 중간 산출물이라
+`.gitignore`에 등록돼 있다(커밋 대상 아님) — 최종 배포본(`backend/dist/`가
+아니라 `C:\claude\dart-search-배포\`)은 저장소 바깥이라 애초에 git 추적
+대상이 아니다.
