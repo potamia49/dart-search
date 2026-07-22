@@ -16,8 +16,9 @@
   extract_audit_opinion / _extract_fiscal_date)를 재사용한다 — 새 파싱 규칙을
   여기서 만들지 않는다.
 - 갱신 대상 컬럼도 STEP5의 `_apply_parsed_result`와 동일하게
-  DIRECT_FINANCIAL_FIELDS + CF_FINANCIAL_FIELDS(_cur/_prv) + audit_opinion +
-  fiscal_date + auditor_name/address + parse_status + parse_note로 한정한다.
+  DIRECT_FINANCIAL_FIELDS + CF_FINANCIAL_FIELDS +
+  NON_OPERATING_FINANCIAL_FIELDS(_cur/_prv) + audit_opinion + fiscal_date +
+  auditor_name/address + parse_status + parse_note로 한정한다.
   excluded_by_*/ref_* 등 필터·참고값 컬럼은 건드리지 않는다.
 
 사용법:
@@ -45,7 +46,12 @@ from app.models.job import Job  # noqa: E402
 from app.models.result import Result  # noqa: E402
 from app.parsers.audit_opinion import extract_audit_opinion  # noqa: E402
 from app.parsers.auditor import AuditorInfo, extract_auditor  # noqa: E402
-from app.parsers.base import CF_FINANCIAL_FIELDS, DIRECT_FINANCIAL_FIELDS, ParsedFinancials  # noqa: E402
+from app.parsers.base import (  # noqa: E402
+    CF_FINANCIAL_FIELDS,
+    DIRECT_FINANCIAL_FIELDS,
+    NON_OPERATING_FINANCIAL_FIELDS,
+    ParsedFinancials,
+)
 from app.parsers.pdf_parser import parse_pdf_financials  # noqa: E402
 from app.parsers.xml_parser import parse_xml_financials  # noqa: E402
 
@@ -53,7 +59,9 @@ from app.parsers.xml_parser import parse_xml_financials  # noqa: E402
 from app.core.pipeline import _extract_fiscal_date, _pick_document_file  # noqa: E402
 
 _ALL_VALUE_FIELDS = tuple(
-    f"{f}_{p}" for f in (DIRECT_FINANCIAL_FIELDS + CF_FINANCIAL_FIELDS) for p in ("cur", "prv")
+    f"{f}_{p}"
+    for f in (DIRECT_FINANCIAL_FIELDS + CF_FINANCIAL_FIELDS + NON_OPERATING_FINANCIAL_FIELDS)
+    for p in ("cur", "prv")
 )
 
 
@@ -223,7 +231,7 @@ def main() -> int:
 
             # 값 변경 감지 (숫자 필드)
             new_values = {}
-            for f in DIRECT_FINANCIAL_FIELDS + CF_FINANCIAL_FIELDS:
+            for f in DIRECT_FINANCIAL_FIELDS + CF_FINANCIAL_FIELDS + NON_OPERATING_FINANCIAL_FIELDS:
                 new_values[f"{f}_cur"] = parsed.values_cur.get(f)
                 new_values[f"{f}_prv"] = parsed.values_prv.get(f)
 

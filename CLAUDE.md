@@ -161,6 +161,22 @@ Job은 `phase` 컬럼(`CANDIDATES`/`FINANCIALS`)으로 2단계로 나뉜다 —
   신규 Phase 2 실행분부터만 채워진다.** `account-detail` 엔드포인트는
   `accounts` 응답이 애초에 `dict[str, list[...]]` 범용 구조라 코드 변경 없이
   새 키가 자동으로 실린다. pytest 298 passed(회귀 0).
+  · **기존 완료 Job 결과에 대한 소급 반영 완료(2026-07-22, 사용자 명시 승인
+  일회성 예외)**: CF·gross_profit·`_apply_sign` 부호수정 때와 동일하게
+  `backend/scripts/reparse_local_cache.py`(이번에 `NON_OPERATING_FINANCIAL_FIELDS`
+  를 대상 필드 목록에 추가하는 최소 변경만 함 — import/`_ALL_VALUE_FIELDS`/
+  `new_values` 루프 3곳, `--dry-run`·멱등·**API 호출 0건** 구조 무변경)로
+  results 1,211건(rcept 보유+파싱완료, 캐시 결측 0) 재파싱. **1,105행 변경,
+  전부 순수 추가**: 4개 non_operating 컬럼 NULL→값 4,417필드 채움, value→NULL
+  회귀 0·value→value 회귀 0(재파싱 전 non_operating 값이 non-NULL이던 행은
+  0건이라 덮어쓸 값 자체가 없었음). **다른 숫자 값 컬럼은 백업 DB와 바이트
+  단위로 전부 동일**(parse_status 전환 0, revenue/total_assets/noncurrent/
+  auditor 변경 0), 유일한 부수 변경은 parse_note 9건이 현재 파서 기준
+  missing 목록으로 텍스트만 갱신된 것(값 무관). `--verify` 항등식 자체검증:
+  부호 오분류 0·DB드리프트 0(멱등), 크기 불일치 2건은 기존 "-"→cogs=0 버그
+  (20230410002954/20230406001585)로 이번 재파싱과 무관. 채워진 결과: OK 행
+  기준 non_operating_income_cur 0→1,032건. 실행 전 `dart_search.db.bak.
+  pre_nonop_backfill.20260722222214`로 백업. `pytest` 298 passed(회귀 0).
 - **스키마 확장은 항상 "컬럼 추가 + 소급 재파싱 없음"** 패턴을 따른다(신규
   Phase 2 실행분부터만 채워짐). **소급 재파싱 대기 후보 4종은 2026-07-21
   일괄 처리 완료**(사용자 명시 요청에 의한 일회성 예외 — 쿼터 0건, 스크립트
