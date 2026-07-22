@@ -177,6 +177,26 @@ Job은 `phase` 컬럼(`CANDIDATES`/`FINANCIALS`)으로 2단계로 나뉜다 —
   (20230410002954/20230406001585)로 이번 재파싱과 무관. 채워진 결과: OK 행
   기준 non_operating_income_cur 0→1,032건. 실행 전 `dart_search.db.bak.
   pre_nonop_backfill.20260722222214`로 백업. `pytest` 298 passed(회귀 0).
+  · **`financial_snapshots` 테이블도 별개 테이블이라 위 results 소급 반영에서
+  빠져 있었다(2026-07-22, 사용자 명시 승인 일회성 예외, 뒤이어 처리)**: 결과
+  화면의 "재무이력(최근 N년, 다년치)" 표는 `results`가 아니라 STEP7이 채우는
+  `financial_snapshots`에서 값을 읽는데, 이 테이블의 기존 4,147행은 두 필드가
+  생기기 전에 만들어져 전부 NULL이라 **합계 행이 "-"로 표시**됐다(세부계정은
+  원문을 매번 새로 여는 `account_detail.py` 경로라 DB와 무관하게 정상이었음 —
+  그래서 합계만 빈 게 드러났다). results 스크립트는 손대지 않고 **별도 스크립트
+  `backend/scripts/reparse_financial_snapshots.py`**(PK·기간 판정 구조가 달라
+  새로 작성, `rcept_no`로 로컬 캐시 재파싱, **API 0건**·`--dry-run`·멱등)로
+  처리. 스냅샷 행이 원문의 당기/전기 어느 열에서 왔는지는 STEP7과 동일하게
+  `_extract_fiscal_date`로 원문 당기 연도를 뽑아 `fiscal_year`와 비교해 판정
+  (일치=values_cur, 한 해 앞=values_prv). **오직 `non_operating_income`/
+  `non_operating_expense`가 NULL인 행만** 채우고 다른 컬럼은 무변경. 대상 4,147행
+  (캐시 결측 0·파싱 예외 0·연도 불일치 0, 기간 판정은 4,147건 전부 결산기준일
+  비교로 해결돼 from_current_period 폴백 미사용): **3,871행 채움**(income
+  NULL→값 3,870·expense NULL→값 3,871), 나머지 276행은 원문에 영업외 항목이 없는
+  업종(금융/수익형)이라 정상적으로 NULL 유지. 백업 DB와 전 컬럼 대조: **다른
+  컬럼 드리프트 0행·value→변경 회귀 0**, 재실행 시 남은 277행 대상 0건 채움
+  (멱등 확인). 실행 전 `dart_search.db.bak.pre_nonop_snapshots_backfill.
+  20260722_225209`로 백업. `pytest` 298 passed.
 - **스키마 확장은 항상 "컬럼 추가 + 소급 재파싱 없음"** 패턴을 따른다(신규
   Phase 2 실행분부터만 채워짐). **소급 재파싱 대기 후보 4종은 2026-07-21
   일괄 처리 완료**(사용자 명시 요청에 의한 일회성 예외 — 쿼터 0건, 스크립트
