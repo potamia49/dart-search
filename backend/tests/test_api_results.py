@@ -209,6 +209,47 @@ def test_list_results_splits_failed_by_has_disclosure(client_with_db):
     assert [r["corp_name"] for r in no_disclosure.json()["items"]] == ["㈜공시없음테스트"]
 
 
+def test_list_results_filters_by_excluded_by_stale_disclosure(client_with_db):
+    """"최근 1년 이내 DART 공시 없음" 배제 플래그도 다른 excluded_by_*와 동일한
+    tri-state 패턴(값을 안 주면 필터 없음/true/false)으로 필터할 수 있어야 한다
+    (2026-07-21 추가, 실사례 "주식회사 유진")."""
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+
+    db = factory()
+    try:
+        db.add(
+            Result(
+                job_id=job_id,
+                corp_code="00100004",
+                rcept_no="20240101000004",
+                corp_name="㈜유진",
+                parse_status=ParseStatus.OK,
+                excluded_by_revenue=0,
+                latest_disclosure_date="20240101",
+                excluded_by_stale_disclosure=1,
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    # 값을 안 주면(기존 excluded_by_revenue/assets와 동일) 필터하지 않는다.
+    unfiltered = client.get(f"/api/jobs/{job_id}/results")
+    assert unfiltered.json()["total"] == 3
+
+    stale_only = client.get(
+        f"/api/jobs/{job_id}/results", params={"excluded_by_stale_disclosure": True}
+    )
+    assert [r["corp_name"] for r in stale_only.json()["items"]] == ["㈜유진"]
+    assert stale_only.json()["items"][0]["latest_disclosure_date"] == "20240101"
+
+    not_stale = client.get(
+        f"/api/jobs/{job_id}/results", params={"excluded_by_stale_disclosure": False}
+    )
+    assert {r["corp_name"] for r in not_stale.json()["items"]} == {"㈜성공테스트", "㈜실패테스트"}
+
+
 def test_list_results_not_found_returns_404(client_with_db):
     client, _factory = client_with_db
     resp = client.get("/api/jobs/9999/results")

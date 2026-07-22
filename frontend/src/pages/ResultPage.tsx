@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { useParams } from 'react-router-dom'
 import {
   Alert,
+  Badge,
   Button,
   CloseButton,
   Group,
@@ -40,6 +41,7 @@ type FilterTab =
   | 'NO_DISCLOSURE'
   | 'EXCLUDED_REVENUE'
   | 'EXCLUDED_ASSETS'
+  | 'STALE_DISCLOSURE'
 
 const PAGE_SIZE = 50
 
@@ -57,26 +59,34 @@ function tabToParams(tab: FilterTab): {
   parse_status?: ParseStatus
   excluded_by_revenue?: boolean
   excluded_by_assets?: boolean
+  excluded_by_stale_disclosure?: boolean
   has_disclosure?: boolean
 } {
+  // "휴면·폐업 추정"(최근 1년 이내 DART 공시 없음) 건은 노이즈 성격이 강해
+  // 전용 탭이 아닌 모든 화면(전체 탭 포함)에서 기본적으로 숨긴다 — 사용자가
+  // 명시적으로 탭을 선택했을 때만 예외로 노출한다(2026-07-22 확정 UX).
+  if (tab === 'STALE_DISCLOSURE') {
+    return { excluded_by_stale_disclosure: true }
+  }
+  const baseline = { excluded_by_stale_disclosure: false }
   switch (tab) {
     case 'OK':
-      return { parse_status: 'OK' }
+      return { ...baseline, parse_status: 'OK' }
     case 'PARTIAL':
-      return { parse_status: 'PARTIAL' }
+      return { ...baseline, parse_status: 'PARTIAL' }
     // FAILED 중에서도 원문을 실제로 열어본 건만 "검수 필요"다. 원문 자체가 없는
     // 건(rcept_no IS NULL)은 파서 문제가 아니라 DART에 감사보고서가 없는 것이라
     // 별도 탭으로 분리한다(2026-07-20).
     case 'FAILED':
-      return { parse_status: 'FAILED', has_disclosure: true }
+      return { ...baseline, parse_status: 'FAILED', has_disclosure: true }
     case 'NO_DISCLOSURE':
-      return { parse_status: 'FAILED', has_disclosure: false }
+      return { ...baseline, parse_status: 'FAILED', has_disclosure: false }
     case 'EXCLUDED_REVENUE':
-      return { excluded_by_revenue: true }
+      return { ...baseline, excluded_by_revenue: true }
     case 'EXCLUDED_ASSETS':
-      return { excluded_by_assets: true }
+      return { ...baseline, excluded_by_assets: true }
     default:
-      return {}
+      return baseline
   }
 }
 
@@ -97,6 +107,15 @@ function FinancialsResultsView({ jobId }: { jobId: number }) {
   const [debouncedSearch, setDebouncedSearch] = useState('')
   const [sortBy, setSortBy] = useState<string | null>(null)
   const [sortDir, setSortDir] = useState<SortDir>('asc')
+  // "휴면·폐업 추정"으로 기본 숨김 처리된 건수 — 무통보로 사라지지 않도록 탭
+  // 뱃지와 "총 N건" 옆 안내 문구로 항상 고지한다(2026-07-22 디자인 리뷰 반영).
+  const [staleCount, setStaleCount] = useState<number | null>(null)
+
+  useEffect(() => {
+    listResults(jobId, { page: 1, page_size: 1, excluded_by_stale_disclosure: true })
+      .then((res) => setStaleCount(res.total))
+      .catch(() => setStaleCount(null))
+  }, [jobId])
 
   // 타이핑 중에 매 글자마다 요청하지 않도록 입력을 디바운스한다.
   useEffect(() => {
@@ -173,7 +192,16 @@ function FinancialsResultsView({ jobId }: { jobId: number }) {
     }
   }
 
-  const visibleColumns = ALL_COLUMNS.filter((c) => visibleKeys.has(c.key))
+  // "휴면·폐업 추정" 탭에서는 판정 근거(최근 공시일자)를 항상 볼 수 있어야
+  // 하므로 컬럼 토글 상태와 무관하게 표시한다(2026-07-22). ColumnToggle에도
+  // 같은 집합을 넘겨 체크박스 상태가 실제 표시 상태와 어긋나지 않게 한다.
+  const forcedVisibleKeys = useMemo<Set<keyof ResultResponse>>(
+    () => (tab === 'STALE_DISCLOSURE' ? new Set(['latest_disclosure_date']) : new Set()),
+    [tab],
+  )
+  const visibleColumns = ALL_COLUMNS.filter(
+    (c) => visibleKeys.has(c.key) || forcedVisibleKeys.has(c.key),
+  )
   const totalPages = data ? Math.max(1, Math.ceil(data.total / data.page_size)) : 1
 
   return (
@@ -188,6 +216,18 @@ function FinancialsResultsView({ jobId }: { jobId: number }) {
             <Tabs.Tab value="NO_DISCLOSURE">감사보고서 없음</Tabs.Tab>
             <Tabs.Tab value="EXCLUDED_REVENUE">매출액 제외 건</Tabs.Tab>
             <Tabs.Tab value="EXCLUDED_ASSETS">총자산 제외 건</Tabs.Tab>
+            <Tabs.Tab
+              value="STALE_DISCLOSURE"
+              rightSection={
+                staleCount !== null ? (
+                  <Badge size="xs" variant="light" color="yellow">
+                    {staleCount}
+                  </Badge>
+                ) : undefined
+              }
+            >
+              휴면·폐업 추정
+            </Tabs.Tab>
           </Tabs.List>
         </Tabs>
 
@@ -201,7 +241,12 @@ function FinancialsResultsView({ jobId }: { jobId: number }) {
             }
             w={260}
           />
-          <ColumnToggle allColumns={ALL_COLUMNS} visibleKeys={visibleKeys} onToggle={toggleColumn} />
+          <ColumnToggle
+            allColumns={ALL_COLUMNS}
+            visibleKeys={visibleKeys}
+            onToggle={toggleColumn}
+            forcedVisibleKeys={forcedVisibleKeys}
+          />
           <Button variant="default" loading={exporting} onClick={() => handleExport('xlsx')}>
             Excel 다운로드
           </Button>
@@ -221,12 +266,31 @@ function FinancialsResultsView({ jobId }: { jobId: number }) {
         </Alert>
       )}
 
+      {tab === 'STALE_DISCLOSURE' && (
+        <Alert color="yellow">
+          최근 1년 이내 DART 공시가 없는 회사입니다 — 폐업·휴면 상태일 가능성이 있어
+          <b> 다른 모든 탭(전체 포함)에서는 기본적으로 숨겨져 있습니다</b>. 실제 영업
+          여부는 이 목록만으로 단정할 수 없으니 필요 시 직접 확인하세요.
+        </Alert>
+      )}
+
       {loading && <Loader />}
 
       {!loading && data && (
         <>
           <Text size="sm" c="dimmed">
             총 {data.total.toLocaleString()}건
+            {tab !== 'STALE_DISCLOSURE' && !!staleCount && (
+              <> · 휴면·폐업 추정 {staleCount.toLocaleString()}건 숨김 (
+              <UnstyledButton
+                component="span"
+                td="underline"
+                onClick={() => handleTabChange('STALE_DISCLOSURE')}
+              >
+                보기
+              </UnstyledButton>
+              )</>
+            )}
           </Text>
           <Table.ScrollContainer minWidth={800}>
             <Table striped highlightOnHover withTableBorder>

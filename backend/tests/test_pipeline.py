@@ -1824,6 +1824,10 @@ async def test_backfill_marks_result_failed_when_no_disclosure_found(
     assert result.revenue_cur is None
     assert result.total_assets_cur is None
     assert result.excluded_by_revenue == 0  # 값을 모르면 제외하지 않는다(기존 원칙 그대로)
+    # 다년치 조회창(§STEP7 설계메모, 여기서는 4년치) 전체에서도 공시가 0건이면
+    # 최근 1년 이내에도 당연히 없다 — "최근 1년 이내 공시 없음" 배제(2026-07-21).
+    assert result.latest_disclosure_date is None
+    assert result.excluded_by_stale_disclosure == 1
 
 
 @pytest.mark.asyncio
@@ -1923,3 +1927,156 @@ async def test_backfill_homonym_falls_back_to_job_region_when_address_missing(
         result = db.execute(select(Result).where(Result.job_id == job_id)).scalar_one()
     assert result.corp_code == "REAL0001"
     assert result.rcept_no == rcept_no
+
+
+# ---------------------------------------------------------------------------
+# "최근 1년 이내 DART 공시 없음" 배제 (2026-07-21 추가, 실사례 "주식회사 유진")
+# ---------------------------------------------------------------------------
+
+
+def test_disclosure_date_from_rcept_no_extracts_yyyymmdd_prefix():
+    """rcept_no(14자리)의 앞 8자리가 접수일자다."""
+    assert pipeline._disclosure_date_from_rcept_no("20260331003150") == "20260331"
+
+
+def test_disclosure_date_from_rcept_no_defensive_for_bad_input():
+    assert pipeline._disclosure_date_from_rcept_no(None) is None
+    assert pipeline._disclosure_date_from_rcept_no("") is None
+    assert pipeline._disclosure_date_from_rcept_no("abc") is None
+
+
+def test_is_disclosure_stale_none_means_stale():
+    """공시를 아예 못 찾았으면(날짜 자체가 없으면) 무조건 배제 대상이다."""
+    assert pipeline._is_disclosure_stale(None) is True
+
+
+def test_is_disclosure_stale_boundary_around_365_days():
+    now = datetime.now()
+    recent = (now - timedelta(days=10)).strftime("%Y%m%d")
+    old = (now - timedelta(days=400)).strftime("%Y%m%d")
+    assert pipeline._is_disclosure_stale(recent) is False
+    assert pipeline._is_disclosure_stale(old) is True
+
+
+@pytest.mark.asyncio
+async def test_backfill_flags_stale_disclosure_when_latest_is_older_than_a_year(
+    db_session_factory, patch_pipeline_env
+):
+    """실사례 "주식회사 유진"과 같은 패턴 — corp_code는 정상 배정됐고 공시도
+    존재하지만(동명이인 폐지 케이스와 다름), 가장 최근 공시조차 1년(365일)보다
+    오래됐다면 excluded_by_stale_disclosure=1로 표시해야 한다."""
+    job_id = _make_job(db_session_factory, cond_revenue={"min_krw": 0, "max_krw": 10**12})
+    with db_session_factory() as db:
+        db.add(Result(job_id=job_id, corp_code="A1", corp_name="주식회사유진"))
+        db.commit()
+
+    old_date = (datetime.now() - timedelta(days=500)).strftime("%Y%m%d")
+    old_rcept = f"{old_date}000001"
+    page = {
+        "status": "000",
+        "total_page": 1,
+        "list": [{"corp_code": "A1", "corp_name": "주식회사유진", "rcept_no": old_rcept}],
+    }
+    fake_client = FakeDartClient(disclosure_pages_by_corp={"A1": [page]})
+
+    await pipeline._backfill_latest_rcept_no_for_job(fake_client, db_session_factory, job_id, 4)
+
+    with db_session_factory() as db:
+        result = db.execute(select(Result).where(Result.job_id == job_id)).scalar_one()
+    assert result.rcept_no == old_rcept  # 공시 자체는 정상적으로 채워진다(FAILED 아님)
+    assert result.latest_disclosure_date == old_date
+    assert result.excluded_by_stale_disclosure == 1
+
+
+@pytest.mark.asyncio
+async def test_backfill_does_not_flag_recent_disclosure_as_stale(
+    db_session_factory, patch_pipeline_env
+):
+    """최근 1년 이내 공시가 있으면 excluded_by_stale_disclosure=0이어야 한다."""
+    job_id = _make_job(db_session_factory, cond_revenue={"min_krw": 0, "max_krw": 10**12})
+    with db_session_factory() as db:
+        db.add(Result(job_id=job_id, corp_code="A1", corp_name="정상활동회사"))
+        db.commit()
+
+    recent_date = (datetime.now() - timedelta(days=30)).strftime("%Y%m%d")
+    recent_rcept = f"{recent_date}000001"
+    page = {
+        "status": "000",
+        "total_page": 1,
+        "list": [{"corp_code": "A1", "corp_name": "정상활동회사", "rcept_no": recent_rcept}],
+    }
+    fake_client = FakeDartClient(disclosure_pages_by_corp={"A1": [page]})
+
+    await pipeline._backfill_latest_rcept_no_for_job(fake_client, db_session_factory, job_id, 4)
+
+    with db_session_factory() as db:
+        result = db.execute(select(Result).where(Result.job_id == job_id)).scalar_one()
+    assert result.rcept_no == recent_rcept
+    assert result.latest_disclosure_date == recent_date
+    assert result.excluded_by_stale_disclosure == 0
+
+
+@pytest.mark.asyncio
+async def test_run_job_phase2_skips_history_collection_for_stale_disclosure(
+    monkeypatch, db_session_factory, patch_pipeline_env
+):
+    """STEP7(다년치 이력 수집)은 excluded_by_stale_disclosure=1인 회사를 건너뛰어
+    쿼터를 아껴야 한다 — 다만 B3(STEP4/5)는 이 판정과 무관하게 항상 최신 1건은
+    내려받아 파싱하므로 결과 행 자체(당기 재무정보)는 그대로 남아야 한다."""
+    monkeypatch.setattr(pipeline, "parse_xml_financials", _fake_parse_xml_financials)
+
+    job_id = _make_job(
+        db_session_factory,
+        cond_revenue={"min_krw": 1_000, "max_krw": 10_000},
+        history_years=2,
+    )
+    with db_session_factory() as db:
+        db.add(Result(job_id=job_id, corp_code="A1", corp_name="오래된회사"))
+        db.commit()
+
+    old_date = (datetime.now() - timedelta(days=500)).strftime("%Y%m%d")
+    old_rcept = f"{old_date}000001"
+    disclosure_page = {
+        "status": "000",
+        "total_page": 1,
+        "list": [{"corp_code": "A1", "corp_name": "오래된회사", "rcept_no": old_rcept}],
+    }
+    doc_zip = _history_doc_zip(
+        "20251231", revenue_cur=5_000, revenue_prv=4_000, file_name=f"{old_rcept}.xml"
+    )
+    fake_client = FakeDartClient(
+        disclosure_pages_by_corp={"A1": [disclosure_page]},
+        documents={old_rcept: doc_zip},
+    )
+    monkeypatch.setattr(pipeline, "DartClient", lambda **kwargs: fake_client)
+
+    await pipeline.run_job_phase2(job_id)
+
+    job = _get_job(db_session_factory, job_id)
+    assert job.status == JobStatus.DONE
+
+    with db_session_factory() as db:
+        result = db.execute(select(Result).where(Result.job_id == job_id)).scalar_one()
+        snapshots = db.execute(
+            select(FinancialSnapshot).where(FinancialSnapshot.result_id == result.id)
+        ).scalars().all()
+
+    assert result.excluded_by_stale_disclosure == 1
+    assert result.rcept_no == old_rcept
+    assert result.revenue_cur == 5_000  # B3(STEP4/5)는 정상 수행된다
+    assert result.excluded_by_revenue == 0
+    assert snapshots == []  # STEP7은 이 회사를 건너뛴다(쿼터 절약)
+    # STEP7이 다년치 조회를 위해 corp_code를 다시 list.json으로 조회하지 않았어야 한다
+    # (B2에서 이미 1회 호출한 것 외에 추가 호출이 없어야 함).
+    assert [
+        call for call in fake_client.disclosure_list_calls if call.get("corp_code") == "A1"
+    ] == [
+        {
+            "corp_code": "A1",
+            "bgn_de": fake_client.disclosure_list_calls[0]["bgn_de"],
+            "end_de": fake_client.disclosure_list_calls[0]["end_de"],
+            "pblntf_ty": "F",
+            "page_no": 1,
+            "page_count": pipeline._DISCLOSURE_PAGE_COUNT,
+        }
+    ]

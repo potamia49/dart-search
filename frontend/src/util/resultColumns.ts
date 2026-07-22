@@ -144,6 +144,16 @@ export const STATUS_COLUMNS: ResultColumn[] = [
       return row.parse_status ?? '-'
     },
   },
+  // 최신 DART 공시 접수일자 — "휴면·폐업 추정" 판정의 근거값(2026-07-22).
+  // YYYYMMDD를 YYYY-MM-DD로 보기 좋게 바꿔 표시한다.
+  {
+    key: 'latest_disclosure_date',
+    label: '최근 공시일자',
+    format: (value) => {
+      if (!value || typeof value !== 'string' || value.length !== 8) return '-'
+      return `${value.slice(0, 4)}-${value.slice(4, 6)}-${value.slice(6, 8)}`
+    },
+  },
 ]
 
 export const ALL_COLUMNS: ResultColumn[] = [

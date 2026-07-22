@@ -85,6 +85,9 @@ RESULT_COLUMN_LABELS: dict[str, str] = {
     "parse_note": "파싱비고",
     "excluded_by_revenue": "매출액조건제외여부",
     "excluded_by_assets": "총자산조건제외여부",  # §4-7-2, 2026-07-15 추가
+    # "최근 1년 이내 DART 공시 없음" 배제 (2026-07-21 추가)
+    "latest_disclosure_date": "최근공시일자",
+    "excluded_by_stale_disclosure": "공시없음(1년초과)제외여부",
 }
 
 # DataFrame 컬럼 순서(=RESULT_COLUMN_LABELS 순서, Result 모델 필드 순서와 동일).

@@ -616,6 +616,134 @@ def test_parse_xml_financials_hangul_pseudo_tags_do_not_collapse_table():
     )
 
 
+def test_parse_xml_financials_ifrs_attached_statements_p_caption():
+    """IFRS "(첨부)재무제표" 첨부문서 구조(롯데미쓰이화학 rcept 20250324000776,
+    2026-07-22 사용자 실측 지적). 본문에 "재무상태표"/"손익계산서"/"현금흐름표"
+    TITLE이 아예 없고, "(첨부)재 무 제 표" TITLE 아래에 각 재무제표 제목이 독립
+    <P>("재 무 상 태 표" 등)로, 실제 데이터 표는 ACLASS="FINANCE"가 아니라
+    ACLASS="NORMAL" + "과목|주석|당기|전기" 처럼 값 사이에 "주석" 열이 낀 구조로
+    들어 있어 기존 파서가 통째로 놓쳐 PARTIAL(전 항목 None)로 떨어지던 케이스다.
+
+    첨부문서 경로가 이 구조를 인식해 표준 13항목 + 현금흐름표 4항목을 모두
+    복구해야 한다. 이 회사는 흑자라 부호가 명확하며(매출총이익==매출액-매출원가,
+    매출원가 양수) 부호 규칙 논쟁과 무관하게 섹션 탐지 자체를 잠근다.
+    """
+    parsed = parse_xml_financials(_read_fixture("20250324000776"))
+    assert parsed.parse_status == "OK"
+    # 재무상태표 (독립 <P> 제목 + NORMAL 표 + 주석 열).
+    assert parsed.values_cur["current_assets"] == 6_492_841_537
+    assert parsed.values_cur["noncurrent_assets"] == 3_926_457_439
+    assert parsed.values_cur["total_assets"] == 10_419_298_976
+    assert parsed.values_cur["total_liab"] == 2_835_310_015
+    assert parsed.values_cur["total_equity"] == 7_583_988_961
+    # 포괄손익계산서 (제목 "포 괄 손 익 계 산 서" → is 섹션).
+    assert parsed.values_cur["revenue"] == 10_230_248_259
+    assert parsed.values_cur["cogs"] == 9_215_215_205
+    assert parsed.values_cur["gross_profit"] == 1_015_033_054
+    assert parsed.values_cur["operating_income"] == 393_563_767
+    assert parsed.values_cur["net_income"] == 475_819_967
+    # 현금흐름표 4항목(best-effort)도 복구.
+    assert parsed.values_cur["cf_operating"] == 595_518_049
+    assert parsed.values_cur["cf_ending_cash"] == 1_082_343_569
+    # 전기 값도 같은 표에서 함께 파싱된다.
+    assert parsed.values_prv["total_assets"] == 16_256_978_702
+    assert parsed.values_prv["revenue"] == 12_043_789_612
+    # 회계 항등식으로 교차 검증(부호 클린).
+    assert parsed.values_cur["total_assets"] == (
+        parsed.values_cur["total_liab"] + parsed.values_cur["total_equity"]
+    )
+    assert parsed.values_cur["gross_profit"] == (
+        parsed.values_cur["revenue"] - parsed.values_cur["cogs"]
+    )
+
+
+def test_parse_xml_financials_ifrs_attached_statements_table_caption():
+    """IFRS "(첨부)재무제표" 변형(하이에어코리아 rcept 20240329000968, 2026-07-22).
+    롯데미쓰이와 달리 각 재무제표 제목이 독립 <P>가 아니라 **THEAD 없는 캡션
+    <TABLE>의 첫 셀**("재 무 상 태 표")로 들어 있고, 현금흐름표 데이터 표는
+    THEAD가 아예 없어 헤더 행이 첫 TBODY 행에 있다. 캡션-표 제목 감지 + THEAD가
+    없을 때 첫 본문 행을 헤더로 삼는 열 계획을 모두 잠근다. 이 회사도 흑자다.
+    """
+    parsed = parse_xml_financials(_read_fixture("20240329000968"))
+    assert parsed.parse_status == "OK"
+    assert parsed.values_cur["total_assets"] == 433_843_751_101
+    assert parsed.values_cur["total_liab"] == 115_262_286_587
+    assert parsed.values_cur["total_equity"] == 318_581_464_514
+    assert parsed.values_cur["revenue"] == 288_611_837_322
+    assert parsed.values_cur["gross_profit"] == 38_632_641_869
+    assert parsed.values_cur["operating_income"] == 15_229_753_225
+    assert parsed.values_cur["net_income"] == 14_558_758_749
+    # THEAD 없는 현금흐름표(헤더가 첫 TBODY 행)도 복구.
+    assert parsed.values_cur["cf_operating"] == 46_262_163_859
+    assert parsed.values_cur["cf_investing"] == -7_712_818_843
+    assert parsed.values_cur["cf_ending_cash"] == 74_319_777_536
+    assert parsed.values_cur["total_assets"] == (
+        parsed.values_cur["total_liab"] + parsed.values_cur["total_equity"]
+    )
+    assert parsed.values_cur["gross_profit"] == (
+        parsed.values_cur["revenue"] - parsed.values_cur["cogs"]
+    )
+
+
+def test_parse_xml_financials_ifrs_attached_pure_loss_natural_sign():
+    """IFRS "(첨부)재무제표" 적자 문서 부호 회귀(ⓑ, rcept 20230322000842,
+    2026-07-22 dart-qa 실증). IFRS 첨부 서식은 손실을 자연 부호(괄호=음수)로
+    표기해 값에 이미 경제적 부호가 들어 있다 — 여기에 FINANCE 서식 전용
+    `_apply_sign`(순수손실 라벨을 반전)을 재사용하면 "Ⅳ.영업손실 (15,641,046,221)"
+    (실제 적자 -15.6억)이 +15.6억(흑자)로 뒤집혔다. 첨부 전용 `_apply_sign_ifrs`가
+    원문 부호를 그대로 신뢰해 세 손익 소계가 모두 음수로 저장돼야 한다.
+
+    이 회사는 매출액 248B < 매출원가 252B라 매출총손익부터 명백한 적자다
+    (회계 항등식 gross_profit == revenue - cogs로 부호를 교차 검증).
+    """
+    parsed = parse_xml_financials(_read_fixture("20230322000842"))
+    assert parsed.parse_status == "OK"
+    # 순수손실 라벨 3종이 전부 음수(적자)로 저장돼야 한다.
+    assert parsed.values_cur["gross_profit"] == -3_973_615_525
+    assert parsed.values_cur["operating_income"] == -15_641_046_221
+    assert parsed.values_cur["net_income"] == -31_896_630_865
+    # 전기도 적자(음수) 유지.
+    assert parsed.values_prv["operating_income"] == -22_417_251_485
+    assert parsed.values_prv["net_income"] == -37_217_983_420
+    # 비용 항목은 양수 크기(FINANCE 경로 관행과 일치).
+    assert parsed.values_cur["revenue"] == 248_274_370_286
+    assert parsed.values_cur["cogs"] == 252_247_985_811
+    assert parsed.values_cur["sga"] == 11_667_430_696
+    # 회계 항등식으로 부호를 자체 검증.
+    assert parsed.values_cur["gross_profit"] == (
+        parsed.values_cur["revenue"] - parsed.values_cur["cogs"]
+    )
+    assert parsed.values_cur["total_assets"] == (
+        parsed.values_cur["total_liab"] + parsed.values_cur["total_equity"]
+    )
+
+
+def test_parse_xml_financials_ifrs_attached_contra_cogs_abs_normalized():
+    """IFRS "(첨부)재무제표" contra 매출원가 부호 회귀(ⓐ, rcept 20230321000531,
+    2026-07-22 dart-qa). 흑자 문서인데 포괄손익계산서가 매출원가를
+    "Ⅱ.매출원가 (975,711,813,052)"처럼 괄호(contra)로 표기해 `parse_won_amount`가
+    음수로 읽었다 — 비용은 정의상 음수가 될 수 없으므로 `_apply_sign_ifrs`가 abs로
+    정규화해 FINANCE 경로의 양수 관행과 일치시켜야 한다.
+    """
+    parsed = parse_xml_financials(_read_fixture("20230321000531"))
+    assert parsed.parse_status == "OK"
+    # 괄호 표기 매출원가가 양수 크기로 정규화돼야 한다(음수 아님).
+    assert parsed.values_cur["cogs"] == 975_711_813_052
+    assert parsed.values_cur["sga"] == 7_331_407_030
+    assert parsed.values_cur["revenue"] == 1_021_640_327_321
+    # 흑자 소계는 그대로 양수.
+    assert parsed.values_cur["gross_profit"] == 45_928_514_269
+    assert parsed.values_cur["operating_income"] == 38_597_107_239
+    assert parsed.values_cur["net_income"] == 15_694_757_080
+    # abs 정규화 덕분에 회계 항등식이 성립한다(정규화 전에는 rev-cogs가 2배로 어긋났다).
+    assert parsed.values_cur["gross_profit"] == (
+        parsed.values_cur["revenue"] - parsed.values_cur["cogs"]
+    )
+    assert parsed.values_cur["total_assets"] == (
+        parsed.values_cur["total_liab"] + parsed.values_cur["total_equity"]
+    )
+
+
 def test_parse_xml_financials_invalid_xml_returns_failed():
     parsed = parse_xml_financials(b"not xml at all &&&")
     assert parsed.parse_status == "FAILED"

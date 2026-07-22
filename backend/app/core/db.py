@@ -87,6 +87,9 @@ _RESULTS_NEW_COLUMNS: dict[str, str] = {
     # ALTER된 DB에 물리적으로 남아있을 수 있으나 더 이상 쓰지 않는다.
     "gross_profit_cur": "INTEGER",
     "gross_profit_prv": "INTEGER",
+    # "최근 1년 이내 DART 공시 없음" 배제 (2026-07-21, app/models/result.py 주석 참고).
+    "latest_disclosure_date": "TEXT",
+    "excluded_by_stale_disclosure": "INTEGER DEFAULT 0",
 }
 # financial_snapshots(2026-07-15 STEP7 신설)에도 §4-8 CF 4컬럼을 추가한다.
 # 이 테이블은 이미 실 데이터가 있어 create_all이 컬럼을 못 붙이므로 ALTER 필요.

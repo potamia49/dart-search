@@ -161,6 +161,10 @@ DEFAULT_HISTORY_YEARS = 4  # JobCreateRequest.history_years 기본값과 동일 
 _DISCLOSURE_PAGE_COUNT = 100  # list.json 1회 최대 100건
 _CHECKPOINT_INTERVAL = 20  # STEP 3/4에서 N건마다 진행률 커밋 + 취소 여부 확인
 
+# "최근 1년 이내 DART 공시 없음" 배제 (2026-07-21 추가, 실사례 "주식회사 유진") —
+# app/models/result.py의 latest_disclosure_date/excluded_by_stale_disclosure 주석 참고.
+_STALE_DISCLOSURE_DAYS = 365
+
 _UNSET = object()  # _checkpoint()의 error_msg=None(명시적 초기화)과 미지정을 구분하기 위한 sentinel
 
 
@@ -1037,6 +1041,33 @@ async def _fetch_all_disclosures_for_corp(
     return items
 
 
+def _disclosure_date_from_rcept_no(rcept_no: str | None) -> str | None:
+    """rcept_no(접수번호)에서 접수일자(YYYYMMDD)를 뽑는다.
+
+    DART 접수번호는 14자리이며 앞 8자리가 접수일자다 — 이 코드베이스는 이미
+    여러 곳(STEP 7 newest-first 정렬 등)에서 "rcept_no 내림차순 = 접수일자
+    내림차순"을 전제로 쓰고 있어 같은 전제를 재사용한다. 형식이 예상과
+    다르면(방어적) None을 돌려준다.
+    """
+    if rcept_no and len(rcept_no) >= 8 and rcept_no[:8].isdigit():
+        return rcept_no[:8]
+    return None
+
+
+def _is_disclosure_stale(latest_disclosure_date: str | None) -> bool:
+    """최신 공시 접수일자가 `_STALE_DISCLOSURE_DAYS`(기본 365일)보다 오래됐으면 True.
+
+    `latest_disclosure_date`가 None이면(= 공시를 아예 못 찾았거나 rcept_no
+    형식을 못 읽었으면) "최근 1년 이내 공시 없음"으로 간주해 True를 반환한다 —
+    다년치 조회창(`_history_window`, end_de=오늘) 안에서도 공시가 하나도
+    없었다면 그보다 좁은 최근 1년 안에도 당연히 없기 때문이다.
+    """
+    if latest_disclosure_date is None:
+        return True
+    cutoff = (datetime.now() - timedelta(days=_STALE_DISCLOSURE_DAYS)).strftime("%Y%m%d")
+    return latest_disclosure_date < cutoff
+
+
 def _upsert_financial_snapshot(
     session_factory: sessionmaker[Session],
     result_id: int,
@@ -1219,6 +1250,12 @@ async def _run_history_collection(
     최종 결과 건수에만 비례하게 한다. `excluded_by_assets`는 §4-7-2(2026-07-15
     추가) 총자산 필터 컬럼이다 — 이 조건을 쓰지 않는 기존 run_job() 흐름에서는
     모든 행이 기본값 0이라 이 조건 추가로 동작이 바뀌지 않는다.
+    `excluded_by_stale_disclosure=0`도 같은 이유로 추가한다(2026-07-21) —
+    최근 1년 이내 공시가 없는(=폐업/휴면 추정) 회사는 B2 단계에서 이미 판정이
+    끝나 있으므로, 그 회사의 다년치 이력까지 추가로 내려받는 것은 쿼터 낭비다.
+    B3(STEP4/5)는 이 판정과 무관하게 항상 최신 1건은 내려받아 파싱하므로
+    결과 행 자체가 사라지지는 않는다 — 화면에서 걸러내는 판정은 여전히
+    `excluded_by_stale_disclosure` 플래그 하나로 일관되게 이뤄진다.
 
     처리 순서는 STEP 4/5와 동일하게 조건 밴드 근접도順이다(§4-10-D).
     """
@@ -1232,6 +1269,7 @@ async def _run_history_collection(
                 Result.job_id == job_id,
                 Result.excluded_by_revenue == 0,
                 Result.excluded_by_assets == 0,
+                Result.excluded_by_stale_disclosure == 0,
                 Result.corp_code.is_not(None),
             )
             .order_by(Result.id)
@@ -1748,6 +1786,13 @@ async def _backfill_latest_rcept_no_for_job(
                 if latest_rcept_no:
                     result.corp_code = resolved_corp_code
                     result.rcept_no = latest_rcept_no
+                    # "최근 1년 이내 공시 없음" 배제(2026-07-21) — 방금 찾은 latest_rcept_no의
+                    # 접수일자를 그대로 재사용한다(추가 API 호출 0건, 위 helper 주석 참고).
+                    latest_disclosure_date = _disclosure_date_from_rcept_no(latest_rcept_no)
+                    result.latest_disclosure_date = latest_disclosure_date
+                    result.excluded_by_stale_disclosure = (
+                        1 if _is_disclosure_stale(latest_disclosure_date) else 0
+                    )
                     found += 1
                 else:
                     # 공시를 못 찾은 건은 FAILED로 명시해 검수 대상으로 노출한다.
@@ -1758,6 +1803,10 @@ async def _backfill_latest_rcept_no_for_job(
                     result.parse_note = "최근 감사보고서 공시를 찾을 수 없음(참고값만 존재)"
                     result.revenue_cur = None
                     result.total_assets_cur = None
+                    # 다년치 조회창 전체에서도 공시가 0건이었다 — 최근 1년 이내는 물론
+                    # 당연히 없다.
+                    result.latest_disclosure_date = None
+                    result.excluded_by_stale_disclosure = 1
                 db.commit()
 
         done += 1

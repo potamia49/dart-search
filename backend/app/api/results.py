@@ -67,6 +67,7 @@ SORTABLE_COLUMNS: tuple[str, ...] = (
     "cf_investing_cur", "cf_investing_prv",
     "cf_financing_cur", "cf_financing_prv",
     "cf_ending_cash_cur", "cf_ending_cash_prv",
+    "latest_disclosure_date",
 )
 
 # 키워드 검색(`q`) 대상 컬럼 — 회사명/주소/감사인으로 좁혀 찾는 용도.
@@ -78,6 +79,7 @@ def _build_results_query(
     parse_status: str | None = None,
     excluded_by_revenue: bool | None = None,
     excluded_by_assets: bool | None = None,
+    excluded_by_stale_disclosure: bool | None = None,
     has_disclosure: bool | None = None,
     q: str | None = None,
 ) -> Select:
@@ -100,6 +102,14 @@ def _build_results_query(
         stmt = stmt.where(Result.excluded_by_revenue == (1 if excluded_by_revenue else 0))
     if excluded_by_assets is not None:
         stmt = stmt.where(Result.excluded_by_assets == (1 if excluded_by_assets else 0))
+    if excluded_by_stale_disclosure is not None:
+        # 최근 1년 이내 DART 공시가 없는(=폐업/휴면 추정) 건만/제외된 건만
+        # (2026-07-21 추가). 지정하지 않으면 필터하지 않는다 — 기본 동작(기본
+        # 탭에서 이 값을 명시적으로 false로 보내 숨기는지 여부)은 프론트엔드 책임이다.
+        stmt = stmt.where(
+            Result.excluded_by_stale_disclosure
+            == (1 if excluded_by_stale_disclosure else 0)
+        )
     return stmt
 
 
@@ -183,6 +193,8 @@ class ResultResponse(BaseModel):
     excluded_by_revenue: int
     excluded_by_assets: int
     excluded_manually: int
+    latest_disclosure_date: str | None
+    excluded_by_stale_disclosure: int
 
 
 class ResultListResponse(BaseModel):
@@ -200,6 +212,7 @@ async def list_results(
     parse_status: str | None = None,
     excluded_by_revenue: bool | None = None,
     excluded_by_assets: bool | None = None,
+    excluded_by_stale_disclosure: bool | None = None,
     has_disclosure: bool | None = None,
     q: str | None = None,
     sort_by: str | None = None,
@@ -212,6 +225,9 @@ async def list_results(
     - `excluded_by_revenue`: true/false — 매출액 사후 필터로 제외된 건만/제외되지 않은 건만.
     - `excluded_by_assets`: true/false — 총자산 사후 필터로 제외된 건만/제외되지 않은 건만
       (§4-7-2, 2026-07-15 추가).
+    - `excluded_by_stale_disclosure`: true/false — 최근 1년 이내 DART 공시(외부감사관련,
+      F유형)가 없는(=폐업/휴면/합병소멸 추정) 건만/아닌 건만 (2026-07-21 추가). 값을
+      주지 않으면 필터하지 않는다(다른 excluded_by_* 와 동일한 tri-state 패턴).
     - `has_disclosure`: true/false — 감사보고서 공시를 찾은 건만/못 찾은 건만
       (`rcept_no` 유무, 2026-07-20 추가). `parse_status=FAILED`와 함께 쓰면
       "실제 파싱 실패(검수 필요)"와 "원문 자체가 없음"을 구분할 수 있다.
@@ -224,7 +240,13 @@ async def list_results(
         raise HTTPException(status_code=404, detail="Job을 찾을 수 없습니다.")
 
     stmt = _build_results_query(
-        job_id, parse_status, excluded_by_revenue, excluded_by_assets, has_disclosure, q
+        job_id,
+        parse_status,
+        excluded_by_revenue,
+        excluded_by_assets,
+        excluded_by_stale_disclosure,
+        has_disclosure,
+        q,
     )
 
     total = db.execute(select(func.count()).select_from(stmt.subquery())).scalar_one()
@@ -300,6 +322,7 @@ async def export_job_results(
     parse_status: str | None = None,
     excluded_by_revenue: bool | None = None,
     excluded_by_assets: bool | None = None,
+    excluded_by_stale_disclosure: bool | None = None,
     has_disclosure: bool | None = None,
     q: str | None = None,
     sort_by: str | None = None,
@@ -308,9 +331,10 @@ async def export_job_results(
 ) -> Response:
     """결과 파일 다운로드 (xlsx/csv, 페이징 없이 필터를 통과한 전체 결과).
 
-    `parse_status`/`excluded_by_revenue`/`excluded_by_assets`/`has_disclosure`/
-    `q`/`sort_by`/`sort_dir`는 `/results`와 동일한 의미다 — 화면에서 걸러 놓고
-    정렬한 그대로를 내려받게 된다. `format`이 xlsx/csv가 아니면 400.
+    `parse_status`/`excluded_by_revenue`/`excluded_by_assets`/
+    `excluded_by_stale_disclosure`/`has_disclosure`/`q`/`sort_by`/`sort_dir`는
+    `/results`와 동일한 의미다 — 화면에서 걸러 놓고 정렬한 그대로를 내려받게
+    된다. `format`이 xlsx/csv가 아니면 400.
     """
     if format not in _EXPORT_CONTENT_TYPES:
         raise HTTPException(
@@ -323,7 +347,13 @@ async def export_job_results(
         raise HTTPException(status_code=404, detail="Job을 찾을 수 없습니다.")
 
     stmt = _build_results_query(
-        job_id, parse_status, excluded_by_revenue, excluded_by_assets, has_disclosure, q
+        job_id,
+        parse_status,
+        excluded_by_revenue,
+        excluded_by_assets,
+        excluded_by_stale_disclosure,
+        has_disclosure,
+        q,
     )
     rows = db.execute(_apply_sort(stmt, sort_by, sort_dir)).scalars().all()
 

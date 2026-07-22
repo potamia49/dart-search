@@ -17,6 +17,10 @@ export interface ListResultsParams {
   parse_status?: ParseStatus
   excluded_by_revenue?: boolean
   excluded_by_assets?: boolean
+  /** 최근 1년 이내 DART 공시 없음(폐업/휴면 추정) 건만(true)/제외한 나머지만(false).
+   * 결과 화면은 "휴면·폐업 추정" 탭이 아닌 한 항상 false를 명시적으로 보내
+   * 기본 숨김을 적용한다(2026-07-22). */
+  excluded_by_stale_disclosure?: boolean
   /** 감사보고서 공시(rcept_no)를 찾은 건만(true)/못 찾은 건만(false).
    * parse_status='FAILED'와 함께 써서 "파싱 실패"와 "원문 없음"을 구분한다. */
   has_disclosure?: boolean

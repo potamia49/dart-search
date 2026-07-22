@@ -102,6 +102,22 @@ class Result(Base):
     # 아니라 사용자 의사 표시일 뿐이라 phase=CANDIDATES 동안은 계속 뒤집을 수
     # 있다 — 실제 제외(행 삭제)는 start-financials 호출 시점에 일괄 반영된다.
 
+    # "최근 1년 이내 DART 공시 없음" 배제 (2026-07-21 추가, 실사례 "주식회사 유진").
+    # Phase 2 B2(`_backfill_latest_rcept_no_for_job`)가 rcept_no를 찾으려고 이미
+    # 호출하는 list.json(pblntf_ty=F, 다년치 조회창) 응답을 그대로 재사용해 채우므로
+    # 추가 API 호출은 0건이다 — excluded_by_revenue/assets와 동일하게 "이미 확보한
+    # 데이터로 사후 판정"하는 패턴을 따른다. latest_disclosure_date는 그 회사의
+    # 가장 최근 외부감사관련(F) 공시 접수일자(YYYYMMDD, rcept_no 앞 8자리에서 뽑음),
+    # 공시를 아예 못 찾았으면 None이다. excluded_by_stale_disclosure는 그 날짜가
+    # 365일보다 오래됐거나(또는 애초에 공시가 없어 날짜를 못 구했으면) 1 — 폐업/휴면/
+    # 합병소멸 등으로 실질적으로 활동을 멈췄을 가능성이 높다고 보고 표시만 해 둔다.
+    # 다른 excluded_by_* 처럼 행을 지우지 않는 순수 필터 플래그이고, 기존 완료 Job의
+    # 행은 이 컬럼 추가만으로는 소급 계산되지 않아 기본값 0(제외 안 됨)으로 남는다.
+    latest_disclosure_date: Mapped[str | None] = mapped_column(String, nullable=True)
+    excluded_by_stale_disclosure: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0"
+    )
+
 
 class ParseStatus:
     OK = "OK"

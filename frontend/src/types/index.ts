@@ -141,6 +141,13 @@ export interface ResultResponse {
   excluded_by_revenue: number
   excluded_by_assets: number
   excluded_manually: number
+
+  /** 최신 DART 공시 접수일자(YYYYMMDD) — 폐업/휴면 추정 판정의 근거값. */
+  latest_disclosure_date: string | null
+  /** 1이면 최근 1년 이내 DART 공시가 없어(외부감사관련 공시 기준) 폐업/휴면으로
+   * 추정되는 건. 결과 화면 기본 탭에서는 이 값이 1인 건을 기본 숨김 처리하고,
+   * "휴면·폐업 추정" 전용 탭에서만 노출한다(2026-07-22). */
+  excluded_by_stale_disclosure: number
 }
 
 export interface ResultListResponse {
