@@ -331,7 +331,7 @@ function FinancialHistorySection({
                         />
                       </Table.Td>
                       {history.map((snap) => (
-                        <Table.Td key={snap.fiscal_year}>{item.format(snap[item.snapKey])}</Table.Td>
+                        <Table.Td key={snap.fiscal_year} ta="right">{item.format(snap[item.snapKey])}</Table.Td>
                       ))}
                     </Table.Tr>
                     {isOpen && detailLoading && !detailsReady && (
@@ -349,7 +349,7 @@ function FinancialHistorySection({
                             <Text span size="xs" c="dimmed">{child.label}</Text>
                           </Table.Td>
                           {history.map((snap) => (
-                            <Table.Td key={snap.fiscal_year}>
+                            <Table.Td key={snap.fiscal_year} ta="right">
                               <Text span size="xs" c="dimmed">
                                 {formatNumber(historyCellValue(snap, field, child.key, byRcept))}
                               </Text>
