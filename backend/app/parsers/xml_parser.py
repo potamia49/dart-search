@@ -358,14 +358,25 @@ def _extract_attach_section(
         if not label:
             continue
         field = aliases.get(normalize_account_label(label))
-        if field is None or field in values_cur:
+        # 이미 값(비-None)이 채워진 필드는 첫 매칭 우선으로 건너뛴다. 단 값이 아직
+        # None(빈 매칭으로만 기록됐거나 미기록)이면 뒤 행이 채울 수 있게 막지 않는다 —
+        # IFRS 연결 재무상태표는 "II.유동자산"(값 없는 섹션 헤더)이 "유동자산합계"
+        # (실제 값)보다 먼저 나와, 헤더가 필드를 None으로 잠그면 소계 값을 영영 못
+        # 채운다(씨이케이 20260330001497). FINANCE 경로(_extract_section)는 무변경.
+        if field is None or values_cur.get(field) is not None:
             continue
         cur_texts = [_text_of(cells[c]) for c in cur_cols if c < len(cells)]
         prv_texts = [_text_of(cells[c]) for c in prv_cols if c < len(cells)]
         # IFRS 첨부 서식은 자연 부호 규약이라 FINANCE식 _apply_sign이 아니라
         # 첨부 전용 _apply_sign_ifrs를 쓴다(위 함수 독스트링 참고).
-        values_cur[field] = _apply_sign_ifrs(field, _first_amount(cur_texts))
-        values_prv[field] = _apply_sign_ifrs(field, _first_amount(prv_texts))
+        cur_val = _apply_sign_ifrs(field, _first_amount(cur_texts))
+        prv_val = _apply_sign_ifrs(field, _first_amount(prv_texts))
+        # 당기·전기가 모두 빈 값이면 기록하지 않는다(필드를 None으로 잠그지 않고
+        # 뒤따르는 소계 행이 채울 여지를 남긴다). 한쪽이라도 값이 있으면 기록한다.
+        if cur_val is None and prv_val is None:
+            continue
+        values_cur[field] = cur_val
+        values_prv[field] = prv_val
 
 
 def parse_xml_financials(raw_xml: bytes) -> ParsedFinancials:

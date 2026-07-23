@@ -905,6 +905,121 @@ def test_normalize_account_label_strips_eps_suffix_only_when_per_share():
     assert normalize_account_label("영업이익(손실)") == "영업이익(손실)"
 
 
+def test_parse_xml_financials_net_income_summary_label_recovers():
+    """진양에너지유틸리티(rcept 20260317000433) — 손익계산서 최종 순손익 요약 행을
+    "Ⅶ. 당기순손익"으로 적어(정규화 "당기순손익") 기존 net_income alias와 불일치,
+    net_income이 통째로 누락되던 케이스(2026-07-23 dart-parser 실측, PARTIAL). "당기순손익"
+    alias 추가로 복구. 이익/손실 부분문자열이 없어 _apply_sign이 원문 부호(괄호=음수)를
+    그대로 신뢰하므로 적자 값이 음수로 보존된다.
+    """
+    parsed = parse_xml_financials(_read_fixture("20260317000433"))
+    assert parsed.parse_status == "OK"
+    assert parsed.parse_note is None
+    assert parsed.values_cur["net_income"] == -1_129_681_376
+    assert parsed.values_prv["net_income"] == -1_836_759_384
+    assert parsed.values_cur["gross_profit"] == (
+        parsed.values_cur["revenue"] - parsed.values_cur["cogs"]
+    )
+    assert parsed.values_cur["total_assets"] == (
+        parsed.values_cur["total_liab"] + parsed.values_cur["total_equity"]
+    )
+    assert normalize_account_label("Ⅶ. 당기순손익") == "당기순손익"
+    assert ACCOUNT_NAME_ALIASES["당기순손익"] == "net_income"
+
+
+def test_parse_xml_financials_mid_consolidated_net_income_recovers():
+    """(주)신신사(rcept 20260407001413) — 연결 표기가 당기순이익 앞이 아니라 중간에
+    끼는 변형 "당기연결순이익(손실)"로 net_income 매칭에 실패, 누락되던 케이스
+    (2026-07-23 dart-parser 실측, PARTIAL). 이익-primary 조합형이라 원문 부호를 그대로
+    신뢰: 당기 흑자(양수)/전기 적자(괄호=음수).
+    """
+    parsed = parse_xml_financials(_read_fixture("20260407001413"))
+    assert parsed.parse_status == "OK"
+    assert parsed.parse_note is None
+    assert parsed.values_cur["net_income"] == 6_412_374_853
+    assert parsed.values_prv["net_income"] == -792_865_908
+    assert parsed.values_cur["gross_profit"] == (
+        parsed.values_cur["revenue"] - parsed.values_cur["cogs"]
+    )
+    assert ACCOUNT_NAME_ALIASES["당기연결순이익(손실)"] == "net_income"
+
+
+def test_parse_xml_financials_bare_maechul_revenue_recovers():
+    """(주)엘엑스엠엠에이(rcept 20260326000129) — IFRS "(첨부)재무제표" 서식이라
+    손익계산서 TITLE이 없고 매출 최상단 행을 "I. 매출"(정규화 "매출")로 적어 revenue가
+    누락되던 케이스(2026-07-23 dart-parser 실측, PARTIAL). bare "매출" alias 추가로 복구.
+    """
+    parsed = parse_xml_financials(_read_fixture("20260326000129"))
+    assert parsed.parse_status == "OK"
+    assert parsed.values_cur["revenue"] == 748_580_488_436
+    assert parsed.values_prv["revenue"] == 864_366_783_633
+    assert parsed.values_cur["gross_profit"] == (
+        parsed.values_cur["revenue"] - parsed.values_cur["cogs"]
+    )
+    assert ACCOUNT_NAME_ALIASES["매출"] == "revenue"
+
+
+def test_parse_xml_financials_ifrs_subtotal_hap_recovers():
+    """씨이케이(rcept 20260330001497) — IFRS "(첨부)연결재무제표"가 "II. 유동자산"을
+    값 없는 섹션 헤더로 두고 실제 소계를 "유동자산합계" 행에 적는다. 값 없는 헤더가
+    current_assets를 None으로 잠가 소계 값을 못 채우던 케이스(2026-07-23 dart-parser
+    실측, PARTIAL). "...합계" alias + 빈 매칭이 필드를 잠그지 않도록 수정해 복구.
+    자산총계==부채+자본은 성립하나 자산총계≠유동+비유동(매각예정자산 별도)이라
+    항등식은 자산총계로만 검증한다.
+    """
+    parsed = parse_xml_financials(_read_fixture("20260330001497"))
+    assert parsed.parse_status == "OK"
+    assert parsed.values_cur["current_assets"] == 52_141_919_553
+    assert parsed.values_cur["noncurrent_assets"] == 155_597_992_834
+    assert parsed.values_cur["current_liab"] == 70_956_519_995
+    assert parsed.values_cur["noncurrent_liab"] == 30_247_486_475
+    assert parsed.values_cur["total_assets"] == (
+        parsed.values_cur["total_liab"] + parsed.values_cur["total_equity"]
+    )
+    assert ACCOUNT_NAME_ALIASES["유동자산합계"] == "current_assets"
+
+
+def test_parse_xml_financials_ifrs_subtotal_gye_recovers():
+    """상지해운(rcept 20260325000364) — 위 씨이케이와 같은 IFRS 첨부 소계 서식이나
+    소계 라벨이 "합계"가 아니라 "계"("유동자산계" 등)인 변형(2026-07-23 dart-parser
+    실측, PARTIAL). "...계" alias 추가로 복구. 여기선 유동+비유동==자산총계도 성립한다.
+    """
+    parsed = parse_xml_financials(_read_fixture("20260325000364"))
+    assert parsed.parse_status == "OK"
+    assert parsed.values_cur["current_assets"] == 5_432_974_069
+    assert parsed.values_cur["noncurrent_assets"] == 1_891_881_005
+    assert parsed.values_cur["current_assets"] + parsed.values_cur["noncurrent_assets"] == (
+        parsed.values_cur["total_assets"]
+    )
+    assert parsed.values_cur["total_assets"] == (
+        parsed.values_cur["total_liab"] + parsed.values_cur["total_equity"]
+    )
+    assert ACCOUNT_NAME_ALIASES["유동부채계"] == "current_liab"
+
+
+def test_parse_xml_financials_eps_suffix_extra_paren_recovers():
+    """대능주택개발(rcept 20220406000855) — 당기순이익 라벨의 EPS 병기 괄호가 균형
+    안 맞게 닫는 괄호를 하나 더 붙인 실측 오타 "...(주당순이익(손실):당기 (4,407원)
+    전기 60,420원))"(끝에 여분 ")"). _EPS_SUFFIX_RE가 끝 앵커라 매치 실패해 net_income이
+    누락되던 케이스(2026-07-23 dart-parser 실측, PARTIAL). 정규식 끝 ``\\)+``로 여분
+    닫는 괄호를 흡수해 복구. 이익-primary라 원문 부호 신뢰(당기 적자/전기 흑자).
+    """
+    parsed = parse_xml_financials(_read_fixture("20220406000855"))
+    assert parsed.parse_status == "OK"
+    assert parsed.values_cur["net_income"] == -132_202_155
+    assert parsed.values_prv["net_income"] == 1_812_601_601
+    assert parsed.values_cur["gross_profit"] == (
+        parsed.values_cur["revenue"] - parsed.values_cur["cogs"]
+    )
+    # 여분 닫는 괄호가 있어도 EPS 접미어가 벗겨져 alias 키와 일치해야 한다.
+    assert (
+        normalize_account_label(
+            "X. 당기순이익(손실)(주석13)(주당순이익(손실):당기 (4,407원) 전기 60,420원))"
+        )
+        == "당기순이익(손실)"
+    )
+
+
 def test_parse_xml_financials_invalid_xml_returns_failed():
     parsed = parse_xml_financials(b"not xml at all &&&")
     assert parsed.parse_status == "FAILED"
