@@ -252,6 +252,23 @@ _FORMULA_SUFFIX_RE = re.compile(
     r"[\(\[][ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩIVX0-9\s+＋]+[\)\]]\s*$"
 )
 
+# 과목명 뒤에 붙는 "주당손익(EPS)" 병기 괄호 접미어 제거용 (실측: 주식회사
+# 노바스 rcept 20260407001297 손익계산서 당기순이익 라벨이
+# "X. 당기순이익(손실)(주석16)(주당손익 당기 (14,770)원  전기  (11,169)원)"처럼
+# 각주 참조 뒤에 EPS(주당손익) 값을 또 하나의 괄호로 병기했다(2026-07-23
+# 사용자 실측). 괄호 안에 "당기"/"전기"/"원" 같은 한글과 자체 중첩 괄호
+# (EPS 금액 "(14,770)")가 섞여 있어 _FOOTNOTE_SUFFIX_RE(숫자/콤마/공백+마커)와
+# _FORMULA_SUFFIX_RE(로마숫자/숫자/공백/+)가 모두 매치 실패했고, 그 결과
+# 정규화 라벨이 "...당기순이익(손실)(주석16)(주당손익...)"로 남아 alias 키
+# "당기순이익(손실)"와 불일치 → net_income이 통째로 누락(PARTIAL)됐다.
+# **괄호가 "주당"으로 시작할 때에 한해서만** 벗긴다 — "(손실)"/"(매출액)"처럼
+# 의미 있는 항목명 괄호는 절대 건드리지 않는다(과잉 제거 방지). 안쪽 EPS 금액
+# 괄호 한 겹의 중첩("(14,770)")까지 흡수하되, 반드시 문자열 끝($)에 붙은
+# 접미어만 대상으로 한다. 이 접미어는 각주 참조 "(주석16)"보다 **뒤에** 오므로
+# `normalize_account_label`에서 _FOOTNOTE_SUFFIX_RE보다 먼저 벗겨야 그다음
+# 각주 제거가 "(주석16)"에 도달할 수 있다.
+_EPS_SUFFIX_RE = re.compile(r"\(\s*주당[^()]*(?:\([^()]*\)[^()]*)*\)\s*$")
+
 # 금액 문자열에서 콤마/공백 제거용
 _AMOUNT_CLEAN_RE = re.compile(r"[,\s　]")
 
@@ -278,6 +295,11 @@ def normalize_account_label(label: str) -> str:
     text = _normalize_roman_lookalike_prefix(text)  # "l."/"Vi."/"Ι." 등을 "I."/"VI."로 치환
     for _ in range(2):  # 접두어가 이중으로 붙는 경우는 실측상 없었지만 안전하게 2회 반복
         stripped = _PREFIX_RE.sub("", text).strip()
+        if stripped == text:
+            break
+        text = stripped
+    for _ in range(2):  # "(주당손익 ... 원)" 같은 EPS 병기 접미어 제거(각주보다 뒤에 오므로 먼저)
+        stripped = _EPS_SUFFIX_RE.sub("", text).strip()
         if stripped == text:
             break
         text = stripped

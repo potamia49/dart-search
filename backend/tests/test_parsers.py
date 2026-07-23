@@ -866,6 +866,45 @@ def test_parse_xml_financials_consolidated_net_income_recovers():
     )
 
 
+def test_parse_xml_financials_eps_suffix_net_income_recovers():
+    """주식회사 노바스(rcept 20260407001297) — 손익계산서 당기순이익 라벨 셀에
+    EPS(주당손익)가 각주 뒤에 병기된 "X. 당기순이익(손실)(주석16)(주당손익 당기
+    (14,770)원  전기  (11,169)원)" 서식(2026-07-23 사용자 실측). 괄호 안에 한글
+    (당기/전기/원)과 중첩 괄호(EPS 금액)가 섞여 _FOOTNOTE_SUFFIX_RE/_FORMULA_SUFFIX_RE가
+    모두 매치 실패, 정규화 라벨이 alias 키 "당기순이익(손실)"와 불일치해 net_income이
+    통째로 누락(PARTIAL)되던 케이스. "주당"으로 시작하는 괄호에 한해 벗기는
+    _EPS_SUFFIX_RE 신설로 복구되고 OK가 돼야 한다. FINANCE 서식·이익-primary
+    조합형이라 원문 부호 그대로 신뢰: 당기 값 (855,942,067)/전기 (647,234,000)이
+    괄호=음수로 net_income에 그대로 반영된다(적자). 금액은 원문 TE 셀(라인 1602~1606).
+    """
+    parsed = parse_xml_financials(_read_fixture("20260407001297"))
+    assert parsed.parse_status == "OK"
+    assert parsed.parse_note is None
+    assert parsed.values_cur["net_income"] == -855_942_067
+    assert parsed.values_prv["net_income"] == -647_234_000
+    assert parsed.values_cur["gross_profit"] == (
+        parsed.values_cur["revenue"] - parsed.values_cur["cogs"]
+    )
+    assert parsed.values_cur["total_assets"] == (
+        parsed.values_cur["total_liab"] + parsed.values_cur["total_equity"]
+    )
+
+
+def test_normalize_account_label_strips_eps_suffix_only_when_per_share():
+    """_EPS_SUFFIX_RE는 "주당"으로 시작하는 괄호 접미어만 벗기고, "(손실)"/"(매출액)"
+    처럼 의미 있는 항목명 괄호는 절대 건드리지 않아야 한다(과잉 제거 방지)."""
+    assert (
+        normalize_account_label(
+            "X. 당기순이익(손실)(주석16)(주당손익 당기 (14,770)원  전기  (11,169)원)"
+        )
+        == "당기순이익(손실)"
+    )
+    # EPS 접미어 없이 의미 있는 괄호만 있는 라벨은 그대로 보존.
+    assert normalize_account_label("당기순이익(손실)") == "당기순이익(손실)"
+    assert normalize_account_label("수익(매출액)") == "수익(매출액)"
+    assert normalize_account_label("영업이익(손실)") == "영업이익(손실)"
+
+
 def test_parse_xml_financials_invalid_xml_returns_failed():
     parsed = parse_xml_financials(b"not xml at all &&&")
     assert parsed.parse_status == "FAILED"
