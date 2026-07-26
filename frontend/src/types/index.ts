@@ -93,6 +93,10 @@ export interface ResultResponse {
    * 서명란이 없는 원문은 이름만 채워지고 주소는 null이다. */
   auditor_name: string | null
   auditor_address: string | null
+  /** 연도별 감사인 변동 여부 (2026-07-26) — 1: 재무 이력에 서로 다른 감사인이 2곳
+   * 이상, 0: 이력의 감사인이 모두 동일, null: 판정 불가(감사인을 확보한 연도가
+   * 1개 이하 — STEP 7 미수행이거나 이 기능 도입 이전에 수집된 기존 Job). */
+  auditor_changed: number | null
 
   current_assets_cur: number | null
   current_assets_prv: number | null
@@ -274,6 +278,19 @@ export interface FinancialSnapshotResponse {
   cf_financing: number | null
   cf_ending_cash: number | null
 
+  /** 그 연도를 **당기**로 감사한 감사인 이름 (2026-07-26). 전기 열 유래 행
+   * (`from_current_period=0`)과 이 기능 도입 이전에 수집된 기존 이력은 null이다 —
+   * 화면은 null일 때 account-detail의 `auditor_name`(원문을 그 자리에서 다시 읽어
+   * 채우므로 기존 Job에서도 값이 나온다)으로 보완한다. */
+  auditor_name: string | null
+
+  /** 이 연도의 감사인이 **직전에 이름이 확보된 연도**와 다른가 (2026-07-26).
+   * true=변경 / false=동일 / null=판정 불가(이 연도 이름이 없거나 비교할 이전
+   * 연도가 없음). 목록 컬럼 `auditor_changed`와 **동일한 정규화**로 서버가
+   * 계산해 내려주는 값이다 — 화면에서 이름을 다시 비교하면 두 화면의 답이
+   * 갈리므로(dart-qa 실측 3건: 대표이사 교체를 감사인 교체로 오판) 이 값만 읽는다. */
+  auditor_changed_from_prev: boolean | null
+
   parse_status: ParseStatus | null
   parse_note: string | null
   /** 1이면 이 연도를 당기로 하는 감사보고서에서 나온 값(원문 보기 = 당기가 이 연도),
@@ -311,4 +328,9 @@ export interface AccountDetailResponse {
   notice: string | null
   /** 이 원문의 감사의견(적정/한정/부적정/의견거절, 판정 불가 시 null). */
   audit_opinion: string | null
+  /** 이 원문의 감사인 이름/사무소 주소 (2026-07-26). `results.auditor_name`(가장
+   * 최근 1건 기준)과 달리 조회한 그 연도 원문에서 매번 새로 뽑으므로 기존 Job에도
+   * 값이 있다(로컬 캐시만 읽어 쿼터 0건). 서명란이 없는 원문은 주소가 null. */
+  auditor_name: string | null
+  auditor_address: string | null
 }

@@ -14,6 +14,7 @@ import {
   Text,
   TextInput,
   Title,
+  Tooltip,
   UnstyledButton,
 } from '@mantine/core'
 import { notifications } from '@mantine/notifications'
@@ -42,6 +43,7 @@ type FilterTab =
   | 'EXCLUDED_REVENUE'
   | 'EXCLUDED_ASSETS'
   | 'STALE_DISCLOSURE'
+  | 'AUDITOR_CHANGED'
 
 const PAGE_SIZE = 50
 
@@ -61,6 +63,7 @@ function tabToParams(tab: FilterTab): {
   excluded_by_assets?: boolean
   excluded_by_stale_disclosure?: boolean
   has_disclosure?: boolean
+  auditor_changed?: boolean
 } {
   // "휴면·폐업 추정"(최근 1년 이내 DART 공시 없음) 건은 노이즈 성격이 강해
   // 전용 탭이 아닌 모든 화면(전체 탭 포함)에서 기본적으로 숨긴다 — 사용자가
@@ -85,9 +88,50 @@ function tabToParams(tab: FilterTab): {
       return { ...baseline, excluded_by_revenue: true }
     case 'EXCLUDED_ASSETS':
       return { ...baseline, excluded_by_assets: true }
+    // 연도별 감사인이 바뀐 회사만(2026-07-26). 판정 불가(NULL — 감사인을 확인한
+    // 연도가 1개 이하)인 건은 백엔드 tri-state 규칙상 이 탭에서 빠진다.
+    case 'AUDITOR_CHANGED':
+      return { ...baseline, auditor_changed: true }
     default:
       return baseline
   }
+}
+
+/** 감사인 변동 셀 (2026-07-26) — 목록의 다른 상태 컬럼(파싱상태)이 평문이라,
+ * 눈에 띄어야 하는 "변동 있음"에만 뱃지를 써서 대비시킨다. 표기 문구 자체는
+ * resultColumns의 formatRow(formatAuditorChanged)가 만든 것을 그대로 쓴다. */
+function AuditorChangedCell({ value, label }: { value: number | null; label: string }) {
+  if (value === 1) {
+    return (
+      <Tooltip
+        multiline
+        w={280}
+        label="수집한 재무 이력 안에서 서로 다른 감사인이 2곳 이상 확인됐습니다. 어느 해에 바뀌었는지는 이 행을 클릭해 상세의 '감사인' 행에서 확인하세요."
+      >
+        <Badge color="orange" variant="light" style={{ cursor: 'help' }}>
+          {label}
+        </Badge>
+      </Tooltip>
+    )
+  }
+  if (value === 0) {
+    return (
+      <Text span size="sm" c="dimmed">
+        {label}
+      </Text>
+    )
+  }
+  return (
+    <Tooltip
+      multiline
+      w={280}
+      label="감사인 이름을 확인한 연도가 1개 이하라 변동 여부를 판정할 수 없습니다(재무 이력 미수집·감사인 서명란 없음 등)."
+    >
+      <Text span size="sm" c="dimmed" style={{ cursor: 'help' }}>
+        {label}
+      </Text>
+    </Tooltip>
+  )
 }
 
 /** phase='FINANCIALS'(Phase 2 완료/진행) Job의 "확정 결과" 뷰 — M2~M4 시점과 동일한
@@ -229,6 +273,7 @@ function FinancialsResultsView({ jobId }: { jobId: number }) {
             <Tabs.Tab value="NO_DISCLOSURE">감사보고서 없음</Tabs.Tab>
             <Tabs.Tab value="EXCLUDED_REVENUE">매출액 제외 건</Tabs.Tab>
             <Tabs.Tab value="EXCLUDED_ASSETS">총자산 제외 건</Tabs.Tab>
+            <Tabs.Tab value="AUDITOR_CHANGED">감사인 변동</Tabs.Tab>
             <Tabs.Tab
               value="STALE_DISCLOSURE"
               rightSection={
@@ -276,6 +321,18 @@ function FinancialsResultsView({ jobId }: { jobId: number }) {
           DART에서 감사보고서 공시를 찾지 못한 회사입니다 — 파싱 실패가 아니라 열어볼 원문이
           없는 경우로, <b>검수 대상이 아닙니다</b>. 외부감사 대상에서 빠졌거나(과거에만 제출),
           조회 기간(재무 이력 연수) 밖에 마지막 보고서가 있는 경우가 대부분입니다.
+        </Alert>
+      )}
+
+      {tab === 'AUDITOR_CHANGED' && (
+        <Alert color="gray">
+          수집한 재무 이력 안에서 <b>감사인(회계법인·감사반)이 한 번 이상 바뀐</b> 회사입니다.
+          어느 해에 바뀌었는지는 행을 클릭해 상세의 재무 이력 표 <b>"감사인" 행</b>에서 확인할
+          수 있습니다. 감사인을 확인한 연도가 1개 이하라 <b>판정할 수 없는 건은 이 탭과
+          "변동 없음" 어느 쪽에도 포함되지 않습니다</b>. 이 기능이 추가되기 전에 수집된 작업은
+          연도별 감사인이 저장돼 있지 않아 목록에서는 전부 판정 불가(-)로 보이지만,
+          <b>상세의 "감사인" 행은 원문을 그때그때 읽어 채우므로 기존 작업에서도 연도별로
+          확인할 수 있습니다</b>.
         </Alert>
       )}
 
@@ -368,7 +425,16 @@ function FinancialsResultsView({ jobId }: { jobId: number }) {
                     onClick={() => setSelected(row)}
                   >
                     {visibleColumns.map((col) => (
-                      <Table.Td key={col.key}>{formatCell(col, row)}</Table.Td>
+                      <Table.Td key={col.key}>
+                        {col.key === 'auditor_changed' ? (
+                          <AuditorChangedCell
+                            value={row.auditor_changed}
+                            label={formatCell(col, row)}
+                          />
+                        ) : (
+                          formatCell(col, row)
+                        )}
+                      </Table.Td>
                     ))}
                   </Table.Tr>
                 ))}

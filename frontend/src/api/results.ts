@@ -24,6 +24,10 @@ export interface ListResultsParams {
   /** 감사보고서 공시(rcept_no)를 찾은 건만(true)/못 찾은 건만(false).
    * parse_status='FAILED'와 함께 써서 "파싱 실패"와 "원문 없음"을 구분한다. */
   has_disclosure?: boolean
+  /** 연도별 감사인이 바뀐 건만(true)/계속 같은 건만(false) (2026-07-26).
+   * 판정 불가(auditor_changed IS NULL)인 건은 양쪽 모두에서 빠진다 —
+   * excluded_by_* 와 동일한 tri-state 패턴이다. */
+  auditor_changed?: boolean
   /** 회사명/주소/대표자/업종/감사인명 부분일치 검색. */
   q?: string
   /** 다중 컬럼 정렬 — 콤마 구분 `field:dir` 목록(예: `corp_name:asc,induty_name:desc`).

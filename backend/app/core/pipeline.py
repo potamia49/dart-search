@@ -71,6 +71,13 @@ Job.status를 PAUSED_QUOTA로 전환하고 그 시점까지의 진행 상태를 
   그대로 호출한다. document.xml 다운로드는 STEP 4와 동일한
   `DOCUMENT_CACHE_DIR` 로컬 캐시를 공유한다(`_ensure_document_cached()`로
   STEP 4/7이 공유하도록 추출).
+- **연도별 감사인(2026-07-26)**: 각 연도의 자기 공시를 어차피 열어 파싱하므로,
+  그 자리에서 `extract_auditor()`로 감사인 이름을 함께 뽑아
+  `financial_snapshots.auditor_name`에 남긴다(**추가 API 호출 0건**). 전기 열
+  유래 행(`from_current_period=0`)에는 채우지 않는다 — 전기 재무제표를 다른
+  감사인이 감사했을 수 있어 연도-감사인 대응이 어긋나기 때문이다. 회사 1건을
+  끝낼 때마다 `_update_auditor_change_flag()`가 이를 집계해
+  `results.auditor_changed`(1/0/NULL) 캐시를 갱신한다.
 - **resume**: 회사(result_id)별로 이미 `financial_snapshots`에 쌓인 distinct
   fiscal_year 수가 `history_years` 이상이면 그 회사는 list.json 호출조차
   하지 않고 건너뛴다. STEP 2/3처럼 list.json 자체는 호출 비용이 낮아
@@ -859,6 +866,7 @@ def _upsert_financial_snapshot(
     parse_status: str,
     parse_note: str | None,
     from_current_period: bool,
+    auditor_name: str | None = None,
 ) -> None:
     """회사(result_id)-회계연도 단위로 financial_snapshots를 upsert.
 
@@ -866,6 +874,10 @@ def _upsert_financial_snapshot(
     "전기 열로 임시로 채워둔 연도(`from_current_period=0`)를 나중에 그 연도의
     자기 공시(당기)로 덮어쓴다"는 규칙을 쓰기 때문에 같은 연도가 두 번
     upsert될 수 있다(그 외의 중복 upsert는 호출부에서 걸러진다).
+
+    `auditor_name`(2026-07-26)은 **당기 upsert(`from_current_period=True`)에서만**
+    넘어온다 — 전기 열 유래 행에 그 공시의 감사인을 적으면 연도-감사인 대응이
+    어긋나기 때문이다(app/models/financial_snapshot.py 주석 참고).
     """
     with session_factory() as db:
         existing = db.execute(
@@ -884,6 +896,139 @@ def _upsert_financial_snapshot(
         existing.parse_status = parse_status
         existing.parse_note = parse_note
         existing.from_current_period = 1 if from_current_period else 0
+        existing.auditor_name = auditor_name
+        db.commit()
+
+
+# 감사인 이름 비교용 정규화 (2026-07-26). **표기 차이를 "감사인 변동"으로 오판하지
+# 않기 위한 비교 키**일 뿐이라 화면/DB에 저장하는 이름은 원문 표기 그대로 둔다
+# (파서 `app/parsers/auditor.py`는 무변경). 로컬 캐시 실측으로 확인된 두 변형을 흡수한다:
+#   ① 접미어-선행 표기 "회계법인 원지" ↔ "원지회계법인"(같은 감사인, 표본의 12%)
+#   ② 이름 줄에 서명자가 붙어 남은 표기 "청현회계법인 대표이사문창규"(스냅샷 3,685건
+#      중 31건/10종 — 글자 사이가 벌어진 "대 표 이 사"는 파서의 `_SIGNER_RE`가
+#      끊지 못해 이름에 딸려 들어온다). 접미어 뒤를 잘라 "청현회계법인"으로 맞춘다.
+_AUDITOR_NAME_SUFFIXES = ("회계법인", "감사반")
+# 접미어 뒤(또는 접미어-선행 표기의 이름 뒤)에 붙는 서명자 표기. "공인회계사"는
+# 감사반 이름의 일부라("천일공인회계사감사반") 여기에 넣지 않는다.
+_AUDITOR_SIGNER_TOKENS = ("대표이사", "대표자", "사원")
+
+
+def _cut_at_signer(text: str) -> str:
+    """서명자 표기가 시작되는 지점에서 끊는다(없으면 원문 그대로)."""
+    cut = len(text)
+    for token in _AUDITOR_SIGNER_TOKENS:
+        index = text.find(token)
+        if index >= 0:
+            cut = min(cut, index)
+    return text[:cut]
+
+
+def _auditor_key(name: str | None) -> str | None:
+    """감사인 이름을 비교용 키로 정규화한다(표기 차이만 흡수, 이름은 안 버린다).
+
+    **접미어 뒤에 남은 글자를 "서명자"로 단정해 잘라내면 안 된다**(2026-07-26
+    dart-qa 지적): 그 자리에는 서명자("대표이사○○○")뿐 아니라 **실제 법인명**
+    ("회계법인 지평"의 "지평")도 오기 때문이다. 옛 구현은 접미어가 문자열 시작이
+    아니기만 하면 뒤를 전부 버려서, 주소 잔재가 한 글자 붙은 "…4층회계법인 지평"을
+    "층회계법인"으로 뭉갰다 — 같은 감사인을 교체로 오판(실측 id 5965)할 뿐 아니라,
+    오염 접두어가 같은 서로 다른 두 법인("층회계법인 지평"/"층회계법인 상지원")이
+    같은 키가 돼 **실제 교체를 조용히 놓칠** 수도 있었다.
+
+    그래서 접미어 뒤는 **실제 서명자 토큰이 나올 때만** 자르고, 법인명이 남아
+    있으면 살린다. 접미어 앞뒤에 모두 글자가 남는 경우는 어느 쪽이 법인명인지
+    단정할 수 없으므로 **아무것도 버리지 않는다** — 단, 앞이 한 글자면 주소 잔재로
+    본다("...325(대치동, 9층)회계법인 지평"처럼 공백 없이 붙어 파서
+    `auditor.py::_clean_name`의 숫자-앞-한글자 가드를 빠져나온 경우로, 실측상
+    이 형태가 전부였다. 정상 법인명은 두 글자 이상이라 깎이지 않는다).
+    """
+    if not name:
+        return None
+    key = re.sub(r"\s+", "", name)
+    for suffix in _AUDITOR_NAME_SUFFIXES:
+        index = key.find(suffix)
+        if index < 0:
+            continue
+        head, tail = key[:index], key[index + len(suffix) :]
+        tail_name = _cut_at_signer(tail)
+        if not tail_name:
+            # 접미어가 이름 끝에 오는 표준형("삼일회계법인"/"천일공인회계사감사반")
+            # 또는 접미어 뒤가 전부 서명자 표기("청현회계법인대표이사문창규").
+            return key[: index + len(suffix)]
+        if not head or len(head) == 1:
+            # 접미어-선행 표기("회계법인원지", 앞의 주소 잔재 한 글자 포함) —
+            # 이름을 앞으로 돌려 표준형("원지회계법인")으로 맞춘다.
+            return tail_name + suffix
+        # 접미어 앞뒤 모두에 이름 같은 글자가 남는 표기: 서명자만 떼고 전부 살린다.
+        return head + suffix + tail_name
+    return key or None
+
+
+def auditor_change_flags(names: Sequence[str | None]) -> list[bool | None]:
+    """연도 오름차순 감사인 이름 목록 → 연도별 "직전 대비 감사인 변경" 여부.
+
+    각 원소는 그 연도의 이름과 **그 이전에 이름이 확보된 가장 최근 연도**의 이름을
+    `_auditor_key()`로 비교한 결과다(True=변경, False=동일). 그 연도의 이름이
+    없거나 비교할 이전 연도가 없으면 판정 불가(None)다.
+
+    프론트가 같은 정규화를 TypeScript로 다시 구현해 백엔드와 답이 갈리는 문제를
+    막기 위해(2026-07-26 dart-qa 지적: 목록의 `auditor_changed`는 "동일"인데 상세
+    표는 "변경" 뱃지가 뜨던 실측 3건) 서버가 이 판정을 내려 응답에 실어 준다 —
+    `FinancialSnapshotResponse.auditor_changed_from_prev`.
+    """
+    flags: list[bool | None] = []
+    prev_key: str | None = None
+    for name in names:
+        key = _auditor_key(name)
+        flags.append(None if key is None or prev_key is None else key != prev_key)
+        if key is not None:
+            prev_key = key
+    return flags
+
+
+def _safe_extract_auditor_name(raw_bytes: bytes) -> str | None:
+    """감사인 이름만 뽑되, 실패해도 그 연도의 재무 수치 수집을 막지 않는다.
+
+    감사인은 best-effort 부가 정보(CF·영업외손익과 같은 성격)라, 서식이 특이해
+    파서가 예외를 내더라도 그 공시의 재무 이력 전체를 버려서는 안 된다.
+    """
+    try:
+        return extract_auditor(raw_bytes).name
+    except Exception as exc:  # noqa: BLE001 - 원문 서식 편차는 회사마다 크다
+        logger.warning("STEP7 감사인 추출 실패(무시하고 계속): %s", exc)
+        return None
+
+
+def _update_auditor_change_flag(
+    session_factory: sessionmaker[Session], result_id: int
+) -> None:
+    """`financial_snapshots.auditor_name`을 집계해 `results.auditor_changed`를 갱신한다.
+
+    tri-state(app/models/result.py 주석 참고): 이름을 확보한 연도가 2개 이상이고
+    서로 다른 감사인이 섞여 있으면 1, 전부 같으면 0, 확보한 연도가 1개 이하면
+    NULL(판정 불가)이다. STEP 7이 회사 1건을 끝낼 때마다 호출되며(조기 반환한
+    resume 경로 포함) DB만 읽으므로 API 호출이 0건이다.
+    """
+    with session_factory() as db:
+        names = (
+            db.execute(
+                select(FinancialSnapshot.auditor_name).where(
+                    FinancialSnapshot.result_id == result_id,
+                    FinancialSnapshot.auditor_name.is_not(None),
+                )
+            )
+            .scalars()
+            .all()
+        )
+        keys = {key for key in (_auditor_key(name) for name in names) if key}
+        result = db.get(Result, result_id)
+        if result is None:
+            return
+        if len(keys) >= 2:
+            result.auditor_changed = 1
+        elif len(keys) == 1 and len(names) >= 2:
+            result.auditor_changed = 0
+        else:
+            result.auditor_changed = None
         db.commit()
 
 
@@ -952,10 +1097,13 @@ async def _collect_history_for_result(
 
         raw_bytes = doc_path.read_bytes()
         suffix = doc_path.suffix.lower()
+        auditor_name: str | None = None
         try:
             if suffix == ".xml":
                 parsed = parse_xml_financials(raw_bytes)
                 raw_text = raw_bytes.decode("utf-8", errors="ignore")
+                # 감사인은 XML 원문에서만 추출한다(STEP 5와 동일 — PDF 미지원).
+                auditor_name = _safe_extract_auditor_name(raw_bytes)
             elif suffix == ".pdf":
                 parsed = parse_pdf_financials(raw_bytes)
                 raw_text = ""
@@ -998,6 +1146,8 @@ async def _collect_history_for_result(
                 parsed.parse_status,
                 parsed.parse_note,
                 from_current_period=True,
+                # 이 공시의 감사인 = 이 연도(당기)를 감사한 감사인이다.
+                auditor_name=auditor_name,
             )
             collected_years.add(fiscal_year_cur)
             own_years.add(fiscal_year_cur)
@@ -1077,6 +1227,10 @@ async def _run_history_collection(
         await _collect_history_for_result(
             dart_client, session_factory, settings, result_id, corp_code, history_years
         )
+        # 이력이 갱신됐으니 "연도별 감사인 변동" 캐시도 이 회사만 다시 계산한다
+        # (2026-07-26). `_collect_history_for_result`가 resume 조건으로 조기
+        # 반환한 경우에도 호출돼, 이미 쌓인 이력만으로 판정이 채워진다.
+        _update_auditor_change_flag(session_factory, result_id)
 
         done += 1
         if done % _CHECKPOINT_INTERVAL == 0 or done == total:

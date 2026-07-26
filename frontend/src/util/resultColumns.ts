@@ -59,7 +59,22 @@ export const BASIC_COLUMNS: ResultColumn[] = [
     label: '감사인',
     formatRow: (row) => formatAuditor(row.auditor_name, row.auditor_address) ?? '-',
   },
+  // 연도별 감사인 변동 여부(2026-07-26) — 1/0/null 3상태다. 상세의 재무이력 표
+  // "감사인" 행에서 어느 해에 바뀌었는지 확인할 수 있다.
+  {
+    key: 'auditor_changed',
+    label: '감사인변동',
+    formatRow: (row) => formatAuditorChanged(row.auditor_changed),
+  },
 ]
+
+/** 감사인 변동 여부 표기 — null은 "판정 불가"(감사인을 확인한 연도가 1개 이하)다.
+ * 목록 셀은 ResultPage가 이 문구를 뱃지로 감싸 보여준다(Excel/CSV는 백엔드 몫). */
+export function formatAuditorChanged(value: number | null | undefined): string {
+  if (value === 1) return '변동'
+  if (value === 0) return '동일'
+  return '-'
+}
 
 /** "안경회계법인(경상남도 창원시)" — 주소는 앞 두 토큰(시도/시군구)만 쓴다.
  * 백엔드가 저장 시점에 시도를 표준명으로 정규화해 두므로 여기서 약칭을 펴지 않는다. */
@@ -168,12 +183,13 @@ export const ALL_COLUMNS: ResultColumn[] = [
   ...STATUS_COLUMNS,
 ]
 
-/** 기본 표시 컬럼 (실제 렌더링 순서는 ALL_COLUMNS 선언 순서를 따름: 회사명/주소/업종/감사의견/감사인/자산총계_당기/매출액_당기/영업이익_당기/parse_status). */
+/** 기본 표시 컬럼 (실제 렌더링 순서는 ALL_COLUMNS 선언 순서를 따름: 회사명/주소/업종/감사의견/감사인/감사인변동/자산총계_당기/매출액_당기/영업이익_당기/parse_status). */
 export const DEFAULT_VISIBLE_KEYS: (keyof ResultResponse)[] = [
   'corp_name',
   'address',
   'induty_name',
   'auditor_name',
+  'auditor_changed',
   'revenue_cur',
   'operating_income_cur',
   'total_assets_cur',

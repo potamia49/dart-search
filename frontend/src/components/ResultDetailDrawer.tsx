@@ -161,6 +161,23 @@ function buildHistoryChildRows(
   return Array.from(seen.values())
 }
 
+/** 그 연도를 **당기**로 감사한 감사인 이름/사무소 주소.
+ *
+ * 1순위는 STEP 7이 수집 시점에 저장해 둔 `snapshot.auditor_name`이고, 그 값이 없는
+ * 기존 수집분은 같은 원문의 account-detail 응답(원문을 그 자리에서 다시 읽으므로
+ * 기존 Job에도 값이 있다)으로 보완한다. 단 **전기 열에서 채워진 연도**
+ * (`from_current_period=0`)는 그 원문의 감사인이 "이 연도"가 아니라 다음 연도를
+ * 감사한 사람이므로 보완에 쓰지 않는다 — 알 수 없음(-)으로 둔다. */
+function auditorForYear(
+  snap: FinancialSnapshotResponse,
+  byRcept: Record<string, AccountDetailResponse>,
+): { name: string | null; address: string | null } {
+  const detail = snap.rcept_no ? byRcept[snap.rcept_no] : undefined
+  const sameYearDetail = snap.from_current_period ? detail : undefined
+  const name = snap.auditor_name ?? sameYearDetail?.auditor_name ?? null
+  return { name, address: name ? sameYearDetail?.auditor_address ?? null : null }
+}
+
 /** 해당 연도 열에 쓸 값 — 원문의 당기 결산연도와 같으면 당기값, 아니면 전기값이다
  * (한 원문이 당기·전기 2개 연도를 담고 있어 연도별로 열을 골라야 한다). */
 function historyCellValue(
@@ -250,6 +267,20 @@ function FinancialHistorySection({
 
   const colSpan = 1 + history.length
   const detailsReady = history.some((s) => s.rcept_no && byRcept[s.rcept_no])
+  // 연도별 감사인 — 표시용 이름/주소만 화면에서 만든다. **"변경" 판정은 하지 않는다**:
+  // 서버가 목록 컬럼(`results.auditor_changed`)과 같은 정규화(서명자 표기 절단 등)로
+  // 계산한 `snap.auditor_changed_from_prev`를 그대로 읽는다(2026-07-26 dart-qa 지적 —
+  // 화면이 공백 제거만 하는 자체 비교를 두면 목록은 "동일"인데 상세는 "변경"이 떴다).
+  const auditors = history.map((snap) => auditorForYear(snap, byRcept))
+  // 뱃지 Tooltip에 띄울 "직전 감사인" — 판정이 아니라 표시용 탐색이다. 서버 판정이
+  // `snapshot.auditor_name` 기준이므로 여기서도 같은 필드로 직전 non-null 연도를 찾는다.
+  const prevKnownAuditor = (idx: number): { year: string; name: string } | null => {
+    for (let i = idx - 1; i >= 0; i -= 1) {
+      const name = history[i].auditor_name
+      if (name) return { year: history[i].fiscal_year, name }
+    }
+    return null
+  }
 
   return (
     <Table.ScrollContainer minWidth={400}>
@@ -303,6 +334,57 @@ function FinancialHistorySection({
               return (
                 <Table.Td key={snap.fiscal_year}>
                   {detail ? (detail.audit_opinion ?? '-') : detailLoading ? <Loader size="xs" /> : '-'}
+                </Table.Td>
+              )
+            })}
+          </Table.Tr>
+          {/* 감사의견 바로 다음 행 — 그 해를 누가 감사했는지(2026-07-26 요청).
+              전년과 다른 감사인이면 "변경"을 붙여 목록의 "감사인변동" 컬럼이
+              가리키는 지점을 이 표에서 바로 짚을 수 있게 한다. */}
+          <Table.Tr>
+            <Table.Td fw={600}>감사인</Table.Td>
+            {history.map((snap, idx) => {
+              const { name, address } = auditors[idx]
+              // null(판정 불가)·false(동일)는 강조 없음 — true일 때만 주황 강조.
+              const changed = snap.auditor_changed_from_prev === true
+              const prev = changed ? prevKnownAuditor(idx) : null
+              if (!name) {
+                const detail = snap.rcept_no ? byRcept[snap.rcept_no] : undefined
+                return (
+                  <Table.Td key={snap.fiscal_year}>
+                    {!detail && detailLoading ? <Loader size="xs" /> : '-'}
+                  </Table.Td>
+                )
+              }
+              const nameText = (
+                <Text span size="sm" c={changed ? 'orange.8' : undefined} fw={changed ? 600 : undefined}>
+                  {name}
+                </Text>
+              )
+              return (
+                <Table.Td key={snap.fiscal_year}>
+                  <Group gap={4} wrap="nowrap">
+                    {address ? (
+                      <Tooltip multiline w={260} label={`${name} — ${address}`}>
+                        {nameText}
+                      </Tooltip>
+                    ) : (
+                      nameText
+                    )}
+                    {changed && (
+                      <Tooltip
+                        label={
+                          prev
+                            ? `직전 감사인(${prev.year}년): ${prev.name}`
+                            : '직전에 감사인이 확인된 연도와 다릅니다.'
+                        }
+                      >
+                        <Badge size="xs" color="orange" variant="light" style={{ cursor: 'help' }}>
+                          변경
+                        </Badge>
+                      </Tooltip>
+                    )}
+                  </Group>
                 </Table.Td>
               )
             })}
@@ -430,7 +512,7 @@ export default function ResultDetailDrawer({ jobId, result, onClose }: ResultDet
           <Title order={5}>재무 이력 (최근 N년)</Title>
           <Text size="xs" c="dimmed">
             가장 오른쪽 열이 최신 연도(당기)입니다. 밑줄 친 항목을 클릭하면 원문의 세부계정을
-            펼쳐 볼 수 있습니다.
+            펼쳐 볼 수 있습니다. 감사인이 직전 연도와 다른 해에는 주황색 "변경" 표시가 붙습니다.
           </Text>
           <FinancialHistorySection
             jobId={jobId}

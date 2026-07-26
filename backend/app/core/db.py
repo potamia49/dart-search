@@ -95,6 +95,10 @@ _RESULTS_NEW_COLUMNS: dict[str, str] = {
     "non_operating_income_prv": "INTEGER",
     "non_operating_expense_cur": "INTEGER",
     "non_operating_expense_prv": "INTEGER",
+    # 연도별 감사인 변동 여부 캐시 (2026-07-26, app/models/result.py 주석 참고).
+    # 기본값을 주지 않아 기존 행은 NULL(=판정 불가)로 남는다 — 0(변동 없음)으로
+    # 단정하지 않기 위함이다.
+    "auditor_changed": "INTEGER",
 }
 # financial_snapshots(2026-07-15 STEP7 신설)에도 §4-8 CF 4컬럼을 추가한다.
 # 이 테이블은 이미 실 데이터가 있어 create_all이 컬럼을 못 붙이므로 ALTER 필요.
@@ -112,6 +116,9 @@ _FINANCIAL_SNAPSHOTS_NEW_COLUMNS: dict[str, str] = {
     # 영업외수익/영업외비용 2항목 (2026-07-22) — results.non_operating_*_cur/prv와 동일한 취지.
     "non_operating_income": "INTEGER",
     "non_operating_expense": "INTEGER",
+    # 그 연도를 당기로 감사한 감사인 이름 (2026-07-26) — results.auditor_changed
+    # 판정의 원천 데이터다(app/models/financial_snapshot.py 주석 참고).
+    "auditor_name": "TEXT",
 }
 
 

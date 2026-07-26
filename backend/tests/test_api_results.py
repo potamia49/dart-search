@@ -306,6 +306,57 @@ def test_list_results_filters_by_excluded_by_stale_disclosure(client_with_db):
     assert {r["corp_name"] for r in not_stale.json()["items"]} == {"㈜성공테스트", "㈜실패테스트"}
 
 
+def test_list_results_filters_by_auditor_changed(client_with_db):
+    """연도별 감사인 변동 여부(2026-07-26)도 tri-state 필터다 — true/false/미지정.
+
+    판정 불가(NULL: 감사인 이름을 확보한 연도가 1개 이하, 이 기능 도입 이전 Job)는
+    true/false 어느 쪽에도 잡히지 않는다."""
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+
+    db = factory()
+    try:
+        db.add_all(
+            [
+                Result(
+                    job_id=job_id,
+                    corp_code="00100005",
+                    corp_name="㈜감사인교체",
+                    parse_status=ParseStatus.OK,
+                    auditor_name="나중회계법인",
+                    auditor_changed=1,
+                ),
+                Result(
+                    job_id=job_id,
+                    corp_code="00100006",
+                    corp_name="㈜감사인유지",
+                    parse_status=ParseStatus.OK,
+                    auditor_name="계속회계법인",
+                    auditor_changed=0,
+                ),
+            ]
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    # 값을 안 주면 필터하지 않는다(기존 excluded_by_* 와 동일).
+    assert client.get(f"/api/jobs/{job_id}/results").json()["total"] == 4
+
+    changed = client.get(f"/api/jobs/{job_id}/results", params={"auditor_changed": True}).json()
+    assert [r["corp_name"] for r in changed["items"]] == ["㈜감사인교체"]
+    assert changed["items"][0]["auditor_changed"] == 1
+
+    unchanged = client.get(
+        f"/api/jobs/{job_id}/results", params={"auditor_changed": False}
+    ).json()
+    assert [r["corp_name"] for r in unchanged["items"]] == ["㈜감사인유지"]
+
+    # 기존(도입 이전) 행은 NULL로 남아 판정 불가로 노출된다.
+    seeded = client.get(f"/api/jobs/{job_id}/results", params={"q": "성공"}).json()
+    assert seeded["items"][0]["auditor_changed"] is None
+
+
 def test_list_results_not_found_returns_404(client_with_db):
     client, _factory = client_with_db
     resp = client.get("/api/jobs/9999/results")
@@ -464,6 +515,83 @@ def test_get_result_history_returns_oldest_first(client_with_db):
     body = resp.json()
     assert [row["fiscal_year"] for row in body] == ["2023", "2024", "2025"]  # 오래된 -> 최신 순
     assert body[0]["revenue"] == 8_000
+
+
+def test_get_result_history_includes_per_year_auditor_name(client_with_db):
+    """연도별 감사인 이름(2026-07-26)이 이력 응답에 실린다 — 도입 이전에 수집된
+    행은 null이라 화면이 "판정 불가"로 다룰 수 있어야 한다."""
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+    result_id = _get_result_id(factory, job_id, "00100001")
+
+    db = factory()
+    try:
+        db.add_all(
+            [
+                FinancialSnapshot(
+                    result_id=result_id,
+                    rcept_no="R2",
+                    fiscal_year="2025",
+                    from_current_period=1,
+                    auditor_name="나중회계법인",
+                ),
+                FinancialSnapshot(
+                    result_id=result_id,
+                    rcept_no="R1",
+                    fiscal_year="2024",
+                    from_current_period=1,
+                    auditor_name="이전회계법인",
+                ),
+                # 전기 열 유래(자기 공시를 못 연 연도)는 감사인을 채우지 않는다.
+                FinancialSnapshot(
+                    result_id=result_id, rcept_no="R1", fiscal_year="2023", from_current_period=0
+                ),
+            ]
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    body = client.get(f"/api/jobs/{job_id}/results/{result_id}/history").json()
+    assert [row["auditor_name"] for row in body] == [None, "이전회계법인", "나중회계법인"]
+    # 이름이 없는 2023년은 판정 불가, 2024년은 비교할 이전 연도가 없어 판정 불가,
+    # 2025년만 "직전 연도 대비 변경"으로 판정된다.
+    assert [row["auditor_changed_from_prev"] for row in body] == [None, None, True]
+
+
+def test_get_result_history_auditor_change_flag_uses_backend_normalization(client_with_db):
+    """연도별 "직전 대비 변경" 판정은 **서버**가 `_auditor_key()`로 계산한다
+    (2026-07-26) — 프론트가 공백 제거만 하는 자체 비교를 두면 목록 컬럼
+    (`auditor_changed`)과 상세 뱃지의 답이 갈린다(dart-qa 실측 3건)."""
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+    result_id = _get_result_id(factory, job_id, "00100001")
+
+    db = factory()
+    try:
+        # 셋 다 같은 감사인이다: 표기 순서 차이 + 서명자(대표이사 교체) 차이뿐.
+        db.add_all(
+            [
+                FinancialSnapshot(
+                    result_id=result_id, rcept_no="R1", fiscal_year="2023",
+                    from_current_period=1, auditor_name="회계법인 원지",
+                ),
+                FinancialSnapshot(
+                    result_id=result_id, rcept_no="R2", fiscal_year="2024",
+                    from_current_period=1, auditor_name="원지회계법인",
+                ),
+                FinancialSnapshot(
+                    result_id=result_id, rcept_no="R3", fiscal_year="2025",
+                    from_current_period=1, auditor_name="원지회계법인 대표이사김철수",
+                ),
+            ]
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    body = client.get(f"/api/jobs/{job_id}/results/{result_id}/history").json()
+    assert [row["auditor_changed_from_prev"] for row in body] == [None, False, False]
 
 
 def test_get_result_history_empty_when_no_snapshots(client_with_db):
@@ -627,6 +755,22 @@ def test_account_detail_returns_children_per_summary_field(client_with_db, monke
     assert any(row["cur"] is not None for row in rows)
     # 총계 항목은 하위가 형제 대분류라 children이 비어 있다(토글 비활성 대상).
     assert body["accounts"]["total_assets"] == []
+
+
+def test_account_detail_returns_auditor_of_that_document(client_with_db, monkeypatch, tmp_path):
+    """감사의견 **다음 행**에 표시할 감사인 정보(2026-07-26)를 그 연도 원문에서
+    직접 뽑아 함께 내려준다 — 로컬 캐시만 읽으므로 추가 API 호출이 0건이고,
+    이 기능 도입 이전에 수집된 기존 Job의 원문에서도 값이 나온다.
+
+    이 fixture는 서명란이 없는 서식이라 이름만 확보되고 주소는 null이 정상이다
+    (test_auditor.py의 동일 rcept 케이스와 같은 기대값)."""
+    client, factory = client_with_db
+    job_id, result_id = _seed_result_with_rcept(factory, "20260630000641")
+    _point_cache_at_tmp(monkeypatch, tmp_path, "20260630000641", "20260630000641")
+
+    body = client.get(f"/api/jobs/{job_id}/results/{result_id}/account-detail").json()
+    assert body["auditor_name"] == "정진세림회계법인"
+    assert body["auditor_address"] is None
 
 
 def test_account_detail_rejects_foreign_rcept_no(client_with_db, monkeypatch, tmp_path):

@@ -26,11 +26,13 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.core.db import get_db
+from app.core.pipeline import auditor_change_flags
 from app.exporters.excel import export_results
 from app.models.financial_snapshot import FinancialSnapshot
 from app.models.job import Job, JobPhase
 from app.models.result import Result
 from app.parsers.account_detail import parse_account_detail
+from app.parsers.auditor import extract_auditor
 from app.parsers.document_sections import SECTION_TITLE_MARKS, extract_section_html
 
 router = APIRouter(prefix="/api/jobs", tags=["results"])
@@ -49,6 +51,7 @@ SORTABLE_COLUMNS: tuple[str, ...] = (
     "audit_opinion",
     "auditor_name",
     "auditor_address",
+    "auditor_changed",
     "parse_status",
     "current_assets_cur", "current_assets_prv",
     "noncurrent_assets_cur", "noncurrent_assets_prv",
@@ -84,6 +87,7 @@ def _build_results_query(
     excluded_by_stale_disclosure: bool | None = None,
     has_disclosure: bool | None = None,
     q: str | None = None,
+    auditor_changed: bool | None = None,
 ) -> Select:
     """`results` 조회 쿼리 빌더 — `/results`(페이징)와 `/export`(전체)가 공유한다."""
     stmt = select(Result).where(Result.job_id == job_id)
@@ -112,6 +116,12 @@ def _build_results_query(
             Result.excluded_by_stale_disclosure
             == (1 if excluded_by_stale_disclosure else 0)
         )
+    if auditor_changed is not None:
+        # 연도별 감사인이 바뀐 회사만(true) / 계속 같은 회사만(false) (2026-07-26).
+        # NULL(판정 불가 — 감사인 이름을 확보한 연도가 1개 이하)은 어느 쪽에도
+        # 속하지 않으므로 두 경우 모두에서 빠진다. 값을 주지 않으면 필터하지
+        # 않는다(excluded_by_* 와 동일한 tri-state 패턴).
+        stmt = stmt.where(Result.auditor_changed == (1 if auditor_changed else 0))
     return stmt
 
 
@@ -180,6 +190,10 @@ class ResultResponse(BaseModel):
     audit_opinion: str | None
     auditor_name: str | None
     auditor_address: str | None
+    # 연도별 감사인 변동 여부 (2026-07-26) — 1: 이력에 서로 다른 감사인 2곳 이상,
+    # 0: 이력의 감사인이 모두 동일, null: 판정 불가(감사인을 확보한 연도가 1개 이하.
+    # STEP 7 미수행이거나 이 기능 도입 이전에 수집된 기존 Job이면 항상 null이다).
+    auditor_changed: int | None
 
     current_assets_cur: int | None
     current_assets_prv: int | None
@@ -253,6 +267,7 @@ async def list_results(
     excluded_by_stale_disclosure: bool | None = None,
     has_disclosure: bool | None = None,
     q: str | None = None,
+    auditor_changed: bool | None = None,
     sort: str | None = None,
     sort_by: str | None = None,
     sort_dir: str = "asc",
@@ -271,6 +286,8 @@ async def list_results(
       (`rcept_no` 유무, 2026-07-20 추가). `parse_status=FAILED`와 함께 쓰면
       "실제 파싱 실패(검수 필요)"와 "원문 자체가 없음"을 구분할 수 있다.
     - `q`: 회사명/주소/대표자/업종/감사인명 부분일치 검색 (2026-07-20 추가).
+    - `auditor_changed`: true/false — 연도별 감사인이 바뀐 건만/바뀌지 않은 건만
+      (2026-07-26 추가). 판정 불가(null)인 건은 두 경우 모두에서 빠진다.
     - `sort`: 다중 컬럼 정렬 — 콤마 구분 `field:dir` 목록(예:
       `corp_name:asc,induty_name:desc`). 앞쪽이 1순위, 뒤쪽이 보조 정렬이다.
       화이트리스트(`SORTABLE_COLUMNS`) 밖 컬럼/형식 오류는 무시한다.
@@ -289,6 +306,7 @@ async def list_results(
         excluded_by_stale_disclosure,
         has_disclosure,
         q,
+        auditor_changed,
     )
 
     total = db.execute(select(func.count()).select_from(stmt.subquery())).scalar_one()
@@ -368,6 +386,7 @@ async def export_job_results(
     excluded_by_stale_disclosure: bool | None = None,
     has_disclosure: bool | None = None,
     q: str | None = None,
+    auditor_changed: bool | None = None,
     sort: str | None = None,
     sort_by: str | None = None,
     sort_dir: str = "asc",
@@ -376,9 +395,9 @@ async def export_job_results(
     """결과 파일 다운로드 (xlsx/csv, 페이징 없이 필터를 통과한 전체 결과).
 
     `parse_status`/`excluded_by_revenue`/`excluded_by_assets`/
-    `excluded_by_stale_disclosure`/`has_disclosure`/`q`/`sort`/`sort_by`/`sort_dir`는
-    `/results`와 동일한 의미다(다중 정렬 `sort` 포함) — 화면에서 걸러 놓고 정렬한
-    그대로를 내려받게 된다. `format`이 xlsx/csv가 아니면 400.
+    `excluded_by_stale_disclosure`/`has_disclosure`/`q`/`auditor_changed`/`sort`/
+    `sort_by`/`sort_dir`는 `/results`와 동일한 의미다(다중 정렬 `sort` 포함) —
+    화면에서 걸러 놓고 정렬한 그대로를 내려받게 된다. `format`이 xlsx/csv가 아니면 400.
     """
     if format not in _EXPORT_CONTENT_TYPES:
         raise HTTPException(
@@ -398,6 +417,7 @@ async def export_job_results(
         excluded_by_stale_disclosure,
         has_disclosure,
         q,
+        auditor_changed,
     )
     sort_specs = _resolve_sort_specs(sort, sort_by, sort_dir)
     rows = db.execute(_apply_sort(stmt, sort_specs)).scalars().all()
@@ -441,6 +461,18 @@ class FinancialSnapshotResponse(BaseModel):
     non_operating_income: int | None
     non_operating_expense: int | None
 
+    # 그 연도를 **당기**로 감사한 감사인 이름 (2026-07-26). 전기 열 유래 행
+    # (`from_current_period=0`)과 이 기능 도입 이전에 수집된 기존 이력은 null이다
+    # — 연도별 감사인/주소를 항상 보여줘야 한다면 `account-detail`이 원문을 그
+    # 자리에서 열어 돌려주는 `auditor_name`/`auditor_address`를 쓰면 된다.
+    auditor_name: str | None
+    # 이 연도의 감사인이 **직전에 이름이 확보된 연도**와 다른가 (2026-07-26).
+    # true=변경, false=동일, null=판정 불가(이 연도 이름이 없거나 비교할 이전
+    # 연도가 없음). 서버가 `results.auditor_changed`와 **동일한 정규화**
+    # (`pipeline._auditor_key()`)로 계산해 내려주는 값이다 — 화면이 자체 비교
+    # 로직을 다시 구현하면 목록 컬럼과 상세 뱃지의 답이 갈린다(dart-qa 실측 3건).
+    auditor_changed_from_prev: bool | None = None
+
     parse_status: str | None
     parse_note: str | None
     # 1이면 이 연도를 **당기**로 하는 감사보고서에서 나온 값(= rcept_no를 열면
@@ -462,6 +494,10 @@ async def get_result_history(
 
     STEP 7이 `excluded_by_revenue=0`인 결과만 대상으로 채우므로, 매출액
     필터로 제외된 결과는 이력이 비어 있을 수 있다(에러가 아니라 빈 배열).
+
+    연도별 `auditor_changed_from_prev`(2026-07-26)는 오름차순으로 배열된 이
+    목록 위에서 서버가 직접 계산한다 — 목록 컬럼(`results.auditor_changed`)과
+    같은 `_auditor_key()` 정규화를 쓰므로 두 화면의 답이 어긋나지 않는다.
     """
     job = db.get(Job, job_id)
     if job is None:
@@ -480,7 +516,13 @@ async def get_result_history(
         .scalars()
         .all()
     )
-    return [FinancialSnapshotResponse.model_validate(r) for r in rows]
+    flags = auditor_change_flags([r.auditor_name for r in rows])
+    items = []
+    for row, flag in zip(rows, flags):
+        item = FinancialSnapshotResponse.model_validate(row)
+        item.auditor_changed_from_prev = flag
+        items.append(item)
+    return items
 
 
 class DocumentSectionResponse(BaseModel):
@@ -620,6 +662,13 @@ class AccountDetailResponse(BaseModel):
     # 이 원문의 감사의견(적정/한정/부적정/의견거절, 판정 불가 시 None) — 재무이력
     # 표가 연도(=원문)마다 다른 감사의견을 재무상태표 위 안내 행에 보여주는 데 쓴다.
     audit_opinion: str | None = None
+    # 이 원문의 감사인 이름과 사무소 주소 (2026-07-26 추가) — 화면이 감사의견
+    # **바로 다음 행**에 "누가 감사했는지"를 연도별로 보여주기 위한 값이다.
+    # `results.auditor_name`(가장 최근 1건 기준)과 달리 조회한 그 연도 원문에서
+    # 매번 새로 뽑으므로, 이 기능 도입 이전에 수집된 기존 Job에서도 값이 나온다
+    # (로컬 문서 캐시만 읽어 추가 API 호출 0건). 서명란이 없는 원문은 null.
+    auditor_name: str | None = None
+    auditor_address: str | None = None
 
 
 @router.get(
@@ -657,7 +706,11 @@ async def get_account_detail(
             detail="원문 캐시가 없습니다 — 재수집이 필요합니다.",
         )
 
-    detail = parse_account_detail(xml_path.read_bytes())
+    raw_bytes = xml_path.read_bytes()
+    detail = parse_account_detail(raw_bytes)
+    # 감사인은 같은 원문을 한 번 더 훑어 뽑는다(추가 API 호출 없음) — 연도별
+    # 상세에서 감사의견 다음 행에 "누가 감사했는지"를 함께 보여주기 위함이다.
+    auditor = extract_auditor(raw_bytes)
     return AccountDetailResponse(
         rcept_no=target_rcept_no,
         fiscal_year_cur=detail.fiscal_year_cur,
@@ -669,4 +722,6 @@ async def get_account_detail(
             for field, rows in detail.accounts.items()
         },
         audit_opinion=detail.audit_opinion,
+        auditor_name=auditor.name,
+        auditor_address=auditor.address,
     )

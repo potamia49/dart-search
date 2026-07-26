@@ -114,16 +114,23 @@ def _make_zip(file_name: str, content: bytes = b"<xml>dummy</xml>") -> bytes:
     return buf.getvalue()
 
 
-def _history_doc_zip(period_to: str, revenue_cur: int, revenue_prv: int, file_name: str = "doc.xml") -> bytes:
+def _history_doc_zip(
+    period_to: str,
+    revenue_cur: int,
+    revenue_prv: int,
+    file_name: str = "doc.xml",
+    auditor_name: str | None = None,
+) -> bytes:
     """STEP 7 테스트용 가짜 원문. `_extract_fiscal_date`가 읽는 PERIODTO 속성은
     실제 정규식과 맞게 넣어두고(진짜 파서를 태우지 않고 그대로 사용), 재무
     수치는 REV_CUR/REV_PRV 마커로 심어 `_fake_parse_xml_financials`가 그대로
     읽게 한다(xml_parser 자체 로직은 test_parsers.py에서 이미 검증했으므로
     여기서는 STEP 7 오케스트레이션만 확인한다)."""
+    signature = f"<P>{auditor_name}</P>" if auditor_name else ""
     content = (
         f'<ROOT><P AUNIT="PERIODFROM" AUNITVALUE="20200101"/>'
         f'<P AUNIT="PERIODTO" AUNITVALUE="{period_to}"/>'
-        f"REV_CUR={revenue_cur};REV_PRV={revenue_prv}</ROOT>"
+        f"REV_CUR={revenue_cur};REV_PRV={revenue_prv}{signature}</ROOT>"
     ).encode("utf-8")
     return _make_zip(file_name, content)
 
@@ -709,6 +716,149 @@ async def test_collect_history_marks_oldest_year_as_previous_period_when_own_rep
     # 2023년을 당기로 하는 공시는 없다 -> r2의 전기 값이 그대로 남는다.
     assert snapshots["2023"].from_current_period == 0
     assert (snapshots["2023"].revenue, snapshots["2023"].rcept_no) == (3_000, r2)
+
+
+@pytest.mark.asyncio
+async def test_collect_history_records_auditor_per_year_and_flags_change(
+    db_session_factory, tmp_path, monkeypatch
+):
+    """연도별 감사인 이름(2026-07-26)은 그 연도를 **당기**로 하는 공시에서만 채우고,
+    전기 열 유래 행은 NULL로 남긴다(전기 재무제표를 다른 감사인이 감사했을 수 있다).
+    서로 다른 감사인이 확인되면 `results.auditor_changed=1`이 된다."""
+    monkeypatch.setattr(pipeline, "parse_xml_financials", _fake_parse_xml_financials)
+    settings = Settings(document_cache_dir=str(tmp_path / "documents"))
+    job_id = _make_job(db_session_factory)
+    result_id = _seed_result(db_session_factory, job_id=job_id, corp_code="H5")
+
+    r1, r2 = "20260601000001", "20250601000002"
+    disclosure_page = {
+        "status": "000",
+        "total_page": 1,
+        "list": [
+            {"corp_code": "H5", "corp_name": "감사인교체회사", "rcept_no": r1},
+            {"corp_code": "H5", "corp_name": "감사인교체회사", "rcept_no": r2},
+        ],
+    }
+    documents = {
+        r1: _history_doc_zip(
+            "20251231", revenue_cur=5_000, revenue_prv=4_000, file_name=f"{r1}.xml",
+            auditor_name="나중회계법인",
+        ),
+        r2: _history_doc_zip(
+            "20241231", revenue_cur=4_000, revenue_prv=3_000, file_name=f"{r2}.xml",
+            auditor_name="이전회계법인",
+        ),
+    }
+    client = FakeDartClient(disclosure_pages_by_corp={"H5": [disclosure_page]}, documents=documents)
+
+    await pipeline._collect_history_for_result(client, db_session_factory, settings, result_id, "H5", 3)
+    pipeline._update_auditor_change_flag(db_session_factory, result_id)
+
+    with db_session_factory() as db:
+        snapshots = {
+            s.fiscal_year: s
+            for s in db.execute(
+                select(FinancialSnapshot).where(FinancialSnapshot.result_id == result_id)
+            ).scalars().all()
+        }
+        result = db.get(Result, result_id)
+    assert snapshots["2025"].auditor_name == "나중회계법인"
+    assert snapshots["2024"].auditor_name == "이전회계법인"
+    # 2023년은 r2의 전기 열 유래라 감사인을 채우지 않는다.
+    assert snapshots["2023"].from_current_period == 0
+    assert snapshots["2023"].auditor_name is None
+    assert result.auditor_changed == 1
+
+
+def _seed_snapshot_auditors(session_factory, result_id: int, names: list[str | None]) -> None:
+    with session_factory() as db:
+        for offset, name in enumerate(names):
+            db.add(
+                FinancialSnapshot(
+                    result_id=result_id,
+                    fiscal_year=str(2025 - offset),
+                    rcept_no=f"R{offset}",
+                    from_current_period=1 if name else 0,
+                    auditor_name=name,
+                )
+            )
+        db.commit()
+
+
+def test_update_auditor_change_flag_ignores_name_order_variants(db_session_factory):
+    """"회계법인 원지"와 "원지회계법인"은 같은 감사인이다 — 원문 표기 순서 차이를
+    감사인 교체로 오판하면 안 된다(app/parsers/auditor.py 실측 서식 12%)."""
+    job_id = _make_job(db_session_factory)
+    result_id = _seed_result(db_session_factory, job_id=job_id, corp_code="H6")
+    _seed_snapshot_auditors(db_session_factory, result_id, ["회계법인 원지", "원지회계법인"])
+
+    pipeline._update_auditor_change_flag(db_session_factory, result_id)
+
+    with db_session_factory() as db:
+        assert db.get(Result, result_id).auditor_changed == 0
+
+
+def test_update_auditor_change_flag_ignores_trailing_signer_name(db_session_factory):
+    """이름 줄에 서명자가 딸려 들어온 표기("청현회계법인 대표이사문창규")도 같은
+    감사인으로 본다 — 로컬 캐시 실측 3,685건 중 31건(10종)이 이 형태였다."""
+    job_id = _make_job(db_session_factory)
+    result_id = _seed_result(db_session_factory, job_id=job_id, corp_code="H8")
+    _seed_snapshot_auditors(
+        db_session_factory, result_id, ["청현회계법인", "청현회계법인 대표이사문창규"]
+    )
+
+    pipeline._update_auditor_change_flag(db_session_factory, result_id)
+
+    with db_session_factory() as db:
+        assert db.get(Result, result_id).auditor_changed == 0
+    # 감사반 이름의 "공인회계사"는 서명자 표기가 아니므로 잘라내면 안 된다.
+    assert pipeline._auditor_key("천일공인회계사감사반") == "천일공인회계사감사반"
+
+
+def test_auditor_key_keeps_firm_name_after_suffix(db_session_factory):
+    """접미어 뒤에 **법인명**이 오는 표기는 그 이름을 버리면 안 된다(2026-07-26).
+
+    주소 잔재 한 글자가 앞에 붙은 "…4층회계법인 지평"(실측 id 5965)은 옛 구현이
+    "층회계법인"으로 뭉개 ① 같은 감사인을 교체로 오판하고 ② 오염 접두어가 같은
+    서로 다른 두 법인을 같은 키로 만들어 실제 교체를 놓칠 수 있었다.
+    """
+    # ① 오탐: 같은 감사인이므로 키가 같아야 한다.
+    assert pipeline._auditor_key("층회계법인 지평") == pipeline._auditor_key("회계법인 지평")
+    assert pipeline._auditor_key("층회계법인 지평") == "지평회계법인"
+    # ② 미탐: 오염 접두어가 같아도 다른 법인이면 키가 달라야 한다.
+    assert pipeline._auditor_key("층회계법인 지평") != pipeline._auditor_key("층회계법인 상지원")
+    # 접미어 뒤가 실제 서명자일 때만 잘라낸다.
+    assert pipeline._auditor_key("청현회계법인 대표이사문창규") == "청현회계법인"
+
+    job_id = _make_job(db_session_factory)
+    result_id = _seed_result(db_session_factory, job_id=job_id, corp_code="H9")
+    _seed_snapshot_auditors(db_session_factory, result_id, ["층회계법인 지평", "회계법인 지평"])
+
+    pipeline._update_auditor_change_flag(db_session_factory, result_id)
+
+    with db_session_factory() as db:
+        assert db.get(Result, result_id).auditor_changed == 0
+
+
+def test_auditor_change_flags_marks_only_years_that_differ_from_previous():
+    """연도별 "직전 대비 변경" 플래그(2026-07-26)는 이름이 확보된 **가장 최근**
+    연도와 비교하고, 이름이 없는 연도는 판정 불가(None)로 건너뛴다."""
+    assert pipeline.auditor_change_flags(
+        [None, "회계법인 원지", None, "원지회계법인", "다른회계법인", None]
+    ) == [None, None, None, False, True, None]
+    assert pipeline.auditor_change_flags([]) == []
+
+
+def test_update_auditor_change_flag_is_null_when_not_enough_years(db_session_factory):
+    """감사인 이름을 확보한 연도가 1개 이하면 "변동 없음(0)"이 아니라 판정 불가(NULL)다."""
+    job_id = _make_job(db_session_factory)
+    result_id = _seed_result(db_session_factory, job_id=job_id, corp_code="H7")
+    _seed_snapshot_auditors(db_session_factory, result_id, ["단독회계법인", None])
+
+    pipeline._update_auditor_change_flag(db_session_factory, result_id)
+
+    with db_session_factory() as db:
+        assert db.get(Result, result_id).auditor_changed is None
 
 
 @pytest.mark.asyncio

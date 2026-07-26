@@ -32,6 +32,18 @@ class Result(Base):
     # 서명란이 없는 원문(실측 31건 중 2건)은 이름만 채워지고 주소는 NULL이다.
     auditor_name: Mapped[str | None] = mapped_column(String, nullable=True)
     auditor_address: Mapped[str | None] = mapped_column(String, nullable=True)
+    # 연도별 감사인이 바뀌었는지 (2026-07-26 추가). STEP 7(다년치 이력 수집)이
+    # 채운 `financial_snapshots.auditor_name`(그 연도를 **당기**로 감사한 감사인만)
+    # 을 근거로 회사 단위로 집계한 **캐시 컬럼**이다 — 목록 조회마다 조인/집계하지
+    # 않도록 excluded_by_* 와 같은 "플래그를 미리 계산해 둔다" 관례를 따른다.
+    #   1    = 이력에서 서로 다른 감사인이 2곳 이상 확인됨(감사인 교체 있었음)
+    #   0    = 이력의 감사인이 모두 동일
+    #   NULL = 판정 불가(감사인 이름을 확보한 연도가 1개 이하 — STEP 7 미수행,
+    #          이 컬럼 도입 이전에 수집된 기존 Job, 서명란 없는 원문 등)
+    # 다른 excluded_by_* 와 달리 기본값을 0이 아니라 NULL로 두는 이유가 이것이다:
+    # 기존 완료 Job의 행을 "감사인 변동 없음(0)"으로 단정하면 안 된다("컬럼 추가만,
+    # 소급 재파싱 없음" 관례 — 신규 Phase 2 실행분부터만 채워진다).
+    auditor_changed: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     # 금융위 요약재무(`fsc_financial_stat`) 참고값 — Phase 1이 후보 목록 화면에
     # 보여주려고 채운다(§4-10-C/D). **필터 판정에 절대 쓰지 않는다** —

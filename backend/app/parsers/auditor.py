@@ -59,6 +59,24 @@ _MAX_NAME_LINE_LEN = 40
 # 포함하는 표 항목(실측 캐시 3건). 이 단어가 있으면 후보에서 제외한다.
 _NOT_AUDITOR_LINE_RE = re.compile(r"담당|임원|위원회")
 
+# 주소가 이름과 같은 줄에 붙는 서식에서 이름 앞에 딸려오는 **주소 단위 한 글자**
+# ("... 728, 302호 천일공인회계사감사반", "... 원방빌딩 14층회 계 법 인 지 평").
+# 로컬 문서 캐시 4,923건 전수 스캔에서 실제로 관측된 글자만 넣는다 — "동"/"가"는
+# 주소 단위이기도 하지만 "동원회계법인"/"가율회계법인"처럼 법인명 첫 글자로 훨씬
+# 흔해(캐시 259건) 넣으면 안 된다. 새 글자는 실측 사례가 나왔을 때만 추가할 것.
+_ADDRESS_UNIT_CHARS = frozenset("층호")
+
+# 두 글자 이상인 주소 단위(지번 주소의 "번지"). 실측은 "…우동 1468번지
+# 태흥공인회계사감사반"/"…송파동 50번지 동산 공인회계사 감사반" 5건(캐시 전수)이며,
+# 전부 단위 **뒤에 공백**이 오고 앞은 숫자다. 아래 두 가지를 반드시 지킨다:
+#
+# * **통짜 2글자 매치만** 허용한다 — "번"/"지"를 각각 `_ADDRESS_UNIT_CHARS`에 넣으면
+#   "지성/지암/지우회계법인", "지음공인회계사감사반"(캐시 29건)의 첫 글자를 먹는다.
+# * 단위 뒤에 **공백이 이어질 때만** 떼어낸다. 공백 없이 붙은 "…100번지성회계법인"은
+#   "100번지"+"성회계법인"인지 "100번"+"지성회계법인"인지 구분할 수 없어(캐시 0건),
+#   이름을 조용히 잘라내느니 손대지 않고 남긴다.
+_ADDRESS_UNIT_WORDS = ("번지",)
+
 # 서명란에서 이름 줄 위로 주소를 찾을 때 거슬러 올라갈 최대 줄 수.
 _ADDRESS_LOOKBACK_LINES = 6
 
@@ -127,11 +145,23 @@ def _clean_name(line: str, match: re.Match[str]) -> str | None:
         start -= 1
     name_part = head[start:]
 
-    # 주소가 "302호"처럼 한글 단위로 끝나면 그 한 글자가 앞에 딸려온다 — 앞
-    # 글자가 숫자였을 때만 떼어낸다(정상 이름을 깎지 않기 위한 좁은 조건).
-    tokens = name_part.split()
-    if start > 0 and head[start - 1].isdigit() and len(tokens) > 1 and len(tokens[0]) == 1:
-        name_part = " ".join(tokens[1:])
+    # 주소가 "302호"/"14층"/"1468번지"처럼 한글 단위로 끝나면 그 단위가 이름 앞에
+    # 딸려온다 — 앞 글자가 숫자이고 **그 뒤에 붙은 것이 실제 주소 단위**
+    # (`_ADDRESS_UNIT_CHARS` 한 글자 또는 `_ADDRESS_UNIT_WORDS` 통짜)일 때만 떼어낸다.
+    #
+    # 이 조건이 예전에는 "숫자 뒤 1글자 토큰"이기만 하면 발동해서, 글자 사이가
+    # 벌어진 법인명이 주소 뒤에 바로 붙는 서식("...한강대로 100삼 일 회 계 법 인")
+    # 에서 이름의 첫 글자를 먹었다("일회계법인"). 캐시 4,923건 중 59건이 그렇게
+    # 손상됐다(2026-07-26 dart-qa 실측).
+    if start > 0 and head[start - 1].isdigit():
+        if name_part[:1] in _ADDRESS_UNIT_CHARS:
+            name_part = name_part[1:]
+        else:
+            for word in _ADDRESS_UNIT_WORDS:
+                rest = name_part[len(word) :]
+                if name_part.startswith(word) and rest[:1].isspace():
+                    name_part = rest
+                    break
 
     name = re.sub(r"\s+", "", name_part)
 

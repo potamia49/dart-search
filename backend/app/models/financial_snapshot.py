@@ -85,6 +85,21 @@ class FinancialSnapshot(Base):
     non_operating_income: Mapped[int | None] = mapped_column(Integer, nullable=True)
     non_operating_expense: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
+    # 그 연도 감사보고서의 감사인(회계법인/감사반) 이름 (2026-07-26 추가,
+    # app/parsers/auditor.py `extract_auditor`). "연도별로 감사인이 바뀌었는지"를
+    # 결과 목록에 표시하기 위한 원천 데이터다(results.auditor_changed 참고).
+    #
+    # **`from_current_period=1`인 행에만 채운다.** 감사인은 "그 회계연도를 당기로
+    # 감사한 회계법인"이라 다음 연도 공시의 전기 열에서 값을 빌려온 행
+    # (`from_current_period=0`)에 그 공시의 감사인을 적으면 연도-감사인 대응이
+    # 어긋난다(전기 재무제표를 다른 감사인이 감사했을 수 있다) — 그런 행은 NULL로
+    # 남기고 판정에서 제외한다.
+    #
+    # 주소(auditor_address)는 연도별로 보관하지 않는다 — 화면의 연도별 상세는
+    # `GET .../account-detail`이 원문을 그 자리에서 다시 열어 이름·주소를 함께
+    # 돌려주므로(추가 API 호출 0건) DB에 중복 보관할 이유가 없다.
+    auditor_name: Mapped[str | None] = mapped_column(String, nullable=True)
+
     parse_status: Mapped[str | None] = mapped_column(String, nullable=True)  # OK/PARTIAL/FAILED
     parse_note: Mapped[str | None] = mapped_column(String, nullable=True)
 

@@ -39,6 +39,9 @@ RESULT_COLUMN_LABELS: dict[str, str] = {
     "audit_opinion": "감사의견",
     "auditor_name": "감사인",
     "auditor_address": "감사인주소",
+    # 연도별 감사인 변동 여부 (2026-07-26) — 1/0/빈칸(판정 불가). 다른
+    # excluded_by_* 플래그와 같이 원값(1/0)을 그대로 내보낸다.
+    "auditor_changed": "감사인변동여부",
     # 요약 재무 (PRD 3-2) — 당기(_cur)/전기(_prv)
     "current_assets_cur": "유동자산(당기)",
     "current_assets_prv": "유동자산(전기)",
