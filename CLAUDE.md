@@ -434,6 +434,38 @@ Job은 `phase` 컬럼(`CANDIDATES`/`FINANCIALS`)으로 2단계로 나뉜다 —
   (진성 결측)만 남고 채움 0건으로 멱등 확인. 실행 전
   `dart_search.db.bak.pre_auditor_backfill.20260726_224159`로 백업(sqlite 온라인
   백업 API — WAL 포함 일관 스냅샷). `pytest` 314 passed.
+- **`financial_snapshots`의 재무상태표/손익계산서/CF/영업외손익 값 자체가
+  구버전 파서 결과에 고정돼 있던 문제 발견 → 소급 재파싱 완료(2026-07-26,
+  사용자 스크린샷 지적으로 발견)**. 결과조회 상세의 "재무 이력(최근 N년)"
+  표가 특정 회사(예: 신신사, corp_code=00636744)에서 전 연도 "-"로 비어
+  있는데 같은 회사의 `results`(결과조회 목록) 행에는 자산총계 등 값이 정상
+  적으로 들어 있는 불일치를 사용자가 지적했다. 원인: `financial_snapshots`는
+  STEP7이 **그 시점의 파서 버전**으로 한 번 파싱한 결과를 영구히 들고
+  있고, 이후 파서가 개선돼도(IFRS 첨부 서식 지원, 손실-primary 조합형 부호
+  수정, 라벨 alias 보강 등) 자동으로 재파싱되지 않는다 — `results`는
+  `reparse_local_cache.py`로 여러 차례 소급 반영됐지만, `financial_snapshots`
+  대상 기존 스크립트(`reparse_financial_snapshots.py`)는 영업외수익/비용
+  2컬럼만 좁게 채우도록 설계돼 있어 BS/IS/CF 값 자체는 건드리지 못했다.
+  실측(신신사 rcept 20260407001413): 현재 파서로 이 문서를 직접 재파싱하면
+  `parse_status=OK`, `total_assets`/`net_income` 모두 정상 추출되는데,
+  저장된 스냅샷 행은 4개 연도 전부 `parse_note="재무상태표/손익계산서
+  테이블을 찾을 수 없음"`·전 필드 NULL로 굳어 있어 문서·파서 문제가 아니라
+  **스냅샷 테이블의 데이터 정체(staleness)**임을 확인. 신규 스크립트
+  **`backend/scripts/reparse_financial_snapshot_values.py`**(`reparse_local_cache.py`
+  + `reparse_financial_snapshots.py`의 기간 판정 로직을 결합 — 표준 13항목 +
+  CF 4항목 + 영업외손익 2항목 전부를 대상으로 하되, 스냅샷 행이 당기/전기
+  어느 열 유래인지는 기존 스크립트와 동일하게 원문 결산기준일 우선·
+  `from_current_period` 폴백으로 판정. `--dry-run`/`--verify` 지원, API 호출
+  0건, 파싱 로직은 STEP7 헬퍼 재사용). 대상 4,147행(전수) 재파싱 →
+  **3,717행 변경**(그중 숫자 값 변경 3,685행), **PARTIAL→OK 459건**. `--verify`
+  항등식 자체검증(gross_profit==revenue-cogs / 자산총계==유동+비유동 /
+  자산총계==부채+자본 3종): 부호 오분류 0, DB 드리프트 0(멱등 확인), 크기
+  불일치 21건은 전부 `results` 재파싱 때부터 알려진 기존 이슈(위 "-"→cogs=0
+  버그, 매각예정자산 등 정당한 제3 자산 항목)로 이번 작업과 무관.
+  **dart-search-배포(exe) DB와 개발 저장소 DB 양쪽 모두에 적용**(배포 exe가
+  실행 중이었으나 활성 Job이 없음을 `jobs.status` 확인 후 진행). 실행 전 각각
+  `dart_search.db.bak.pre_snapshot_values_backfill.20260727_000316`로 백업.
+  `pytest` 314 passed(회귀 0).
 - **스키마 확장은 항상 "컬럼 추가 + 소급 재파싱 없음"** 패턴을 따른다(신규
   Phase 2 실행분부터만 채워짐). **소급 재파싱 대기 후보 4종은 2026-07-21
   일괄 처리 완료**(사용자 명시 요청에 의한 일회성 예외 — 쿼터 0건, 스크립트
