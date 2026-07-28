@@ -42,3 +42,38 @@ body {
   color: #fff;
   font-weight: 600;
 }
+
+/* ── §4-11 결과 목록 다중 선택 다운로드 ──
+   선택 행 강조는 인라인 style이 아니라 클래스로 넣는다 — 인라인 style은
+   Mantine의 highlightOnHover 규칙(`tr:hover`)까지 덮어써 hover 피드백을 죽인다.
+   `tr.result-row-selected`(0,1,1)는 striped(:where로 감싼 0,1,0)를 이기고
+   hover(0,2,0)에는 지므로, 줄무늬 위에 선택 강조가 얹히고 hover는 그대로 산다. */
+tr.result-row-selected {
+  background-color: var(--mantine-color-blue-0);
+}
+
+/* 체크박스 열은 가로 스크롤(재무 컬럼을 켜면 표가 넓어진다) 중에도 왼쪽에 고정한다.
+   sticky 셀은 뒤 컬럼이 비쳐 보이지 않도록 셀 자체에 불투명 배경이 필요해,
+   행 상태(줄무늬/선택/hover)별 배경을 셀에도 같은 순서로 맞춰 준다. */
+.result-select-header {
+  position: sticky;
+  left: 0;
+  z-index: 3;
+  /* 배경은 위 .mantine-Table-th(딥 네이비)를 그대로 쓴다 */
+}
+.result-select-cell {
+  position: sticky;
+  left: 0;
+  z-index: 2;
+  background-color: var(--mantine-color-body);
+}
+tr:where([data-striped='odd']:nth-of-type(odd)) .result-select-cell,
+tr:where([data-striped='even']:nth-of-type(even)) .result-select-cell {
+  background-color: var(--mantine-color-gray-0);
+}
+tr.result-row-selected .result-select-cell {
+  background-color: var(--mantine-color-blue-0);
+}
+tr:hover .result-select-cell {
+  background-color: var(--mantine-color-gray-1);
+}

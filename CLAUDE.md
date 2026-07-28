@@ -567,6 +567,39 @@ Excel/CSV 내보내기(현재 필터·정렬 반영), 재무 이력(최근 N년)
 "감사인 변동 여부" 컬럼(목록)과 상세 재무이력의 연도별 감사인 표시·강조는
 **2026-07-26 구현 완료**(위 "연도별 감사인" 항목 참고).
 
+**다중 선택 다운로드(§4-11/M9, 백엔드·프론트 모두 2026-07-28 완료)**: 목록 왼쪽
+체크박스로 회사를 골라 그 회사들만 별도 파일로 받는다 — 기존 "전체 내보내기"
+([Excel/CSV 다운로드], 현재 필터·정렬 전체)를 **대체하지 않고 병행**한다.
+`GET /api/jobs/{id}/export`의 `ids`(쉼표구분 `results.id`, 지정 시 다른 필터·정렬
+전부 무시·타 Job id 섞이면 400) + `include_history`(=true면 `financial_history`
+시트 추가, **xlsx 전용** — csv와 조합 시 400)를 쓴다. 프론트(`ResultPage.tsx`)는
+선택 상태를 `Set<number>`로 들고 **페이지 전환·필터 탭 변경에도 유지**(Job이 바뀔
+때만 초기화)하며, 헤더 체크박스는 현재 페이지 행만 전체선택/해제한다. 선택 1건
+이상일 때만 "선택 N건" + [선택 항목 다운로드] 메뉴(Excel+이력 / Excel만 / CSV만)를
+띄우므로 **csv+이력 400 조합과 빈 `ids=` 요청은 UI에서 발생하지 않는다**.
+백엔드 내보내기 로직은 `app/exporters/excel.py`의 신규
+`FINANCIAL_SNAPSHOT_COLUMN_LABELS`/`snapshots_to_dataframe()`/
+`export_results_with_history()`가 담당하고 기존 `RESULT_COLUMN_LABELS`/
+`results_to_dataframe()`/`export_results()`는 무변경이다(두 파라미터가 없으면
+전체 내보내기 응답이 이전과 동일). 스냅샷에는 회사명이 없어(`result_id` FK만)
+호출부가 만든 `{result_id: corp_name}` 매핑으로 조인하고, `financial_history`
+시트는 설계 문구의 "회사명順"이 아니라 **`result_id` → `fiscal_year` 오름차순**이다
+— `ids` 경로에서는 `results` 시트도 id 오름차순이라 두 시트의 회사 순서가 같지만,
+`ids` 없이 `sort`를 건 전체 내보내기에서는 `results` 시트만 그 정렬을 따르므로
+순서가 어긋날 수 있다(값 오류는 아니며 `result_id` 컬럼으로 대조 가능,
+dart-qa 2026-07-28 지적). `ids`는 정수가 아닌 토큰뿐 아니라 **SQLite
+INTEGER(양수 int64) 범위를 벗어난 값도 400**으로 막는다(그대로 바인딩하면
+`OverflowError`로 500이 났다 — dart-qa 실측 후 수정). **DB 스키마 변경·추가 API
+호출 0건**인 순수 조회 파라미터 확장이라 이 프로젝트의 "컬럼 추가 + 소급 재파싱"
+논의 자체가 해당 없다(기존 완료 Job에서도 즉시 쓸 수 있다).
+· **dart-design-review(2026-07-28) 반영**: 표시줄에 "이 페이지 M건 · 현재 화면
+밖 K건" 분해 표시와 다운로드 메뉴 안내 문구(필터·탭 무관 전체 대상 / 이력 없는
+회사 제외)를 추가해 탭·페이지를 넘나드는 선택이 "안 보이는 상태로 다운로드"되는
+문제를 줄였다. 선택 행 배경 강조 + 체크박스 열 `position: sticky`(가로 스크롤
+중에도 왼쪽 고정)를 `index.css`의 `.result-row-selected`/`.result-select-header`/
+`.result-select-cell` 클래스로 추가(인라인 style이 아니라 클래스로 넣어야
+Mantine `highlightOnHover`의 hover 규칙이 죽지 않는다).
+
 ### "최근 1년 이내 DART 공시 없음" 배제 (2026-07-21 추가)
 
 실사례("주식회사 유진"류 — 폐업/휴면/합병소멸 등으로 실질적으로 활동을 멈춘

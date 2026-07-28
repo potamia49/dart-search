@@ -10,6 +10,10 @@ STEP 5(파싱, M3)가 채워져 `parse_status`/재무 항목이 실제 값을 �
 `/export`는 M4에서 `app/exporters/excel.py`와 함께 구현했다 — 페이징 없이
 필터를 통과한 결과 전체를 xlsx/csv로 내려준다.
 
+`/export`는 2026-07-28(§4-11, M9)부터 `ids`(체크박스로 고른 `results.id` 목록)와
+`include_history`(재무이력 시트 추가, xlsx 전용) 쿼리 파라미터를 함께 받는다 —
+기존 "현재 필터·정렬 전체 내보내기" 동작은 두 파라미터가 없을 때 그대로다.
+
 `/results/{result_id}/history`는 `financial_snapshots`(STEP 7)를 조회한다.
 기존 `/results` 목록 응답은 무겁게 만들지 않기 위해 그대로 두고(이력은
 포함하지 않음), 상세 조회에서만 lazy-load하게 별도 엔드포인트로 분리했다.
@@ -27,7 +31,7 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.core.db import get_db
 from app.core.pipeline import auditor_change_flags
-from app.exporters.excel import export_results
+from app.exporters.excel import export_results, export_results_with_history
 from app.models.financial_snapshot import FinancialSnapshot
 from app.models.job import Job, JobPhase
 from app.models.result import Result
@@ -376,10 +380,53 @@ _EXPORT_CONTENT_TYPES = {
 }
 
 
+def _parse_export_ids(ids: str | None) -> list[int] | None:
+    """`?ids=101,102,105` 쿼리 문자열을 `results.id` 목록으로 파싱한다(§4-11).
+
+    파라미터 자체가 없으면 `None`(=선택 다운로드가 아님, 기존 필터 기반 전체
+    내보내기)을 돌려주고, 빈 문자열/쉼표만 있는 값은 빈 리스트를 돌려준다
+    (=선택 0건 → 헤더만 있는 빈 파일). 정수가 아닌 토큰이 섞이면 400이다 —
+    조용히 버리면 "체크했는데 파일에 없다"가 되어 오히려 위험하다.
+    중복 id는 처음 것만 남기고 순서를 보존한다.
+
+    파이썬 `int()`는 자릿수 제한이 없어 `2**63` 이상도 파싱에 성공하지만, 그 값을
+    그대로 `IN (...)`에 바인딩하면 SQLite가 `OverflowError`를 내 500이 된다
+    (dart-qa 2026-07-28 실측) — 그래서 **SQLite INTEGER 범위(양수 int64)를 벗어난
+    값도 여기서 400으로 처리**한다. `results.id`는 AUTOINCREMENT 양수라 0/음수는
+    애초에 존재할 수 없다.
+    """
+    if ids is None:
+        return None
+    parsed: list[int] = []
+    seen: set[int] = set()
+    for token in (t.strip() for t in ids.split(",")):
+        if not token:
+            continue
+        try:
+            value = int(token)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail=f"ids에 정수가 아닌 값이 있습니다: {token!r}",
+            ) from None
+        if not 0 < value <= 2**63 - 1:
+            raise HTTPException(
+                status_code=400,
+                detail=f"ids에 결과 id로 쓸 수 없는 값이 있습니다: {token!r}",
+            )
+        if value in seen:
+            continue
+        seen.add(value)
+        parsed.append(value)
+    return parsed
+
+
 @router.get("/{job_id}/export")
 async def export_job_results(
     job_id: int,
     format: str = "xlsx",
+    ids: str | None = None,
+    include_history: bool = False,
     parse_status: str | None = None,
     excluded_by_revenue: bool | None = None,
     excluded_by_assets: bool | None = None,
@@ -398,32 +445,94 @@ async def export_job_results(
     `excluded_by_stale_disclosure`/`has_disclosure`/`q`/`auditor_changed`/`sort`/
     `sort_by`/`sort_dir`는 `/results`와 동일한 의미다(다중 정렬 `sort` 포함) —
     화면에서 걸러 놓고 정렬한 그대로를 내려받게 된다. `format`이 xlsx/csv가 아니면 400.
+
+    **다중 선택 다운로드(§4-11, 2026-07-28)** — 위 "필터 전체" 내보내기와 별개로,
+    화면에서 체크박스로 고른 회사만 받는 두 파라미터를 지원한다:
+
+    - `ids`: 쉼표 구분 `results.id` 목록(예: `?ids=101,102,105`). 지정되면 위
+      필터·정렬 파라미터는 **전부 무시**하고 정확히 그 id들만 id 오름차순으로
+      내보낸다 — 사용자는 이미 화면에서 필터로 찾아 체크한 뒤이므로 다운로드
+      시점에 필터를 다시 태우면 "체크했는데 파일에 없다"가 된다. 다른 Job의
+      결과 id가 섞여 있으면 400(`job_id` 스코프 검증). 빈 값이면 헤더만 있는
+      빈 파일이다.
+    - `include_history`: true면 `financial_snapshots`(회사×회계연도)를 담은
+      `financial_history` 시트를 추가한 **2시트 xlsx**로 응답한다. csv는 다중
+      시트를 표현할 수 없으므로 `format=csv`와 함께 오면 400이다.
     """
     if format not in _EXPORT_CONTENT_TYPES:
         raise HTTPException(
             status_code=400,
             detail=f"지원하지 않는 format입니다: {format!r} (xlsx 또는 csv만 가능)",
         )
+    if include_history and format != "xlsx":
+        raise HTTPException(
+            status_code=400,
+            detail="include_history=true는 format=xlsx에서만 지원합니다(csv는 다중 시트 불가).",
+        )
 
     job = db.get(Job, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job을 찾을 수 없습니다.")
 
-    stmt = _build_results_query(
-        job_id,
-        parse_status,
-        excluded_by_revenue,
-        excluded_by_assets,
-        excluded_by_stale_disclosure,
-        has_disclosure,
-        q,
-        auditor_changed,
-    )
-    sort_specs = _resolve_sort_specs(sort, sort_by, sort_dir)
-    rows = db.execute(_apply_sort(stmt, sort_specs)).scalars().all()
+    selected_ids = _parse_export_ids(ids)
+    if selected_ids is not None:
+        # 선택 다운로드 — 필터/정렬을 타지 않고 지정된 id만, 항상 id 오름차순으로.
+        rows = (
+            db.execute(
+                select(Result)
+                .where(Result.job_id == job_id, Result.id.in_(selected_ids))
+                .order_by(Result.id.asc())
+            )
+            .scalars()
+            .all()
+            if selected_ids
+            else []
+        )
+        found = {r.id for r in rows}
+        missing = [i for i in selected_ids if i not in found]
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail=f"이 Job에 속하지 않는 결과 id가 있습니다: {missing}",
+            )
+    else:
+        stmt = _build_results_query(
+            job_id,
+            parse_status,
+            excluded_by_revenue,
+            excluded_by_assets,
+            excluded_by_stale_disclosure,
+            has_disclosure,
+            q,
+            auditor_changed,
+        )
+        sort_specs = _resolve_sort_specs(sort, sort_by, sort_dir)
+        rows = db.execute(_apply_sort(stmt, sort_specs)).scalars().all()
 
-    content = export_results(rows, format)
-    filename = f"dart_search_job{job_id}_results.{format}"
+    if include_history:
+        result_ids = [r.id for r in rows]
+        snapshots = (
+            db.execute(
+                select(FinancialSnapshot)
+                .where(FinancialSnapshot.result_id.in_(result_ids))
+                .order_by(
+                    FinancialSnapshot.result_id.asc(), FinancialSnapshot.fiscal_year.asc()
+                )
+            )
+            .scalars()
+            .all()
+            if result_ids
+            else []
+        )
+        content = export_results_with_history(
+            rows, snapshots, {r.id: r.corp_name for r in rows}
+        )
+    else:
+        content = export_results(rows, format)
+
+    suffix = "_selected" if selected_ids is not None else ""
+    suffix += "_with_history" if include_history else ""
+    filename = f"dart_search_job{job_id}_results{suffix}.{format}"
     return Response(
         content=content,
         media_type=_EXPORT_CONTENT_TYPES[format],

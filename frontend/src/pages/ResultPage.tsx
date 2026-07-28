@@ -4,10 +4,13 @@ import {
   Alert,
   Badge,
   Button,
+  Checkbox,
   CloseButton,
   Group,
   Loader,
+  Menu,
   Pagination,
+  Paper,
   Stack,
   Table,
   Tabs,
@@ -50,6 +53,10 @@ const PAGE_SIZE = 50
 /** 검색어 입력마다 요청을 보내지 않도록 하는 디바운스 지연(ms) — SearchPage의
  * 후보 수 미리보기와 같은 값을 쓴다. */
 const SEARCH_DEBOUNCE_MS = 400
+
+/** 이 개수를 넘게 고르면 파일 생성이 오래 걸릴 수 있다고 안내한다(§4-11 — 상한을 걸어
+ * 막지는 않는다. 로컬 SQLite 조회뿐이라 수백~수천 건도 동작 자체는 가능하다). */
+const LARGE_SELECTION_HINT = 500
 
 /** 컬럼의 정렬 필드명 — `sortKey: false`면 정렬 불가 컬럼이다. */
 function sortKeyOf(column: ResultColumn): string | null {
@@ -147,6 +154,10 @@ function FinancialsResultsView({ jobId }: { jobId: number }) {
   )
   const [selected, setSelected] = useState<ResultResponse | null>(null)
   const [exporting, setExporting] = useState(false)
+  // §4-11 다중 선택 다운로드 — 체크한 결과 id 집합. **페이지를 넘기거나 필터 탭을
+  // 바꿔도 유지**하고(화면 탐색 수단일 뿐이므로), Job이 바뀔 때만 초기화한다.
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(() => new Set())
+  const [selectionExporting, setSelectionExporting] = useState(false)
   const [search, setSearch] = useState('')
   const [debouncedSearch, setDebouncedSearch] = useState('')
   // 다중 컬럼 정렬 — 배열 앞쪽이 1순위(주 정렬), 뒤쪽이 보조 정렬이다. 일반 클릭은
@@ -160,6 +171,11 @@ function FinancialsResultsView({ jobId }: { jobId: number }) {
     listResults(jobId, { page: 1, page_size: 1, excluded_by_stale_disclosure: true })
       .then((res) => setStaleCount(res.total))
       .catch(() => setStaleCount(null))
+  }, [jobId])
+
+  // 다른 Job의 결과 id가 선택에 남아 있으면 백엔드가 400(스코프 검증)을 준다.
+  useEffect(() => {
+    setSelectedIds(new Set())
   }, [jobId])
 
   // 타이핑 중에 매 글자마다 요청하지 않도록 입력을 디바운스한다.
@@ -249,6 +265,46 @@ function FinancialsResultsView({ jobId }: { jobId: number }) {
     }
   }
 
+  /** §4-11 선택 항목 다운로드 — 체크한 회사만 내보낸다. 필터/정렬은 넘기지 않는다
+   * (백엔드도 `ids`가 있으면 무시한다 — 이미 화면에서 골라 놓은 것이라 다운로드
+   * 시점에 필터를 다시 태우면 "체크했는데 파일에 없다"가 된다).
+   * `includeHistory`는 xlsx에서만 호출되게 메뉴 구성 자체로 차단해 둔다. */
+  async function handleSelectionExport(format: 'xlsx' | 'csv', includeHistory: boolean) {
+    const ids = [...selectedIds].sort((a, b) => a - b)
+    if (ids.length === 0) return
+    setSelectionExporting(true)
+    try {
+      await exportResults(jobId, format, {}, { ids, includeHistory })
+    } catch {
+      notifications.show({ color: 'red', message: '선택 항목 다운로드에 실패했습니다.' })
+    } finally {
+      setSelectionExporting(false)
+    }
+  }
+
+  function toggleRowSelected(id: number, checked: boolean) {
+    setSelectedIds((prev) => {
+      const next = new Set(prev)
+      if (checked) next.add(id)
+      else next.delete(id)
+      return next
+    })
+  }
+
+  /** 헤더 체크박스 — **현재 페이지에 보이는 행만** 전체선택/해제한다
+   * (다른 페이지에서 이미 고른 선택은 건드리지 않는다). */
+  function togglePageSelected(checked: boolean) {
+    const pageIds = data?.items.map((row) => row.id) ?? []
+    setSelectedIds((prev) => {
+      const next = new Set(prev)
+      for (const id of pageIds) {
+        if (checked) next.add(id)
+        else next.delete(id)
+      }
+      return next
+    })
+  }
+
   // "휴면·폐업 추정" 탭에서는 판정 근거(최근 공시일자)를 항상 볼 수 있어야
   // 하므로 컬럼 토글 상태와 무관하게 표시한다(2026-07-22). ColumnToggle에도
   // 같은 집합을 넘겨 체크박스 상태가 실제 표시 상태와 어긋나지 않게 한다.
@@ -260,6 +316,9 @@ function FinancialsResultsView({ jobId }: { jobId: number }) {
     (c) => visibleKeys.has(c.key) || forcedVisibleKeys.has(c.key),
   )
   const totalPages = data ? Math.max(1, Math.ceil(data.total / data.page_size)) : 1
+  const pageRows = data?.items ?? []
+  const selectedOnPage = pageRows.filter((row) => selectedIds.has(row.id)).length
+  const allPageSelected = pageRows.length > 0 && selectedOnPage === pageRows.length
 
   return (
     <Stack>
@@ -344,6 +403,64 @@ function FinancialsResultsView({ jobId }: { jobId: number }) {
         </Alert>
       )}
 
+      {/* §4-11 선택 항목 다운로드 표시줄 — 선택 0건이면 통째로 숨긴다. 페이지 로딩
+          중에도 선택은 유지되므로 테이블 바깥(로딩 조건 밖)에 둔다. */}
+      {selectedIds.size > 0 && (
+        <Paper withBorder p="xs" bg="var(--mantine-color-blue-0)">
+          <Group justify="space-between">
+            <Group gap="xs">
+              <Text size="sm" fw={600}>
+                선택 {selectedIds.size.toLocaleString()}건
+                {selectedIds.size > selectedOnPage && (
+                  <Text component="span" size="xs" c="dimmed" fw={400}>
+                    {' '}
+                    (이 페이지 {selectedOnPage}건 · 현재 화면 밖{' '}
+                    {(selectedIds.size - selectedOnPage).toLocaleString()}건)
+                  </Text>
+                )}
+              </Text>
+              <Button
+                size="compact-xs"
+                variant="subtle"
+                onClick={() => setSelectedIds(new Set())}
+              >
+                선택 해제
+              </Button>
+              {selectedIds.size > LARGE_SELECTION_HINT && (
+                <Text size="xs" c="dimmed">
+                  선택이 많아 파일 생성에 시간이 걸릴 수 있습니다.
+                </Text>
+              )}
+            </Group>
+            <Menu position="bottom-end" withinPortal>
+              <Menu.Target>
+                <Button loading={selectionExporting}>선택 항목 다운로드</Button>
+              </Menu.Target>
+              <Menu.Dropdown>
+                <Menu.Label>
+                  선택한 {selectedIds.size.toLocaleString()}건만 내보내기 — 현재 필터·탭과
+                  무관하게 지금까지 체크한 전체 건이 대상입니다
+                </Menu.Label>
+                <Menu.Item onClick={() => handleSelectionExport('xlsx', true)}>
+                  Excel (기본정보 + 재무이력)
+                </Menu.Item>
+                <Menu.Item onClick={() => handleSelectionExport('xlsx', false)}>
+                  Excel (기본정보만)
+                </Menu.Item>
+                {/* CSV는 시트가 하나뿐이라 재무이력을 담을 수 없다 — 조합 자체를 제공하지 않는다. */}
+                <Menu.Item onClick={() => handleSelectionExport('csv', false)}>
+                  CSV (기본정보만)
+                </Menu.Item>
+                <Menu.Label>
+                  재무 이력이 수집된 회사만 재무이력 시트에 실립니다(감사보고서 없음 등은
+                  제외)
+                </Menu.Label>
+              </Menu.Dropdown>
+            </Menu>
+          </Group>
+        </Paper>
+      )}
+
       {loading && <Loader />}
 
       {!loading && data && (
@@ -382,6 +499,18 @@ function FinancialsResultsView({ jobId }: { jobId: number }) {
             <Table striped highlightOnHover withTableBorder>
               <Table.Thead>
                 <Table.Tr>
+                  {/* §4-11 선택 열 — 헤더 체크박스는 현재 페이지 행만 전체선택/해제한다.
+                      가로 스크롤 중에도 왼쪽에 고정되도록 result-select-header가 sticky를 건다. */}
+                  <Table.Th w={40} className="result-select-header">
+                    <Checkbox
+                      size="sm"
+                      aria-label="현재 페이지 전체 선택"
+                      checked={allPageSelected}
+                      indeterminate={selectedOnPage > 0 && !allPageSelected}
+                      disabled={pageRows.length === 0}
+                      onChange={(event) => togglePageSelected(event.currentTarget.checked)}
+                    />
+                  </Table.Th>
                   {visibleColumns.map((col) => {
                     const key = sortKeyOf(col)
                     const sortIndex = key === null ? -1 : sorts.findIndex((s) => s.key === key)
@@ -421,9 +550,21 @@ function FinancialsResultsView({ jobId }: { jobId: number }) {
                 {data.items.map((row) => (
                   <Table.Tr
                     key={row.id}
+                    className={selectedIds.has(row.id) ? 'result-row-selected' : undefined}
                     style={{ cursor: 'pointer' }}
                     onClick={() => setSelected(row)}
                   >
+                    {/* 체크박스 클릭이 행 클릭(상세 Drawer 열기)으로 번지지 않게 막는다. */}
+                    <Table.Td className="result-select-cell" onClick={(event) => event.stopPropagation()}>
+                      <Checkbox
+                        size="sm"
+                        aria-label={`${row.corp_name ?? `결과 #${row.id}`} 선택`}
+                        checked={selectedIds.has(row.id)}
+                        onChange={(event) =>
+                          toggleRowSelected(row.id, event.currentTarget.checked)
+                        }
+                      />
+                    </Table.Td>
                     {visibleColumns.map((col) => (
                       <Table.Td key={col.key}>
                         {col.key === 'auditor_changed' ? (

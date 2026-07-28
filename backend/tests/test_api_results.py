@@ -477,6 +477,219 @@ def test_export_filters_by_parse_status(client_with_db):
 
 
 # ---------------------------------------------------------------------------
+# GET /api/jobs/{id}/export?ids=&include_history= — 다중 선택 다운로드(§4-11, M9)
+# ---------------------------------------------------------------------------
+
+
+def test_export_ids_selects_only_given_rows_and_ignores_other_filters(client_with_db):
+    """`ids`가 오면 parse_status/q/sort 등 다른 필터는 전부 무시하고 그 id만 내보낸다.
+
+    사용자는 화면에서 필터로 찾아 체크한 뒤라, 다운로드 시점에 필터를 다시
+    태우면 "체크했는데 파일에 없다"가 된다(§4-11).
+    """
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+    failed_id = _get_result_id(factory, job_id, "00100002")  # parse_status=FAILED 행
+
+    resp = client.get(
+        f"/api/jobs/{job_id}/export",
+        params={
+            "format": "csv",
+            "ids": str(failed_id),
+            # 아래 필터들은 이 행을 배제하지만 ids가 있으므로 전부 무시돼야 한다.
+            "parse_status": "OK",
+            "q": "존재하지않는회사명",
+            "sort": "revenue_cur:desc",
+        },
+    )
+    assert resp.status_code == 200
+    text = resp.content.decode("utf-8-sig")
+    assert "㈜실패테스트" in text
+    assert "㈜성공테스트" not in text
+
+
+def test_export_ids_rejects_result_from_another_job(client_with_db):
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+    other_job_id = _seed_job_with_results(factory)
+    own_id = _get_result_id(factory, job_id, "00100001")
+    foreign_id = _get_result_id(factory, other_job_id, "00100001")
+
+    resp = client.get(
+        f"/api/jobs/{job_id}/export",
+        params={"format": "xlsx", "ids": f"{own_id},{foreign_id}"},
+    )
+    assert resp.status_code == 400
+    assert str(foreign_id) in resp.json()["detail"]
+
+
+def test_export_ids_rejects_non_integer_token(client_with_db):
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+
+    resp = client.get(f"/api/jobs/{job_id}/export", params={"format": "xlsx", "ids": "1,abc"})
+    assert resp.status_code == 400
+
+
+@pytest.mark.parametrize("bad_id", ["1180591620717411303424", str(2**63), "0", "-5"])
+def test_export_ids_rejects_out_of_range_integer(client_with_db, bad_id):
+    """SQLite INTEGER(int64) 범위를 벗어난 정수는 400이어야 한다 — 그대로
+    바인딩하면 `OverflowError`로 500이 났다(dart-qa 2026-07-28 실측)."""
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+
+    resp = client.get(f"/api/jobs/{job_id}/export", params={"format": "xlsx", "ids": bad_id})
+    assert resp.status_code == 400
+
+
+def test_export_empty_ids_returns_header_only_file(client_with_db):
+    """빈 `ids`(선택 0건)는 에러가 아니라 헤더만 있는 빈 파일이다."""
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+
+    resp = client.get(f"/api/jobs/{job_id}/export", params={"format": "xlsx", "ids": ""})
+    assert resp.status_code == 200
+    wb = openpyxl.load_workbook(io.BytesIO(resp.content))
+    assert wb["results"].max_row == 1
+
+    resp = client.get(
+        f"/api/jobs/{job_id}/export",
+        params={"format": "xlsx", "ids": "", "include_history": "true"},
+    )
+    assert resp.status_code == 200
+    wb = openpyxl.load_workbook(io.BytesIO(resp.content))
+    assert wb.sheetnames == ["results", "financial_history"]
+    assert wb["results"].max_row == 1
+    assert wb["financial_history"].max_row == 1
+
+
+def test_export_include_history_with_csv_returns_400(client_with_db):
+    """csv는 다중 시트를 표현할 수 없으므로 조합 자체를 거부한다(§4-11)."""
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+
+    resp = client.get(
+        f"/api/jobs/{job_id}/export",
+        params={"format": "csv", "include_history": "true"},
+    )
+    assert resp.status_code == 400
+
+
+def test_export_include_history_writes_two_sheets_with_joined_corp_name(client_with_db):
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+    ok_id = _get_result_id(factory, job_id, "00100001")
+    failed_id = _get_result_id(factory, job_id, "00100002")
+
+    db = factory()
+    try:
+        db.add_all(
+            [
+                FinancialSnapshot(
+                    result_id=ok_id,
+                    rcept_no="R2",
+                    fiscal_year="2025",
+                    total_assets=6_000_000_000,
+                    revenue=10_000_000_000,
+                    auditor_name="안경회계법인",
+                    from_current_period=1,
+                ),
+                FinancialSnapshot(
+                    result_id=ok_id,
+                    rcept_no="R1",
+                    fiscal_year="2024",
+                    total_assets=5_000_000_000,
+                    revenue=8_000_000_000,
+                    auditor_name="이전회계법인",
+                    from_current_period=1,
+                ),
+                # 선택하지 않은 회사의 이력은 파일에 실리면 안 된다.
+                FinancialSnapshot(
+                    result_id=failed_id, rcept_no="R9", fiscal_year="2025", revenue=1
+                ),
+            ]
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    resp = client.get(
+        f"/api/jobs/{job_id}/export",
+        params={"format": "xlsx", "ids": str(ok_id), "include_history": "true"},
+    )
+    assert resp.status_code == 200
+    assert "attachment" in resp.headers["content-disposition"]
+
+    wb = openpyxl.load_workbook(io.BytesIO(resp.content))
+    assert wb.sheetnames == ["results", "financial_history"]
+
+    ws_results = wb["results"]
+    assert ws_results.max_row == 2  # 헤더 + 선택한 1개사
+    results_header = [c.value for c in next(ws_results.iter_rows(min_row=1, max_row=1))]
+    corp_col = results_header.index("회사명") + 1
+    assert ws_results.cell(row=2, column=corp_col).value == "㈜성공테스트"
+
+    ws_history = wb["financial_history"]
+    header = [c.value for c in next(ws_history.iter_rows(min_row=1, max_row=1))]
+    assert "회사명" in header and "회계연도" in header and "감사인" in header
+    assert ws_history.max_row == 3  # 헤더 + 선택한 회사의 2개 연도
+    rows = [
+        [ws_history.cell(row=r, column=c + 1).value for c in range(len(header))]
+        for r in (2, 3)
+    ]
+    name_i, year_i, assets_i = (
+        header.index("회사명"),
+        header.index("회계연도"),
+        header.index("자산총계"),
+    )
+    # result_id -> fiscal_year 오름차순으로 정렬되고, 회사명은 results에서 조인된다.
+    assert [str(r[year_i]) for r in rows] == ["2024", "2025"]
+    assert [r[name_i] for r in rows] == ["㈜성공테스트", "㈜성공테스트"]
+    assert [r[assets_i] for r in rows] == [5_000_000_000, 6_000_000_000]
+
+
+def test_export_include_history_without_ids_covers_filtered_rows(client_with_db):
+    """`include_history`는 `ids` 없이(=필터 기준 전체) 써도 동작한다."""
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+    ok_id = _get_result_id(factory, job_id, "00100001")
+
+    db = factory()
+    try:
+        db.add(
+            FinancialSnapshot(
+                result_id=ok_id, rcept_no="R1", fiscal_year="2024", revenue=8_000_000_000
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    resp = client.get(
+        f"/api/jobs/{job_id}/export",
+        params={"format": "xlsx", "include_history": "true", "parse_status": "OK"},
+    )
+    assert resp.status_code == 200
+    wb = openpyxl.load_workbook(io.BytesIO(resp.content))
+    assert wb["results"].max_row == 2  # OK 필터 통과 1개사
+    assert wb["financial_history"].max_row == 2
+
+
+def test_export_without_new_params_is_unchanged(client_with_db):
+    """`ids`/`include_history`를 주지 않으면 기존 전체 내보내기와 100% 동일하다."""
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+
+    resp = client.get(f"/api/jobs/{job_id}/export", params={"format": "xlsx"})
+    assert resp.status_code == 200
+    wb = openpyxl.load_workbook(io.BytesIO(resp.content))
+    assert wb.sheetnames == ["results"]
+    assert wb["results"].max_row == 3
+    assert "dart_search_job" in resp.headers["content-disposition"]
+    assert "_selected" not in resp.headers["content-disposition"]
+
+
+# ---------------------------------------------------------------------------
 # GET /api/jobs/{id}/results/{result_id}/history — STEP 7(2026-07-15 추가)
 # ---------------------------------------------------------------------------
 

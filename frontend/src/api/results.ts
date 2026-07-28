@@ -48,14 +48,32 @@ export async function listResults(
   return data
 }
 
-/** 현재 필터를 그대로 export 쿼리에 반영해 파일을 내려받는다 (blob 다운로드). */
+/** §4-11 다중 선택 다운로드 옵션 — 기존 "현재 필터 전체 내보내기"와 병행하는 별개 경로다. */
+export interface ExportResultsOptions {
+  /** 체크박스로 고른 `results.id` 목록. 지정되면 백엔드가 다른 필터·정렬을 **전부 무시**하고
+   * 정확히 이 id들만 id 오름차순으로 내보낸다(타 Job의 id가 섞이거나 정수가 아니면 400). */
+  ids?: number[]
+  /** true면 `financial_history` 시트를 추가한 2시트 xlsx.
+   * **xlsx 전용** — csv와 함께 보내면 백엔드가 400을 준다(메뉴에서 그 조합을 아예 없애 차단한다). */
+  includeHistory?: boolean
+}
+
+/** 현재 필터를 그대로 export 쿼리에 반영해 파일을 내려받는다 (blob 다운로드).
+ * `options.ids`를 넘기면 필터 대신 그 결과들만 받는 선택 다운로드가 된다(§4-11). */
 export async function exportResults(
   jobId: number,
   format: ExportFormat,
   filters: Omit<ListResultsParams, 'page' | 'page_size'> = {},
+  options: ExportResultsOptions = {},
 ): Promise<void> {
   const response = await apiClient.get(`/jobs/${jobId}/export`, {
-    params: { format, ...filters },
+    params: {
+      format,
+      ...filters,
+      // 백엔드는 쉼표 구분 문자열(`ids=1,2,3`)을 기대한다.
+      ...(options.ids ? { ids: options.ids.join(',') } : {}),
+      ...(options.includeHistory ? { include_history: true } : {}),
+    },
     responseType: 'blob',
   })
 
