@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Callable
 
 from lxml import etree
 
@@ -269,6 +270,22 @@ def _attach_section_of(text: str) -> str | None:
     return None
 
 
+def _attach_other_statement_title(text: str) -> bool:
+    """첨부 구간의 제목이 **파싱 대상이 아닌 다른 재무제표**인지 판정.
+
+    "자 본 변 동 표"/"이익잉여금처분계산서" 등은 bs/is/cf 어느 쪽도 아니라
+    `_attach_section_of`가 None을 돌려주는데, 그 표들이 직전 재무제표 구간에
+    딸려 들어가면(원문 섹션 열람에서 손익계산서 탭에 자본변동표가 붙는 식)
+    화면이 지저분해진다. `detect_caption_while_pending` 소비자만 이 판정으로
+    구간을 끊는다 — 값 추출 경로(파이프라인)의 동작에는 관여하지 않는다.
+    """
+    c = text.replace(" ", "").replace("　", "").replace("\n", "").replace("\r", "").replace("\t", "")
+    for pref in _ATTACH_CAPTION_PREFIXES:
+        if c.startswith(pref):
+            c = c[len(pref) :]
+    return any(c.startswith(mark) for mark in _OTHER_TITLE_MARKS)
+
+
 def _first_cell_text(table: etree._Element) -> str:
     """표 첫 행의 첫 셀 텍스트(캡션 표의 제목 셀 판정용)."""
     tr = table.find(".//TR")
@@ -319,18 +336,19 @@ def _build_period_column_plan(header_cells: list[etree._Element]) -> tuple[list[
     return None
 
 
-def _extract_attach_section(
+def attach_period_plan(
     table: etree._Element,
-    values_cur: dict,
-    values_prv: dict,
-    aliases: dict[str, str] = ACCOUNT_NAME_ALIASES,
-) -> None:
-    """"(첨부)재무제표" 구조의 NORMAL 데이터 표 1개를 파싱해 표준 필드를 채운다.
+) -> tuple[tuple[list[int], list[int]], list[etree._Element]] | None:
+    """"(첨부)재무제표" 데이터 표의 (당기/전기 열 계획, 본문 행 목록)을 판별.
 
     헤더(당기/전기 열 정의)는 THEAD에 있을 수도, 첫 TBODY 행에 있을 수도 있다
     (하이에어 현금흐름표는 THEAD가 없고 첫 본문 행이 헤더다). 두 경우를 모두
-    시도해 열 계획을 세운 뒤, 나머지 본문 행에서 과목명→값을 추출한다. 부호
-    규칙(_apply_sign)·값 선택(_first_amount)은 기존 경로와 동일하게 공유한다."""
+    시도하고, 당기·전기 열을 끝내 찾지 못하면 None(= 재무제표 데이터 표가 아님).
+
+    `_extract_attach_section`(파이프라인 값 추출)과 `account_detail.py`(세부계정
+    펼치기)가 **같은 열 판정 기준**을 쓰도록 공용 함수로 분리해 둔 것이다 —
+    두 곳이 따로 열 계획을 세우면 화면과 저장값이 갈라진다(2026-07-27).
+    """
     tbody = table.find("TBODY")
     rows = tbody.findall("TR") if tbody is not None else []
     plan: tuple[list[int], list[int]] | None = None
@@ -347,9 +365,45 @@ def _extract_attach_section(
                 data_rows = rows[idx + 1 :]
                 break
     if plan is None:
-        return
+        return None
+    return plan, data_rows
 
-    cur_cols, prv_cols = plan
+
+# 첨부 서식 라벨 셀의 들여쓰기 계산 시 무시할 문자(셀 안 줄바꿈은 서식상 자동
+# 개행일 뿐 계층 정보가 아니다 — 하이에어 20240329000968 실측: 같은 계층의 셀이
+# "\n 매출채권\n"과 " 단기금융상품"으로 뒤섞여 있다).
+_ATTACH_INDENT_IGNORED = str.maketrans({"\n": None, "\r": None, "\t": None})
+
+
+def attach_label_indent(cell: etree._Element) -> int:
+    """첨부 서식 라벨 셀의 선행 공백 수(계정 계층의 유일한 단서).
+
+    FINANCE 서식은 셀에 `ALEVEL` 속성으로 계층을 명시하지만, "(첨부)재무제표"
+    서식의 데이터 표는 평범한 `<TD>`라 ALEVEL이 아예 없다(실측 4건 + 이래CS
+    20260401004343). 대신 대분류는 왼쪽 끝에서 시작하고("Ⅰ.유동자산") 하위
+    계정은 선행 공백으로 들여쓴다("    1.현금및현금성자산") — 공백 폭 자체는
+    회사마다 1~4칸으로 제각각이라 절대값이 아니라 **표 안에서의 상대 순위**로
+    계층을 매긴다(account_detail.py `_attach_levels`).
+    """
+    text = "".join(cell.itertext()).translate(_ATTACH_INDENT_IGNORED)
+    return len(text) - len(text.lstrip(" 　"))
+
+
+def _extract_attach_section(
+    table: etree._Element,
+    values_cur: dict,
+    values_prv: dict,
+    aliases: dict[str, str] = ACCOUNT_NAME_ALIASES,
+) -> None:
+    """"(첨부)재무제표" 구조의 NORMAL 데이터 표 1개를 파싱해 표준 필드를 채운다.
+
+    열 계획/본문 행 판별은 `attach_period_plan`이 담당하고, 여기서는 본문 행에서
+    과목명→값을 추출한다. 값 선택(_first_amount)은 기존 경로와 공유하고, 부호는
+    첨부 서식 전용 `_apply_sign_ifrs`를 쓴다(FINANCE 서식과 규약이 반대)."""
+    planned = attach_period_plan(table)
+    if planned is None:
+        return
+    (cur_cols, prv_cols), data_rows = planned
     for tr in data_rows:
         cells = list(tr)
         if not cells:
@@ -379,33 +433,42 @@ def _extract_attach_section(
         values_prv[field] = prv_val
 
 
-def parse_xml_financials(raw_xml: bytes) -> ParsedFinancials:
-    """감사보고서 원문 XML에서 재무상태표/손익계산서를 파싱해 표준 13항목을 채운다."""
-    # 실측 샘플 30건 중 다수가 본문 텍스트에 "<"/"&"를 이스케이프하지 않은 채
-    # 담고 있어(예: 서술형 문장 속 부등호, 앰퍼샌드) 엄격 모드로는 파싱 자체가
-    # 실패한다. recover=True로 손상된 부분만 건너뛰고 나머지 구조는 그대로
-    # 활용한다 — DART 원문은 표 구조가 앞부분(재무상태표/손익계산서)에 있고
-    # 깨지는 지점은 대개 뒤쪽 서술형 주석이라 실사용에 지장이 없다.
-    # 인코딩을 UTF-8로 먼저 정규화한다(EUC-KR/CP949 원문 복구, _decode_raw_xml 참고).
-    raw_xml = _decode_raw_xml(raw_xml)
-    # 한글 유령 태그("<주석3>" 등)를 제거해 recover 파서가 표 구조를 통째로
-    # 붕괴시키는 것을 막는다(_HANGUL_PSEUDO_TAG_RE 주석 참고). _decode_raw_xml이
-    # UTF-8 bytes를 보장하므로 안전하게 디코딩→치환→재인코딩한다.
-    raw_xml = _HANGUL_PSEUDO_TAG_RE.sub("", raw_xml.decode("utf-8")).encode("utf-8")
-    parser = etree.XMLParser(recover=True)
-    root = etree.fromstring(raw_xml, parser=parser)
-    if root is None:
-        logger.warning("XML 파싱 실패(복구 불가): %s", parser.error_log)
-        return ParsedFinancials(parse_status="FAILED", parse_note=f"XML 구문 오류(복구 불가): {parser.error_log}")
+def walk_statement_tables(
+    root: etree._Element,
+    visit: Callable[[str, str, etree._Element], bool],
+    *,
+    on_section_title: Callable[[str, etree._Element], None] | None = None,
+    detect_caption_while_pending: bool = False,
+) -> None:
+    """원문 트리에서 재무제표 데이터 표 후보를 문서 순서대로 찾아 `visit`에 넘긴다.
 
-    values_cur: dict[str, float | None] = {}
-    values_prv: dict[str, float | None] = {}
-    found_any_table = False
+    **서식 인식 기준을 한 곳에 모아 두기 위한 공용 워커**다(2026-07-27 신설).
+    파이프라인 파서(`parse_xml_financials`)·세부계정 펼치기(`account_detail.py`)·
+    원문 섹션 열람(`document_sections.py`)이 모두 이 함수를 통해 섹션을 잡는다 —
+    각자 TITLE 상태기계를 재구현하면 "(첨부)재무제표" 같은 서식 확장이 한쪽에만
+    반영돼 화면과 저장값이 갈라진다(실제로 그렇게 갈라져 있던 것을 고친 것이다).
+
+    두 서식을 모두 인식한다:
+    - FINANCE 서식: `<TITLE>`("재무상태표"/"손익계산서"/"현금흐름표") 구간의
+      `ACLASS="FINANCE"` 표.
+    - "(첨부)재무제표" 서식: `_ATTACH_TITLE_MARK` TITLE과 다음 TITLE 사이
+      (`in_attach`)에서만 `<P>`/캡션 표의 제목으로 섹션을 잡고, 그 뒤 표를
+      데이터 표 후보로 넘긴다(주석 본문의 "손익계산서" 언급 오탐 차단).
+
+    `visit(fmt, section, table)` — `fmt`는 "finance"/"attach", `section`은
+    "bs"/"is"/"cf". 반환값 True는 "이 표를 그 섹션의 본문 표로 소비했다"는 뜻이라
+    섹션 추적을 리셋한다(같은 섹션의 뒤따르는 표는 더 이상 넘기지 않는다).
+    False면 섹션을 유지한 채 다음 표를 계속 넘긴다 — 첨부 서식의 기간/각주 표를
+    건너뛰고 진짜 데이터 표에 도달하기 위한 기존 규칙이다.
+
+    `on_section_title(section, element)`는 첨부 서식에서 재무제표 제목(<P> 또는
+    캡션 표)을 감지했을 때 호출된다(원문 섹션 열람이 제목을 렌더링하는 데 쓴다).
+    `detect_caption_while_pending=True`면 섹션이 이미 대기 중이어도 제목(<P>/캡션
+    표)을 다시 확인해 섹션을 전환한다 — 표를 소비하지 않고 구간 전체를 훑는
+    소비자(원문 섹션 열람)를 위한 opt-in이며, 기본값은 기존 동작(대기 중에는
+    제목을 확인하지 않음) 그대로다.
+    """
     section: str | None = None
-    # "(첨부)재무제표" 구조 추적 상태 (위 _ATTACH_TITLE_MARK 주석 참고).
-    # in_attach: "(첨부)...재무제표" TITLE과 다음 TITLE(주석 등) 사이에서만 True라
-    # 주석 본문의 "손익계산서" 언급 등 오탐을 원천 차단한다.
-    # attach_section: 그 구간에서 P/캡션표로 감지한 대기 중 섹션(bs/is/cf).
     in_attach = False
     attach_section: str | None = None
 
@@ -416,8 +479,7 @@ def parse_xml_financials(raw_xml: bytes) -> ParsedFinancials:
         local_tag = tag.rsplit("}", 1)[-1]
 
         if local_tag == "TITLE":
-            title_text = _text_of(el)
-            compact = title_text.replace(" ", "").replace("　", "")
+            compact = _text_of(el).replace(" ", "").replace("　", "")
             if _BS_TITLE_MARK in compact:
                 section = "bs"
                 in_attach = False
@@ -441,44 +503,96 @@ def parse_xml_financials(raw_xml: bytes) -> ParsedFinancials:
             continue
 
         # "(첨부)재무제표" 구간에서 각 재무제표의 제목이 독립 <P>로 나오는 서식
-        # (롯데미쓰이 등). 대기 중 섹션이 없을 때만 감지한다.
-        if in_attach and local_tag == "P" and attach_section is None:
-            sec = _attach_section_of(_text_of(el))
+        # (롯데미쓰이 등). 기본은 대기 중 섹션이 없을 때만 감지한다(기존 동작).
+        if in_attach and local_tag == "P" and (attach_section is None or detect_caption_while_pending):
+            text = _text_of(el)
+            sec = _attach_section_of(text)
             if sec is not None:
                 attach_section = sec
+                if on_section_title is not None:
+                    on_section_title(sec, el)
+            elif detect_caption_while_pending and _attach_other_statement_title(text):
+                attach_section = None  # 자본변동표 등 다른 재무제표에서 구간을 끊는다
             continue
 
-        if local_tag == "TABLE" and section in ("bs", "is") and el.get("ACLASS") == "FINANCE":
-            found_any_table = True
-            _extract_section(el, values_cur, values_prv)
-            section = None  # 구간당 첫 FINANCE 테이블만 사용
+        if local_tag != "TABLE":
+            continue
 
-        elif local_tag == "TABLE" and section == "cf" and el.get("ACLASS") == "FINANCE":
-            # 현금흐름표 4항목(best-effort). found_any_table에는 반영하지 않아
-            # parse_status 판정에 영향을 주지 않는다(§4-8 확정).
-            _extract_section(el, values_cur, values_prv, CF_ACCOUNT_NAME_ALIASES)
-            section = None  # 구간당 첫 FINANCE 테이블만 사용
+        if section in ("bs", "is", "cf") and el.get("ACLASS") == "FINANCE":
+            if visit("finance", section, el):
+                section = None  # 구간당 첫 FINANCE 테이블만 사용
+            continue
 
-        elif local_tag == "TABLE" and in_attach:
-            # "(첨부)재무제표" 구간의 표. 대기 섹션이 없으면 캡션 표(제목 셀)로
-            # 보고 섹션을 잡고, 대기 섹션이 있으면 데이터 표로 보고 추출한다.
+        if not in_attach:
+            continue
+
+        # "(첨부)재무제표" 구간의 표. 대기 섹션이 없으면 캡션 표(제목 셀)로
+        # 보고 섹션을 잡고, 대기 섹션이 있으면 데이터 표로 보고 넘긴다.
+        if attach_section is None or detect_caption_while_pending:
+            caption = _first_cell_text(el)
+            sec = _attach_section_of(caption)
+            if sec is not None:
+                attach_section = sec
+                if on_section_title is not None:
+                    on_section_title(sec, el)
+                continue
+            if detect_caption_while_pending and _attach_other_statement_title(caption):
+                attach_section = None  # 자본변동표 등 다른 재무제표에서 구간을 끊는다
+                continue
             if attach_section is None:
-                sec = _attach_section_of(_first_cell_text(el))
-                if sec is not None:
-                    attach_section = sec
+                continue
+        if visit("attach", attach_section, el):
+            attach_section = None
+
+
+def parse_xml_financials(raw_xml: bytes) -> ParsedFinancials:
+    """감사보고서 원문 XML에서 재무상태표/손익계산서를 파싱해 표준 13항목을 채운다."""
+    # 실측 샘플 30건 중 다수가 본문 텍스트에 "<"/"&"를 이스케이프하지 않은 채
+    # 담고 있어(예: 서술형 문장 속 부등호, 앰퍼샌드) 엄격 모드로는 파싱 자체가
+    # 실패한다. recover=True로 손상된 부분만 건너뛰고 나머지 구조는 그대로
+    # 활용한다 — DART 원문은 표 구조가 앞부분(재무상태표/손익계산서)에 있고
+    # 깨지는 지점은 대개 뒤쪽 서술형 주석이라 실사용에 지장이 없다.
+    # 인코딩을 UTF-8로 먼저 정규화한다(EUC-KR/CP949 원문 복구, _decode_raw_xml 참고).
+    raw_xml = _decode_raw_xml(raw_xml)
+    # 한글 유령 태그("<주석3>" 등)를 제거해 recover 파서가 표 구조를 통째로
+    # 붕괴시키는 것을 막는다(_HANGUL_PSEUDO_TAG_RE 주석 참고). _decode_raw_xml이
+    # UTF-8 bytes를 보장하므로 안전하게 디코딩→치환→재인코딩한다.
+    raw_xml = _HANGUL_PSEUDO_TAG_RE.sub("", raw_xml.decode("utf-8")).encode("utf-8")
+    parser = etree.XMLParser(recover=True)
+    root = etree.fromstring(raw_xml, parser=parser)
+    if root is None:
+        logger.warning("XML 파싱 실패(복구 불가): %s", parser.error_log)
+        return ParsedFinancials(parse_status="FAILED", parse_note=f"XML 구문 오류(복구 불가): {parser.error_log}")
+
+    values_cur: dict[str, float | None] = {}
+    values_prv: dict[str, float | None] = {}
+    found_any_table = False
+
+    def visit(fmt: str, sec: str, table: etree._Element) -> bool:
+        """워커가 넘긴 표 1개를 추출한다(반환값=소비 여부, 워커 독스트링 참고)."""
+        nonlocal found_any_table
+        if fmt == "finance":
+            if sec in ("bs", "is"):
+                found_any_table = True
+                _extract_section(table, values_cur, values_prv)
             else:
-                attach_aliases = (
-                    CF_ACCOUNT_NAME_ALIASES if attach_section == "cf" else ACCOUNT_NAME_ALIASES
-                )
-                before = len(values_cur)
-                _extract_attach_section(el, values_cur, values_prv, attach_aliases)
-                if len(values_cur) > before:
-                    # 실제로 과목이 잡힌 데이터 표만 소비하고 섹션을 리셋한다
-                    # (캡션/기간/각주 표는 매칭 0이라 대기 섹션을 유지해 넘어간다).
-                    # CF는 §4-8 규칙대로 found_any_table에 반영하지 않는다.
-                    if attach_section in ("bs", "is"):
-                        found_any_table = True
-                    attach_section = None
+                # 현금흐름표 4항목(best-effort). found_any_table에는 반영하지 않아
+                # parse_status 판정에 영향을 주지 않는다(§4-8 확정).
+                _extract_section(table, values_cur, values_prv, CF_ACCOUNT_NAME_ALIASES)
+            return True  # 구간당 첫 FINANCE 테이블만 사용
+
+        attach_aliases = CF_ACCOUNT_NAME_ALIASES if sec == "cf" else ACCOUNT_NAME_ALIASES
+        before = len(values_cur)
+        _extract_attach_section(table, values_cur, values_prv, attach_aliases)
+        if len(values_cur) == before:
+            # 캡션/기간/각주 표는 매칭이 0이라 소비하지 않고 대기 섹션을 유지한다.
+            return False
+        # CF는 §4-8 규칙대로 found_any_table에 반영하지 않는다.
+        if sec in ("bs", "is"):
+            found_any_table = True
+        return True
+
+    walk_statement_tables(root, visit)
 
     status, note = determine_parse_status(values_cur, values_prv, found_any_table=found_any_table)
 

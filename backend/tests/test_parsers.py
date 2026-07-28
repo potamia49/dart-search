@@ -14,7 +14,9 @@ from pathlib import Path
 
 import pytest
 
+from app.parsers.account_detail import parse_account_detail
 from app.parsers.audit_opinion import extract_audit_opinion
+from app.parsers.document_sections import extract_section_html
 from app.parsers.base import (
     ACCOUNT_NAME_ALIASES,
     DIRECT_FINANCIAL_FIELDS,
@@ -1023,6 +1025,202 @@ def test_parse_xml_financials_eps_suffix_extra_paren_recovers():
 def test_parse_xml_financials_invalid_xml_returns_failed():
     parsed = parse_xml_financials(b"not xml at all &&&")
     assert parsed.parse_status == "FAILED"
+
+
+# ---------------------------------------------------------------------------
+# document_sections.py / account_detail.py — IFRS "(첨부)재무제표" 서식 인식
+# (2026-07-27, 이래CS 20260401004343 사용자 실측 지적)
+#
+# 파이프라인 파서(xml_parser.py)는 2026-07-22에 이 서식을 지원해 재무이력 표에는
+# 값이 나왔지만, UI 전용 두 모듈이 <TABLE-GROUP><TITLE> + ACLASS="FINANCE" 조합만
+# 인식해 "원문을 찾을 수 없음"/"세부계정 없음"으로 비어 있었다. 세 모듈이 공용
+# 워커(`walk_statement_tables`)로 같은 기준을 쓰게 고친 것을 잠근다.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "rcept_no, section, expected_title_fragment",
+    [
+        # 캡션 <TABLE> 제목 + 연결재무제표 (이래CS — 사용자 실측 신고 케이스)
+        ("20260401004343", "bs", "재 무 상 태 표"),
+        ("20260401004343", "is", "손 익 계 산 서"),
+        ("20260401004343", "cf", "현 금 흐 름 표"),
+        # 독립 <P> 제목 (롯데미쓰이화학)
+        ("20250324000776", "bs", "재 무 상 태 표"),
+        ("20250324000776", "is", "손 익 계 산 서"),
+        ("20250324000776", "cf", "현 금 흐 름 표"),
+        # 캡션 <TABLE> 제목 + THEAD 없는 현금흐름표 (하이에어코리아)
+        ("20240329000968", "bs", "재 무 상 태 표"),
+        ("20240329000968", "cf", "현 금 흐 름 표"),
+        # 적자 문서 / contra 매출원가 문서도 동일하게 열린다.
+        ("20230322000842", "is", "손 익 계 산 서"),
+        ("20230321000531", "bs", "재 무 상 태 표"),
+    ],
+)
+def test_extract_section_html_ifrs_attach_format(rcept_no, section, expected_title_fragment):
+    """IFRS "(첨부)재무제표" 서식 원문도 원문 섹션 열람이 가능해야 한다.
+
+    이 서식은 재무제표별 `<TITLE>`이 없어 기존 경로가 항상 `available=false`를
+    돌려줬다(사용자 화면: "해당 섹션을 원문에서 찾을 수 없습니다"). 제목(<P>/캡션
+    표)이 h4로, 데이터 표가 <table>로 조립돼야 한다.
+    """
+    import re
+
+    found, html = extract_section_html(_read_fixture(rcept_no), section)
+    assert found is True
+    assert expected_title_fragment in html
+    assert '<h4 class="doc-section-title">' in html
+    # 금액 셀(1,234,567 형태)이 실제로 담겨 있어야 한다(빈 표 렌더링 방지).
+    assert len(re.findall(r"[0-9]{1,3}(?:,[0-9]{3})+", html)) > 10
+    assert "<tr></tr>" not in html
+
+
+def test_extract_section_html_finance_format_unchanged():
+    """FINANCE 서식(기존 <TABLE-GROUP><TITLE> 경로)은 무변경이어야 한다 —
+    첨부 서식 분기는 TITLE을 못 찾았을 때만 시도하므로 이 경로에 영향이 없다."""
+    found, html = extract_section_html(_read_fixture("20260630000641"), "bs")
+    assert found is True
+    assert "자산총계" in html.replace(" ", "")
+
+
+def test_extract_section_html_ifrs_attach_stops_at_next_statement():
+    """첨부 서식의 손익계산서 구간은 다음 재무제표(자본변동표)에서 끊겨야 한다 —
+    끊지 않으면 손익계산서 탭에 자본변동표가 통째로 딸려 들어간다(이래CS 실측)."""
+    _, is_html = extract_section_html(_read_fixture("20260401004343"), "is")
+    # 손익계산서 본문 표 + "별첨 주석은..." 부속 표까지 2개만 실린다.
+    assert is_html.count("<table>") == 2
+    # 자본변동표 고유 열("자본금"/"이익잉여금")이 손익계산서 구간에 없어야 한다.
+    assert "자본금" not in is_html
+    assert "이익잉여금" not in is_html
+    # 손익계산서 자체 내용은 그대로 들어 있다.
+    assert "매출원가" in is_html.replace(" ", "")
+
+
+def test_parse_account_detail_ifrs_attach_children_sum_to_summary():
+    """이래CS(rcept 20260401004343) — IFRS "(첨부)연결재무제표" 서식의 세부계정.
+
+    이 서식의 데이터 표는 평범한 `<TD>`라 FINANCE 서식의 `ALEVEL` 속성이 없고
+    하위계정은 선행 공백 4칸으로만 들여쓴다. 들여쓰기 기반 레벨 판정이 맞는지는
+    **children 합계 == 요약 대분류 값** 항등식으로 자체 검증한다(부분값이 과다/
+    과소로 붙으면 즉시 어긋난다). 당기·전기 양쪽에서 성립해야 한다.
+    """
+    raw = _read_fixture("20260401004343")
+    detail = parse_account_detail(raw)
+    summary = parse_xml_financials(raw)
+    assert summary.parse_status == "OK"  # 파이프라인은 원래부터 정상이었다
+
+    assert detail.fiscal_year_cur == "2025"
+    assert detail.audit_opinion == "적정"
+
+    first = detail.accounts["current_assets"][0]
+    assert "현금및현금성자산" in first.label
+    assert first.level == 1
+    assert first.cur == 6_912_252_564
+    assert first.prv == 3_709_701_041
+
+    for field in ("current_assets", "noncurrent_assets", "current_liab", "noncurrent_liab"):
+        rows = detail.accounts[field]
+        assert rows, field
+        assert sum(r.cur for r in rows if r.level == 1) == summary.values_cur[field]
+        assert sum(r.prv for r in rows if r.level == 1) == summary.values_prv[field]
+
+    # 총계 항목은 하위가 형제 대분류라 children이 비어 있다(FINANCE 경로와 동일).
+    assert detail.accounts["total_assets"] == []
+    # 현금흐름표도 같은 경로로 계층이 잡힌다(중첩 레벨 포함).
+    cf_rows = detail.accounts["cf_operating"]
+    assert [r.level for r in cf_rows] == [1, 2, 2, 2, 1]
+    assert cf_rows[0].cur == 34_797_392_667
+
+
+def test_parse_account_detail_ifrs_attach_keeps_natural_sign():
+    """첨부 서식 세부계정의 부호는 `_apply_sign_ifrs`와 같은 규칙 — 손익 항목은
+    원문 부호(괄호=음수)를 그대로 신뢰한다. 파이프라인이 저장한 요약값과 화면의
+    세부계정이 다른 규칙을 쓰면 같은 표 안에서 부호가 엇갈려 보인다."""
+    detail = parse_account_detail(_read_fixture("20260401004343"))
+    rows = {r.label.strip(): r for r in detail.accounts["operating_income"]}
+    assert rows["기타영업수익"].cur == 11_668_219_529  # 수익: 양수 그대로
+    assert rows["기타영업비용"].cur == -10_339_682_121  # 괄호 표기 비용: 음수 유지
+    assert rows["금융비용"].cur == -7_819_285_861
+
+
+def test_parse_account_detail_ifrs_attach_summary_row_is_never_a_child():
+    """요약 필드로 매핑되는 행은 들여쓰기와 무관하게 항상 대분류로 잡아야 한다.
+
+    롯데미쓰이(20250324000776) 손익계산서는 "III. 매출총이익" 다음 줄의
+    "판매비와관리비"를 한 칸 들여써 적는다 — 들여쓰기만 보면 판관비가 매출총이익의
+    하위계정으로 붙어 화면에 엉뚱하게 표시된다."""
+    detail = parse_account_detail(_read_fixture("20250324000776"))
+    assert detail.accounts["gross_profit"] == []
+    assert "sga" in detail.accounts  # 대분류로 인식(하위계정은 원문에 없어 빈 목록)
+    assert [r.label.strip() for r in detail.accounts["operating_income"]] == [
+        "금융수익",
+        "금융비용",
+        "기타수익",
+        "기타비용",
+    ]
+
+
+def test_parse_account_detail_ifrs_attach_uses_numbering_when_no_indent():
+    """들여쓰기가 없는 첨부 서식 표는 번호 접두어를 보조 단서로 써야 한다.
+
+    세아엠앤에스(20230321000531)의 현금흐름표는 대분류("Ⅰ.영업활동으로 인한
+    현금흐름")와 하위계정("1.당기순이익")이 **같은 열에서 시작**해 들여쓰기만으로는
+    계층을 알 수 없다 — 보조 단서가 없으면 cf_* 세부계정이 통째로 비어 화면에서
+    펼치기가 동작하지 않는다. children 합계 == 활동별 소계 항등식으로 자체 검증한다.
+    """
+    raw = _read_fixture("20230321000531")
+    detail = parse_account_detail(raw)
+    summary = parse_xml_financials(raw)
+
+    for field in ("cf_operating", "cf_investing", "cf_financing"):
+        rows = detail.accounts[field]
+        assert rows, field
+        top = min(r.level for r in rows)
+        assert sum(r.cur for r in rows if r.level == top) == summary.values_cur[field]
+
+    labels = [r.label.strip() for r in detail.accounts["cf_operating"]]
+    assert labels[0].endswith("당기순이익")
+    assert len(labels) == 6  # 1~6번 항목 전부
+
+
+def test_parse_account_detail_ifrs_attach_numbering_does_not_invert_levels():
+    """번호 접두어는 **대분류 경계 판정에만** 쓰고 레벨 순위에는 쓰지 않는다.
+
+    한화컴파운드(20250328000629) 현금흐름표는 번호가 붙은 소계
+    ("1. 재무활동으로 인한 현금유입액") 아래에 **번호 없는** 세부 항목("유상증자")을
+    들여써 적는다 — 번호를 깊이 신호로 쓰면 부모가 자식보다 깊게 매겨져 계층이
+    뒤집힌다. 부모는 자식보다 얕아야 한다.
+    """
+    rows = parse_account_detail(_read_fixture("20250328000629")).accounts["cf_financing"]
+    by_label = {r.label.strip(): r for r in rows}
+    parent = by_label["1. 재무활동으로 인한 현금유입액"]
+    child = by_label["유상증자"]
+    assert parent.level < child.level
+
+
+def test_parse_account_detail_ifrs_attach_flat_table_keeps_all_rows():
+    """들여쓰기가 전혀 없는 표에서는 번호 없는 세부 행도 같은 대분류에 이어 붙인다.
+
+    한화컴파운드(20250328000629) 투자활동 구간은 번호 붙은 소계와 번호 없는 세부
+    행이 모두 같은 열에서 시작한다 — 번호 있는 행만 잡으면 "합계가 맞지 않는 일부
+    목록"이 화면에 나온다. 원문 구간의 행이 순서대로 모두 실려야 한다.
+    """
+    rows = parse_account_detail(_read_fixture("20250328000629")).accounts["cf_investing"]
+    labels = [r.label.strip() for r in rows]
+    assert labels[0] == "1. 투자활동으로 인한 현금유입액"
+    assert "단기대여금의 감소" in labels  # 번호 없는 세부 행
+    assert "2. 투자활동으로 인한 현금유출액" in labels  # 뒤따르는 소계도 유실되지 않는다
+    assert len(labels) == 13
+
+
+def test_parse_account_detail_finance_format_unchanged():
+    """FINANCE 서식(ALEVEL 기반 경로)은 무변경 — 공용 워커로 바꾼 뒤에도 동일하게
+    대분류별 children이 나와야 한다(위 §4-8 기존 테스트와 같은 원문)."""
+    detail = parse_account_detail(_read_fixture("20260630000641"))
+    assert len(detail.accounts["current_assets"]) > 5
+    assert all(r.level >= 1 for r in detail.accounts["current_assets"])
+    assert detail.accounts["total_assets"] == []
+    assert detail.accounts["cf_ending_cash"] == []
 
 
 # ---------------------------------------------------------------------------

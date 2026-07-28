@@ -12,6 +12,14 @@ DART document.xml의 실측 구조(backend/tests/fixtures 30건):
 통과시키지 않고(XSS 안전) TABLE/TR/TD/TH/TITLE/P만 화이트리스트로 다시
 조립하며, 모든 텍스트 노드는 이스케이프하고 셀 속성은 COLSPAN/ROWSPAN만
 통과시킨다.
+
+**IFRS "(첨부)재무제표" 서식(2026-07-27 추가)**: 이 서식은 재무제표별 `<TITLE>`이
+아예 없고 "(첨부)재 무 제 표" TITLE 하나 아래에 4개 재무제표가 들어가므로 위
+규칙이 항상 실패한다(로컬 캐시 실측 391건 — 이래CS 20260401004343 등에서 사용자가
+"재무이력에는 값이 있는데 원문보기는 못 찾는다"고 신고). TITLE을 못 찾았을 때에만
+`xml_parser.walk_statement_tables`(파이프라인 파서와 **같은** 서식 인식 로직)로
+제목(<P>/캡션 표)과 데이터 표를 찾아 조립한다 — 인식 기준을 이 파일에 다시
+구현하지 않는 것이 핵심이다(그렇게 갈라져 있던 것을 고친 것이다).
 """
 
 from __future__ import annotations
@@ -20,7 +28,7 @@ from html import escape
 
 from lxml import etree
 
-from app.parsers.xml_parser import _decode_raw_xml
+from app.parsers.xml_parser import _decode_raw_xml, _first_cell_text, walk_statement_tables
 
 # 프론트 탭과 1:1 대응하는 섹션 키 → 원문 TITLE 매칭 문자열(공백 제거 기준).
 #
@@ -100,6 +108,50 @@ def _render_block(el: etree._Element, out: list[str]) -> None:
         _render_block(child, out)
 
 
+# "(첨부)재무제표" 첨부 서식에서 서버가 조립해 줄 수 있는 섹션(재무제표 3종).
+# "주석"/"감사보고서"는 이 서식에서도 독립 <TITLE>로 나오므로 기존 경로가 그대로 처리한다.
+_ATTACH_RENDERABLE_SECTIONS = ("bs", "is", "cf")
+
+
+def _extract_attach_section_html(root: etree._Element, section: str) -> tuple[bool, str]:
+    """IFRS "(첨부)재무제표" 서식 원문에서 `section` 구간을 HTML로 조립한다.
+
+    이 서식은 본문에 "재무상태표"/"손익계산서"/"현금흐름표" `<TITLE>`이 아예 없고
+    "(첨부)재 무 제 표" TITLE 하나 아래에 4개 재무제표가 들어가며, 각 재무제표의
+    제목은 독립 `<P>` 또는 캡션 `<TABLE>`의 첫 셀로 나온다(xml_parser 모듈
+    독스트링 참고). 서식 인식은 파이프라인 파서와 **같은** `walk_statement_tables`
+    에 맡기고, 여기서는 그 워커가 알려주는 제목/표만 렌더링한다 — 인식 기준을
+    여기에 다시 구현하면 서식 확장이 한쪽에만 반영돼 또 갈라진다(2026-07-27).
+
+    표를 "소비"하지 않고(visit이 항상 False) 다음 재무제표 제목이 나올 때까지의
+    표를 모두 모으므로, 데이터 표 뒤의 "별첨 주석은 본 재무제표의 일부입니다"
+    같은 부속 표까지 원문 순서대로 함께 보여준다.
+    """
+    blocks: list[str] = []
+    rendering = False
+
+    def on_section_title(sec: str, el: etree._Element) -> None:
+        nonlocal rendering
+        rendering = sec == section
+        if not rendering:
+            return
+        # 제목은 <P>(텍스트)일 수도 캡션 <TABLE>(첫 셀)일 수도 있다 — 어느 쪽이든
+        # FINANCE 경로의 <TITLE>과 같은 모양(h4)으로 렌더링해 화면을 일관되게 한다.
+        text = _first_cell_text(el) if _local(el) == "TABLE" else _text_of(el)
+        if text:
+            blocks.append(f'<h4 class="doc-section-title">{escape(text)}</h4>')
+
+    def visit(fmt: str, sec: str, table: etree._Element) -> bool:
+        if fmt == "attach" and rendering:
+            _render_block(table, blocks)
+        return False  # 표를 소비하지 않고 다음 제목까지 이어서 모은다
+
+    walk_statement_tables(
+        root, visit, on_section_title=on_section_title, detect_caption_while_pending=True
+    )
+    return bool(blocks), "".join(blocks)
+
+
 def extract_section_html(raw_xml: bytes, section: str) -> tuple[bool, str]:
     """`raw_xml`에서 `section`(bs|is|cf|notes|audit)에 해당하는 구간을 HTML로 잘라 반환.
 
@@ -129,6 +181,11 @@ def extract_section_html(raw_xml: bytes, section: str) -> tuple[bool, str]:
             title_el = el
             break
     if title_el is None:
+        # IFRS "(첨부)재무제표" 서식은 재무제표별 <TITLE>이 없어 위 경로가 항상
+        # 실패한다(로컬 캐시 실측 391건) — 이 경우에만 첨부 서식 경로를 시도한다.
+        # FINANCE 서식(TITLE을 찾은 원문)은 이 분기에 들어오지 않아 무변경이다.
+        if section in _ATTACH_RENDERABLE_SECTIONS:
+            return _extract_attach_section_html(root, section)
         return False, ""
 
     container = parent_map.get(title_el, title_el)

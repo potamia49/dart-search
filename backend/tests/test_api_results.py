@@ -840,6 +840,44 @@ def test_account_detail_returns_non_operating_children(client_with_db, monkeypat
     assert any(row["cur"] is not None for row in expense_rows)
 
 
+def test_document_section_and_account_detail_support_ifrs_attach_format(
+    client_with_db, monkeypatch, tmp_path
+):
+    """IFRS "(첨부)재무제표" 서식 원문(이래CS rcept 20260401004343)도 원문 열람과
+    세부계정 펼치기가 동작해야 한다(2026-07-27 사용자 실측 신고 재현).
+
+    이 서식은 재무제표별 `<TITLE>`이 없고 데이터 표가 ACLASS="NORMAL"이라, 두
+    UI 전용 엔드포인트가 각자 <TABLE-GROUP><TITLE>+FINANCE 조합만 인식하던 동안
+    `document-sections/bs`는 available=false("원문을 찾을 수 없습니다"),
+    `account-detail`은 accounts={}로 비어 있었다 — 정작 파이프라인 파서는 같은
+    원문을 2026-07-22부터 정상 파싱해 재무이력 표에는 값이 보이던 상태였다.
+    """
+    client, factory = client_with_db
+    job_id, result_id = _seed_result_with_rcept(factory, "20260401004343")
+    _point_cache_at_tmp(monkeypatch, tmp_path, "20260401004343", "20260401004343")
+
+    resp = client.get(f"/api/jobs/{job_id}/results/{result_id}/document-sections/bs")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["available"] is True
+    assert body["notice"] is None
+    assert "재 무 상 태 표" in body["html"]
+    assert "자산총계" in body["html"].replace(" ", "")
+
+    resp = client.get(f"/api/jobs/{job_id}/results/{result_id}/account-detail")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["fiscal_year_cur"] == "2025"
+    rows = body["accounts"]["current_assets"]
+    assert len(rows) == 8
+    assert all(row["level"] >= 1 for row in rows)
+    # 세부계정 합계 == 요약 대분류(유동자산) 값 — 계층 판정 자체검증.
+    assert sum(row["cur"] for row in rows) == 141_442_144_183
+    # 감사의견/감사인은 서식과 무관한 별도 로직이라 기존대로 함께 내려간다.
+    assert body["audit_opinion"] == "적정"
+    assert body["auditor_name"]
+
+
 def test_document_section_invalid_section_returns_400(client_with_db, monkeypatch, tmp_path):
     client, factory = client_with_db
     job_id, result_id = _seed_result_with_rcept(factory, "20260630000641")

@@ -337,6 +337,22 @@ _BLANK_AMOUNT_VALUES = {""}
 _ZERO_AMOUNT_VALUES = {"-", "−", "‐", "–"}
 
 
+# 로마숫자 항목번호로 시작하는지 판정용(유니코드/아스키 + 유사문자 오표기 흡수).
+# "(첨부)재무제표" 서식에서 로마숫자 접두어는 **구역(대분류) 행의 표지**라,
+# 들여쓰기가 없는 표에서 세부계정과 구역 행을 가르는 근거로 쓴다
+# (account_detail.py `_collect_attach_table`의 "계속 행" 처리 참고).
+_ROMAN_PREFIX_RE = re.compile(
+    r"^(?:[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ∥]+|"
+    rf"(?:{'|'.join(_ASCII_ROMAN_NUMERALS_ORDERED)}))\s*\."
+)
+
+
+def has_roman_numeral_prefix(label: str) -> bool:
+    """라벨이 로마숫자 항목번호("Ⅳ." / "IV." / 유사문자 "Vl.")로 시작하는가."""
+    text = _normalize_roman_lookalike_prefix((label or "").strip())
+    return _ROMAN_PREFIX_RE.match(text) is not None
+
+
 def normalize_account_label(label: str) -> str:
     """과목명 표기를 정규화해 ACCOUNT_NAME_ALIASES 조회 키로 변환.
 
