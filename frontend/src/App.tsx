@@ -6,6 +6,10 @@ import ResultPage from './pages/ResultPage'
 
 const HEADER_GRADIENT = 'linear-gradient(155deg, #0A192F 0%, #1F4E79 55%, #2C6597 100%)'
 
+// 뷰어 전용 배포 빌드 플래그 — 빌드 시점에 VITE_VIEWER_JOB_ID(예: "27")를 주면 그 Job의
+// 결과조회 화면만 보이는 잠금 빌드가 된다. 값이 없으면(기본 빌드) 기존 동작 그대로다.
+const VIEWER_JOB_ID = import.meta.env.VITE_VIEWER_JOB_ID as string | undefined
+
 function navClass({ isActive }: { isActive: boolean }): string {
   return isActive ? 'brand-nav active' : 'brand-nav'
 }
@@ -43,25 +47,34 @@ function App() {
               </span>
             </div>
           </Group>
-          <Group gap={4} wrap="nowrap">
-            <RouterNavLink to="/search" className={navClass}>
-              검색
-            </RouterNavLink>
-            <RouterNavLink to="/jobs" className={navClass}>
-              작업 현황
-            </RouterNavLink>
-          </Group>
+          {!VIEWER_JOB_ID && (
+            <Group gap={4} wrap="nowrap">
+              <RouterNavLink to="/search" className={navClass}>
+                검색
+              </RouterNavLink>
+              <RouterNavLink to="/jobs" className={navClass}>
+                작업 현황
+              </RouterNavLink>
+            </Group>
+          )}
         </Group>
       </AppShell.Header>
 
       <AppShell.Main>
-        <Routes>
-          <Route path="/" element={<Navigate to="/search" replace />} />
-          <Route path="/search" element={<SearchPage />} />
-          <Route path="/jobs" element={<JobsPage />} />
-          <Route path="/jobs/:id/results" element={<ResultPage />} />
-          <Route path="*" element={<Navigate to="/search" replace />} />
-        </Routes>
+        {VIEWER_JOB_ID ? (
+          <Routes>
+            <Route path="*" element={<Navigate to={`/jobs/${VIEWER_JOB_ID}/results`} replace />} />
+            <Route path="/jobs/:id/results" element={<ResultPage viewerOnly />} />
+          </Routes>
+        ) : (
+          <Routes>
+            <Route path="/" element={<Navigate to="/search" replace />} />
+            <Route path="/search" element={<SearchPage />} />
+            <Route path="/jobs" element={<JobsPage />} />
+            <Route path="/jobs/:id/results" element={<ResultPage />} />
+            <Route path="*" element={<Navigate to="/search" replace />} />
+          </Routes>
+        )}
       </AppShell.Main>
 
       <AppShell.Footer

@@ -162,8 +162,11 @@ function AuditorChangedCell({ value, label }: { value: number | null; label: str
 }
 
 /** phase='FINANCIALS'(Phase 2 완료/진행) Job의 "확정 결과" 뷰 — M2~M4 시점과 동일한
- * 결과 테이블/필터 탭/컬럼 토글/상세 Drawer/다운로드. §4-7-2로 "총자산 제외" 탭만 추가됐다. */
-function FinancialsResultsView({ jobId }: { jobId: number }) {
+ * 결과 테이블/필터 탭/컬럼 토글/상세 Drawer/다운로드. §4-7-2로 "총자산 제외" 탭만 추가됐다.
+ * `viewerOnly`는 뷰어 전용 배포 빌드(App.tsx VIEWER_JOB_ID)에서 true로 내려와 다운로드
+ * 관련 UI(상단 Excel/CSV 버튼, 선택 체크박스 열, 선택 항목 다운로드)를 통째로 숨긴다 —
+ * 조회·필터·정렬·상세보기는 그대로 동작한다. */
+function FinancialsResultsView({ jobId, viewerOnly = false }: { jobId: number; viewerOnly?: boolean }) {
   const [tab, setTab] = useState<FilterTab>('ALL')
   const [page, setPage] = useState(1)
   const [data, setData] = useState<ResultListResponse | null>(null)
@@ -446,12 +449,16 @@ function FinancialsResultsView({ jobId }: { jobId: number }) {
             onToggle={toggleColumn}
             forcedVisibleKeys={forcedVisibleKeys}
           />
-          <Button variant="default" loading={exporting} onClick={() => handleExport('xlsx')}>
-            Excel 다운로드
-          </Button>
-          <Button variant="default" loading={exporting} onClick={() => handleExport('csv')}>
-            CSV 다운로드
-          </Button>
+          {!viewerOnly && (
+            <>
+              <Button variant="default" loading={exporting} onClick={() => handleExport('xlsx')}>
+                Excel 다운로드
+              </Button>
+              <Button variant="default" loading={exporting} onClick={() => handleExport('csv')}>
+                CSV 다운로드
+              </Button>
+            </>
+          )}
         </Group>
       </Group>
 
@@ -496,8 +503,10 @@ function FinancialsResultsView({ jobId }: { jobId: number }) {
       )}
 
       {/* §4-11 선택 항목 다운로드 표시줄 — 선택 0건이면 통째로 숨긴다. 페이지 로딩
-          중에도 선택은 유지되므로 테이블 바깥(로딩 조건 밖)에 둔다. */}
-      {selectedIds.size > 0 && (
+          중에도 선택은 유지되므로 테이블 바깥(로딩 조건 밖)에 둔다. 뷰어 전용 빌드는
+          다운로드 자체가 목적이 없는 체크박스 열(아래)을 렌더링하지 않으므로 선택이
+          쌓일 일이 없다 — 그래도 방어적으로 이 표시줄도 함께 숨긴다. */}
+      {!viewerOnly && selectedIds.size > 0 && (
         <Paper withBorder p="xs" bg="var(--mantine-color-blue-0)">
           <Group justify="space-between">
             <Group gap="xs">
@@ -628,17 +637,20 @@ function FinancialsResultsView({ jobId }: { jobId: number }) {
               <Table.Thead>
                 <Table.Tr>
                   {/* §4-11 선택 열 — 헤더 체크박스는 현재 페이지 행만 전체선택/해제한다.
-                      가로 스크롤 중에도 왼쪽에 고정되도록 result-select-header가 sticky를 건다. */}
-                  <Table.Th w={40} className="result-select-header">
-                    <Checkbox
-                      size="sm"
-                      aria-label="현재 페이지 전체 선택"
-                      checked={allPageSelected}
-                      indeterminate={selectedOnPage > 0 && !allPageSelected}
-                      disabled={pageRows.length === 0}
-                      onChange={(event) => togglePageSelected(event.currentTarget.checked)}
-                    />
-                  </Table.Th>
+                      가로 스크롤 중에도 왼쪽에 고정되도록 result-select-header가 sticky를 건다.
+                      뷰어 전용 빌드는 다운로드가 없어 선택 자체가 무의미하므로 열을 통째로 뺀다. */}
+                  {!viewerOnly && (
+                    <Table.Th w={40} className="result-select-header">
+                      <Checkbox
+                        size="sm"
+                        aria-label="현재 페이지 전체 선택"
+                        checked={allPageSelected}
+                        indeterminate={selectedOnPage > 0 && !allPageSelected}
+                        disabled={pageRows.length === 0}
+                        onChange={(event) => togglePageSelected(event.currentTarget.checked)}
+                      />
+                    </Table.Th>
+                  )}
                   {visibleColumns.map((col) => {
                     const key = sortKeyOf(col)
                     const sortIndex = key === null ? -1 : sorts.findIndex((s) => s.key === key)
@@ -683,16 +695,18 @@ function FinancialsResultsView({ jobId }: { jobId: number }) {
                     onClick={() => setSelected(row)}
                   >
                     {/* 체크박스 클릭이 행 클릭(상세 Drawer 열기)으로 번지지 않게 막는다. */}
-                    <Table.Td className="result-select-cell" onClick={(event) => event.stopPropagation()}>
-                      <Checkbox
-                        size="sm"
-                        aria-label={`${row.corp_name ?? `결과 #${row.id}`} 선택`}
-                        checked={selectedIds.has(row.id)}
-                        onChange={(event) =>
-                          toggleRowSelected(row.id, event.currentTarget.checked)
-                        }
-                      />
-                    </Table.Td>
+                    {!viewerOnly && (
+                      <Table.Td className="result-select-cell" onClick={(event) => event.stopPropagation()}>
+                        <Checkbox
+                          size="sm"
+                          aria-label={`${row.corp_name ?? `결과 #${row.id}`} 선택`}
+                          checked={selectedIds.has(row.id)}
+                          onChange={(event) =>
+                            toggleRowSelected(row.id, event.currentTarget.checked)
+                          }
+                        />
+                      </Table.Td>
+                    )}
                     {visibleColumns.map((col) => (
                       <Table.Td key={col.key}>
                         {col.key === 'auditor_changed' ? (
@@ -724,7 +738,7 @@ function FinancialsResultsView({ jobId }: { jobId: number }) {
   )
 }
 
-export default function ResultPage() {
+export default function ResultPage({ viewerOnly = false }: { viewerOnly?: boolean }) {
   const { id } = useParams<{ id: string }>()
   const jobId = Number(id)
 
@@ -754,7 +768,9 @@ export default function ResultPage() {
       {!job && !jobError && <Loader />}
 
       {job && job.phase === 'CANDIDATES' && <CandidatesView job={job} />}
-      {job && job.phase === 'FINANCIALS' && <FinancialsResultsView jobId={jobId} />}
+      {job && job.phase === 'FINANCIALS' && (
+        <FinancialsResultsView jobId={jobId} viewerOnly={viewerOnly} />
+      )}
     </Stack>
   )
 }
