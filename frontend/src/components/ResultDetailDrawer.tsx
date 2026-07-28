@@ -319,7 +319,7 @@ function FinancialHistorySection({
                     </Tooltip>
                   )}
                   {snap.rcept_no && !snap.from_current_period && (
-                    <Text size="10px" c="dimmed">전기 기준</Text>
+                    <Text size="10px" c="dimmed">{Number(snap.fiscal_year) + 1}년 보고서 전기 금액입니다.</Text>
                   )}
                 </Stack>
               </Table.Th>
