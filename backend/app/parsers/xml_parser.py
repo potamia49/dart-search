@@ -307,32 +307,75 @@ def _classify_period(text: str) -> str | None:
     return None
 
 
+# 열 제목을 "당기"/"전기"가 아니라 **회계 차수**로만 적는 서식(2026-07-28 실측).
+# 예: 재무상태표 THEAD `<TH COLSPAN="2">제6기 기말</TH>` / `<TH COLSPAN="2">제5기
+# 기말</TH>`, 손익계산서 `<TH>제 6 기</TH>` / `<TH>제 5 기</TH>` (합천수상태양광
+# 20260331004483). 이런 표는 "당기"/"전기" 단서가 헤더에 전혀 없어 `_classify_period`
+# 만으로는 열 계획이 서지 않았고, 그 결과 재무상태표/손익계산서를 통째로 못 찾은
+# 것으로 처리돼 PARTIAL로 떨어졌다(같은 문서의 주석 표에는 "당기"/"전기"가
+# 정상적으로 쓰인다 — 본문 3표만 차수 표기를 쓰는 서식이다).
+#
+# 로컬 문서 캐시 8,748건 전수 스캔 실측: "(첨부)재무제표" 서식 462건 중 **63건**
+# (표 기준 184개)이 이 표기를 쓴다. 184개 표 전부 큰 차수(당기)가 먼저 나오는
+# 내림차순이었고 오름차순/동일 차수는 0건이었다. 그럼에도 판정은 **차수 숫자 크기가
+# 아니라 등장 순서**로 한다 — 숫자 크기로 판정하면 서식이나 회계연도 표기 방식이
+# 달라질 때 옳고 그름이 조용히 뒤집힐 수 있기 때문이다(첫 번째 차수 열=당기,
+# 두 번째=전기, 그 뒤 열은 무시).
+#
+# "제 9(당) 기말" / "제 8(당) 기말"처럼 **전기 열에도 "(당)"이 잘못 붙은** 원문
+# 3건(20240329003157/20250331003688/20250409002265)도 이 폴백이 흡수한다 —
+# 명시 표기만 보면 두 열 모두 당기가 돼 열 계획이 서지 않던 사례다.
+_ORDINAL_PERIOD_RE = re.compile(r"제\d+(?:\([당전]\))?기")
+_ORDINAL_COMPACT = str.maketrans({" ": None, "　": None, "\n": None, "\r": None, "\t": None})
+
+
+def _is_ordinal_period(text: str) -> bool:
+    """헤더 셀 텍스트가 "제N기"/"제N기 기말" 같은 차수 기반 기간 제목인지 판정."""
+    return bool(_ORDINAL_PERIOD_RE.search(text.translate(_ORDINAL_COMPACT)))
+
+
 def _build_period_column_plan(header_cells: list[etree._Element]) -> tuple[list[int], list[int]] | None:
     """헤더 행의 셀들을 COLSPAN을 누적하며 순회해 당기/전기 열 인덱스를 계산.
 
     "(첨부)재무제표" 데이터 표는 "과목 | 주석 | 당기 | 전기" 구조라 값 사이에
     "주석" 열이 끼어 있고, 당기/전기가 각각 상세/합계 2열(COLSPAN=2)일 수도
     있다. 헤더 셀의 "(당)"/"(전)" 표기로 각 열을 분류해 라벨/주석 열은 건너뛰고
-    당기·전기 값 열의 (본문 셀) 인덱스 목록만 돌려준다. 당기·전기 열을 둘 다
-    찾지 못하면 None(이 표는 재무제표 데이터 표가 아님)."""
+    당기·전기 값 열의 (본문 셀) 인덱스 목록만 돌려준다.
+
+    명시 표기로 당기·전기를 **둘 다** 잡지 못했을 때만, 차수 기반 표기
+    ("제6기 기말"/"제 6 기", `_ORDINAL_PERIOD_RE` 주석 참고)로 등장 순서에 따라
+    첫 번째 차수 열=당기 / 두 번째=전기로 폴백한다. 명시 표기가 성립하는 기존
+    표들은 이 폴백에 도달하지 않아 동작이 그대로다.
+
+    둘 다 끝내 찾지 못하면 None(이 표는 재무제표 데이터 표가 아님)."""
     col = 0
     cur: list[int] = []
     prv: list[int] = []
+    ordinals: list[tuple[int, int]] = []  # 차수 기반 헤더 셀의 (시작 열, 열 수)
     for cell in header_cells:
         raw_span = cell.get("COLSPAN", "1") or "1"
         try:
             span = int(raw_span)
         except ValueError:
             span = 1
-        role = _classify_period(_text_of(cell))
+        text = _text_of(cell)
+        role = _classify_period(text)
         for c in range(col, col + span):
             if role == "cur":
                 cur.append(c)
             elif role == "prv":
                 prv.append(c)
+        if _is_ordinal_period(text):
+            ordinals.append((col, span))
         col += span
     if cur and prv:
         return cur, prv
+    if len(ordinals) >= 2:
+        (cur_col, cur_span), (prv_col, prv_span) = ordinals[0], ordinals[1]
+        return (
+            list(range(cur_col, cur_col + cur_span)),
+            list(range(prv_col, prv_col + prv_span)),
+        )
     return None
 
 
