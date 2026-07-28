@@ -31,7 +31,11 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.core.db import get_db
 from app.core.pipeline import auditor_change_flags
-from app.exporters.excel import export_results, export_results_with_history
+from app.exporters.excel import (
+    export_results,
+    export_results_with_history,
+    export_selection_results,
+)
 from app.models.financial_snapshot import FinancialSnapshot
 from app.models.job import Job, JobPhase
 from app.models.result import Result
@@ -458,6 +462,12 @@ async def export_job_results(
     - `include_history`: true면 `financial_snapshots`(회사×회계연도)를 담은
       `financial_history` 시트를 추가한 **2시트 xlsx**로 응답한다. csv는 다중
       시트를 표현할 수 없으므로 `format=csv`와 함께 오면 400이다.
+
+    **컬럼 구성(2026-07-28 변경)**: `ids`가 지정된 선택 다운로드의 기본정보는
+    기본정보 15컬럼 + "계정과목명"/"금액" + "파싱상태" **long 포맷**(회사 1건 =
+    당기 계정과목 19행, 값이 없는 계정과목도 금액만 비운 행으로 남는다)이다.
+    `ids` 없는 필터 전체 내보내기는 `include_history` 여부와 **무관하게** 기존
+    wide 포맷(당기/전기 한 행) 그대로다 — 포맷을 가르는 기준은 `ids` 유무 하나뿐이다.
     """
     if format not in _EXPORT_CONTENT_TYPES:
         raise HTTPException(
@@ -509,6 +519,12 @@ async def export_job_results(
         sort_specs = _resolve_sort_specs(sort, sort_by, sort_dir)
         rows = db.execute(_apply_sort(stmt, sort_specs)).scalars().all()
 
+    # 기본정보 시트/파일의 컬럼 구성은 **오직 `ids` 유무**로 갈린다 — 선택
+    # 다운로드는 회사 × 계정과목 long 포맷, 필터 전체 내보내기는 기존 wide 포맷이다
+    # (`include_history`는 `financial_history` 시트를 덧붙일 뿐 포맷에 관여하지
+    # 않는다, dart-qa 2026-07-28 리뷰 반영).
+    use_selection_format = selected_ids is not None
+
     if include_history:
         result_ids = [r.id for r in rows]
         snapshots = (
@@ -525,11 +541,20 @@ async def export_job_results(
             else []
         )
         content = export_results_with_history(
-            rows, snapshots, {r.id: r.corp_name for r in rows}
+            rows,
+            snapshots,
+            {r.id: r.corp_name for r in rows},
+            use_selection_format=use_selection_format,
         )
+    elif use_selection_format:
+        content = export_selection_results(rows, format)
     else:
         content = export_results(rows, format)
 
+    # 주의: 프론트엔드(`frontend/src/api/results.ts`)가 이 `_selected` 접미어 유무로
+    # 서버가 `ids`를 지원하는지(구버전 여부)를 판정하는 fail-safe 근거로 쓴다 —
+    # 이 문자열을 바꾸면 프론트가 모든 선택 다운로드를 "서버 구버전"으로 오판해
+    # 차단한다(양방향 잠금: tests/test_api_results.py의 `_selected` 접미어 테스트).
     suffix = "_selected" if selected_ids is not None else ""
     suffix += "_with_history" if include_history else ""
     filename = f"dart_search_job{job_id}_results{suffix}.{format}"

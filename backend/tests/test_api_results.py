@@ -18,6 +18,7 @@ from sqlalchemy.pool import StaticPool
 
 from app import main as app_main
 from app.core.db import get_db
+from app.exporters.excel import RESULT_COLUMN_LABELS
 from app.models import Base
 from app.models.financial_snapshot import FinancialSnapshot
 from app.models.job import Job, JobStatus
@@ -508,6 +509,118 @@ def test_export_ids_selects_only_given_rows_and_ignores_other_filters(client_wit
     assert "㈜성공테스트" not in text
 
 
+def test_export_ids_uses_long_account_format(client_with_db):
+    """선택 다운로드는 회사 1건이 당기 계정과목 19행으로 풀리는 long 포맷이다
+    (2026-07-28). 값이 없는 계정과목도 금액만 빈 채로 행이 남는다."""
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+    ok_id = _get_result_id(factory, job_id, "00100001")
+
+    resp = client.get(
+        f"/api/jobs/{job_id}/export", params={"format": "xlsx", "ids": str(ok_id)}
+    )
+    assert resp.status_code == 200
+    wb = openpyxl.load_workbook(io.BytesIO(resp.content))
+    ws = wb["results"]
+    header = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
+
+    assert header == [
+        "결과ID",
+        "Job ID",
+        "고유번호",
+        "접수번호",
+        "회사명",
+        "주소",
+        "전화번호(미수집)",
+        "대표자명",
+        "업종코드",
+        "업종명",
+        "결산기준일",
+        "감사의견",
+        "감사인",
+        "감사인주소",
+        "감사인변동여부",
+        "계정과목명",
+        "금액",
+        "파싱상태",  # 계정과목명/금액보다도 뒤, 맨 마지막 컬럼(2026-07-28 사용자 확정)
+    ]
+    assert ws.max_row == 20  # 헤더 + 계정과목 19행
+
+    account_col, amount_col = header.index("계정과목명") + 1, header.index("금액") + 1
+    amounts = {
+        ws.cell(row=r, column=account_col).value: ws.cell(row=r, column=amount_col).value
+        for r in range(2, 21)
+    }
+    assert len(amounts) == 19
+    assert amounts["매출액"] == 10_000_000_000
+    assert amounts["자산총계"] is None  # 결측도 행은 남고 금액만 빈 값
+    assert "매출액(전기)" not in amounts  # 전기 항목은 싣지 않는다
+    # 기본정보는 모든 계정과목 행에 반복된다(파싱상태 포함).
+    corp_col = header.index("회사명") + 1
+    status_col = header.index("파싱상태") + 1
+    assert {ws.cell(row=r, column=corp_col).value for r in range(2, 21)} == {"㈜성공테스트"}
+    assert {ws.cell(row=r, column=status_col).value for r in range(2, 21)} == {"OK"}
+
+
+def test_export_ids_csv_uses_long_account_format(client_with_db):
+    """CSV(기본정보만) 선택 다운로드도 같은 long 포맷을 쓴다."""
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+    ok_id = _get_result_id(factory, job_id, "00100001")
+
+    resp = client.get(
+        f"/api/jobs/{job_id}/export", params={"format": "csv", "ids": str(ok_id)}
+    )
+    assert resp.status_code == 200
+    lines = resp.content.decode("utf-8-sig").splitlines()
+    assert lines[0].endswith("계정과목명,금액,파싱상태")
+    assert len(lines) == 20
+    assert any(line.endswith("매출액,10000000000,OK") for line in lines[1:])
+
+
+@pytest.mark.parametrize("format", ["xlsx", "csv"])
+def test_export_ids_filename_has_selected_suffix(client_with_db, format):
+    """`ids`를 준 선택 다운로드의 파일명에는 반드시 `_selected`가 들어간다.
+
+    프론트엔드(`frontend/src/api/results.ts::exportResults`)가 이 접미어 유무를
+    **하드 fail-safe 조건**으로 쓴다 — `ids`를 보냈는데 응답 파일명에 `_selected`가
+    없으면 "서버가 구버전이라 ids를 무시하고 전체를 내려줬다"로 보고 저장을 막는다.
+    따라서 이 문자열을 바꾸면 프론트의 모든 선택 다운로드가 차단되므로, 반대
+    방향(`ids` 없으면 접미어 없음, `test_export_without_new_params_is_unchanged`)과
+    함께 양방향으로 잠가 둔다(dart-design-review 2026-07-28).
+    """
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+    ok_id = _get_result_id(factory, job_id, "00100001")
+
+    resp = client.get(
+        f"/api/jobs/{job_id}/export", params={"format": format, "ids": str(ok_id)}
+    )
+    assert resp.status_code == 200
+    assert "_selected" in resp.headers["content-disposition"]
+
+    # 빈 선택(0건)도 `ids`를 인식한 응답이므로 접미어가 있어야 한다 —
+    # 없으면 프론트가 "구버전 서버"로 오판한다.
+    resp = client.get(f"/api/jobs/{job_id}/export", params={"format": format, "ids": ""})
+    assert resp.status_code == 200
+    assert "_selected" in resp.headers["content-disposition"]
+
+
+def test_export_ids_with_history_filename_has_both_suffixes(client_with_db):
+    """`include_history`가 붙어도 `_selected`가 사라지면 안 된다(프론트 가드 근거)."""
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+    ok_id = _get_result_id(factory, job_id, "00100001")
+
+    resp = client.get(
+        f"/api/jobs/{job_id}/export",
+        params={"format": "xlsx", "ids": str(ok_id), "include_history": "true"},
+    )
+    assert resp.status_code == 200
+    disposition = resp.headers["content-disposition"]
+    assert "_selected" in disposition and "_with_history" in disposition
+
+
 def test_export_ids_rejects_result_from_another_job(client_with_db):
     client, factory = client_with_db
     job_id = _seed_job_with_results(factory)
@@ -624,8 +737,10 @@ def test_export_include_history_writes_two_sheets_with_joined_corp_name(client_w
     assert wb.sheetnames == ["results", "financial_history"]
 
     ws_results = wb["results"]
-    assert ws_results.max_row == 2  # 헤더 + 선택한 1개사
+    # 기본정보 시트는 long 포맷 — 헤더 + 선택한 1개사 × 계정과목 19행(2026-07-28).
+    assert ws_results.max_row == 20
     results_header = [c.value for c in next(ws_results.iter_rows(min_row=1, max_row=1))]
+    assert results_header[-3:] == ["계정과목명", "금액", "파싱상태"]
     corp_col = results_header.index("회사명") + 1
     assert ws_results.cell(row=2, column=corp_col).value == "㈜성공테스트"
 
@@ -649,7 +764,11 @@ def test_export_include_history_writes_two_sheets_with_joined_corp_name(client_w
 
 
 def test_export_include_history_without_ids_covers_filtered_rows(client_with_db):
-    """`include_history`는 `ids` 없이(=필터 기준 전체) 써도 동작한다."""
+    """`include_history`는 `ids` 없이(=필터 기준 전체) 써도 동작한다.
+
+    이때 기본정보 시트는 **기존 wide 포맷 그대로**여야 한다 — 포맷을 가르는 기준은
+    `ids` 유무 하나뿐이고 `include_history`는 관여하지 않는다(dart-qa 2026-07-28).
+    """
     client, factory = client_with_db
     job_id = _seed_job_with_results(factory)
     ok_id = _get_result_id(factory, job_id, "00100001")
@@ -671,7 +790,11 @@ def test_export_include_history_without_ids_covers_filtered_rows(client_with_db)
     )
     assert resp.status_code == 200
     wb = openpyxl.load_workbook(io.BytesIO(resp.content))
-    assert wb["results"].max_row == 2  # OK 필터 통과 1개사
+    # `ids`가 없으므로 기본정보 시트는 wide 포맷(OK 필터 통과 1개사 = 1행 + 헤더).
+    assert wb["results"].max_row == 2
+    header = [c.value for c in next(wb["results"].iter_rows(min_row=1, max_row=1))]
+    assert header == list(RESULT_COLUMN_LABELS.values())
+    assert "매출액(전기)" in header and "계정과목명" not in header
     assert wb["financial_history"].max_row == 2
 
 
@@ -685,6 +808,10 @@ def test_export_without_new_params_is_unchanged(client_with_db):
     wb = openpyxl.load_workbook(io.BytesIO(resp.content))
     assert wb.sheetnames == ["results"]
     assert wb["results"].max_row == 3
+    # 필터 전체 내보내기는 기존 wide 포맷 그대로다(선택 다운로드 long 포맷 아님).
+    header = [c.value for c in next(wb["results"].iter_rows(min_row=1, max_row=1))]
+    assert "매출액(당기)" in header and "매출액(전기)" in header
+    assert "계정과목명" not in header
     assert "dart_search_job" in resp.headers["content-disposition"]
     assert "_selected" not in resp.headers["content-disposition"]
 

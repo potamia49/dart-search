@@ -58,6 +58,32 @@ export interface ExportResultsOptions {
   includeHistory?: boolean
 }
 
+/** 선택 항목 다운로드를 요청했는데 **서버가 `ids`를 무시하고 전체 결과를 내려준** 경우.
+ *
+ * `ids`/`include_history`는 2026-07-28에 추가된 파라미터라, 그 이전 코드로 떠 있는
+ * 백엔드(예: 며칠째 재시작 없이 살아 있는 uvicorn, 구버전 배포 exe)에 요청하면
+ * FastAPI가 **모르는 쿼리 파라미터를 조용히 무시**하고 200 + 전체 결과 파일을 준다 —
+ * 사용자 눈에는 "체크하지 않은 회사까지 다운로드됨"으로 보인다(2026-07-28 실측 재현).
+ * 이 경우 파일을 저장하지 않고 이 에러를 던져 호출부가 원인을 안내하게 한다. */
+export class SelectionExportUnsupportedError extends Error {
+  constructor() {
+    super('서버가 선택 항목 다운로드(ids)를 지원하지 않습니다.')
+    this.name = 'SelectionExportUnsupportedError'
+  }
+}
+
+/** 선택 항목 다운로드를 요청했는데 **응답의 `Content-Disposition` 헤더 자체를 읽지 못한** 경우.
+ *
+ * 위 `SelectionExportUnsupportedError`와 달리 "서버가 구버전"이라고 단정할 수 없는 상황이다 —
+ * 파일명을 못 읽으니 서버가 `ids`를 처리했는지 확인할 방법이 없을 뿐이다. 저장하면 전체 파일을
+ * 선택 파일로 오인할 수 있으므로 똑같이 중단하되, 원인 안내는 다르게 한다. */
+export class SelectionExportUnverifiableError extends Error {
+  constructor() {
+    super('다운로드 응답 정보를 읽지 못해 선택 항목 다운로드를 확인할 수 없습니다.')
+    this.name = 'SelectionExportUnverifiableError'
+  }
+}
+
 /** 현재 필터를 그대로 export 쿼리에 반영해 파일을 내려받는다 (blob 다운로드).
  * `options.ids`를 넘기면 필터 대신 그 결과들만 받는 선택 다운로드가 된다(§4-11). */
 export async function exportResults(
@@ -77,9 +103,27 @@ export async function exportResults(
     responseType: 'blob',
   })
 
+  // `apiClient`는 상대 경로(`/api`)를 쓰는 동일 출처 요청이라 `Content-Disposition`이
+  // 브라우저에 그대로 노출된다(교차 출처였다면 `Access-Control-Expose-Headers` 없이는
+  // 이 헤더를 못 읽는다). 그래도 사내 프록시가 헤더를 떼는 드문 경우가 있어, 아래에서
+  // "헤더 없음"과 "구버전 서버"를 구분해 처리한다.
   const disposition = response.headers['content-disposition'] as string | undefined
   const filenameMatch = disposition?.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i)
   const filename = filenameMatch ? decodeURIComponent(filenameMatch[1]) : `job_${jobId}_results.${format}`
+
+  // 선택 다운로드는 **서버가 실제로 `ids`를 처리했는지 확인한 뒤에만** 저장한다.
+  // 백엔드는 `ids`를 인식한 경우에만 파일명에 `_selected`를 붙이므로(§4-11,
+  // `results.py::export_job_results`), 그 표식이 없으면 필터 기반 전체 내보내기가
+  // 돌아온 것이다 — 저장해 버리면 "체크 안 한 회사까지 들어 있는 파일"이 된다.
+  if (options.ids) {
+    if (!filenameMatch) {
+      // 파일명 자체를 못 읽었다 — 서버 버전 문제로 단정하지 말고 별도로 안내한다.
+      throw new SelectionExportUnverifiableError()
+    }
+    if (!filename.includes('_selected')) {
+      throw new SelectionExportUnsupportedError()
+    }
+  }
 
   const blobUrl = window.URL.createObjectURL(response.data as Blob)
   const link = document.createElement('a')

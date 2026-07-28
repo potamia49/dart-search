@@ -14,6 +14,18 @@ DB 컬럼명(영문)은 `app/models/result.py`(§5 스키마)를 그대로 유�
 쓰는 `export_results_with_history()`를 더했다. 기존 `RESULT_COLUMN_LABELS`/
 `results_to_dataframe()`/`export_results()`는 **무변경**이고 전체 내보내기 동작도
 그대로다 — 새 딕셔너리/함수를 옆에 추가했을 뿐이다.
+
+2026-07-28 후속(§4-11): **선택 다운로드의 기본정보 표만** 계정과목을 세로로 푸는
+long 포맷(`SELECTION_EXPORT_COLUMN_LABELS`/`results_to_selection_dataframe()`/
+`export_selection_results()`)으로 교체했다. 필터 전체 내보내기(`ids` 없는 요청)는
+여전히 기존 wide 포맷(`RESULT_COLUMN_LABELS`/`export_results()`)을 쓴다 — 두 경로가
+쓰는 함수가 아예 갈라져 있다.
+
+포맷을 가르는 기준은 **`ids` 유무 하나뿐이다**(dart-qa 2026-07-28 리뷰 반영) —
+`include_history`는 어느 포맷을 쓸지에 관여하지 않는다. `ids` 없이
+`include_history=true`만 온 요청(필터 전체 + 재무이력)의 기본정보 시트는 wide다.
+그래서 `export_results_with_history()`가 `use_selection_format` 인자를 받아
+호출부(`export_job_results()`)가 넘긴 `selected_ids is not None`을 그대로 따른다.
 """
 
 from __future__ import annotations
@@ -141,6 +153,145 @@ def export_results(results: Sequence[Result], fmt: Literal["xlsx", "csv"]) -> by
 
 
 # ---------------------------------------------------------------------------
+# 다중 선택 다운로드(§4-11, M9) — 기본정보 long 포맷 (2026-07-28)
+# ---------------------------------------------------------------------------
+#
+# 선택 다운로드(`ids` 지정)에서만 쓰는 컬럼 구성이다. 기본정보 컬럼은
+# `RESULT_COLUMN_LABELS`와 **완전히 같은 필드·라벨**을 재사용하고, 그 뒤에
+# 재무 항목을 "계정과목명/금액" 2컬럼으로 세로로 푼다(회사 1건 = 계정과목 수만큼의
+# 행). 전기(`_prv`) 값은 싣지 않는다 — 사용자 확정 사항("전기 항목은 전년도 당기
+# 항목이니깐"). 전기 포함 다년치가 필요하면 `include_history=true`의
+# `financial_history` 시트를 쓴다.
+#
+# 필터 전체 내보내기(`ids` 없는 요청)는 이 포맷을 쓰지 않는다 — `include_history`
+# 유무와 무관하게 기존 wide 포맷(`RESULT_COLUMN_LABELS`/`export_results()`)이다.
+
+# long 포맷에서 각 행마다 반복되는 기본정보 필드. 앞 15개는 `RESULT_COLUMN_LABELS`의
+# 앞 15개(필드·라벨·순서 동일)이고, `parse_status`는 사용자 확정(2026-07-28)에 따라
+# **계정과목명/금액보다도 뒤**, 즉 최종 컬럼 순서의 맨 마지막에 놓는다 — 그 배치는
+# 아래 `SELECTION_TRAILING_COLUMNS`가 담당한다(여기서는 "행마다 반복되는 필드"라는
+# 의미만 갖는다).
+SELECTION_BASE_COLUMNS: list[str] = [
+    "id",
+    "job_id",
+    "corp_code",
+    "rcept_no",
+    "corp_name",
+    "address",
+    "phone",
+    "ceo_name",
+    "induty_code",
+    "induty_name",
+    "fiscal_date",
+    "audit_opinion",
+    "auditor_name",
+    "auditor_address",
+    "auditor_changed",
+    "parse_status",
+]
+
+# 위 기본정보 필드 중 "계정과목명/금액" **뒤**에 배치할 것(2026-07-28, 사용자 확정).
+SELECTION_TRAILING_COLUMNS: list[str] = ["parse_status"]
+
+# 세로로 풀 당기(`_cur`) 재무 항목 19개. 순서가 곧 한 회사 안의 행 순서다
+# (재무상태표 → 손익계산서 → 현금흐름표 → 영업외손익, `RESULT_COLUMN_LABELS`와
+# 동일한 배열 순서).
+SELECTION_ACCOUNT_COLUMNS: list[str] = [
+    "current_assets_cur",
+    "noncurrent_assets_cur",
+    "total_assets_cur",
+    "current_liab_cur",
+    "noncurrent_liab_cur",
+    "total_liab_cur",
+    "total_equity_cur",
+    "revenue_cur",
+    "cogs_cur",
+    "gross_profit_cur",
+    "sga_cur",
+    "operating_income_cur",
+    "net_income_cur",
+    "cf_operating_cur",
+    "cf_investing_cur",
+    "cf_financing_cur",
+    "cf_ending_cash_cur",
+    "non_operating_income_cur",
+    "non_operating_expense_cur",
+]
+
+# 계정과목명은 새로 짓지 않고 기존 wide 포맷 라벨에서 "(당기)" 접미어만 뗀다
+# (예: "매출액(당기)" → "매출액"). 라벨이 두 곳에서 어긋날 여지를 없애기 위함.
+SELECTION_ACCOUNT_LABELS: dict[str, str] = {
+    col: RESULT_COLUMN_LABELS[col].removesuffix("(당기)") for col in SELECTION_ACCOUNT_COLUMNS
+}
+
+# DB 필드명(가상 필드 `account_name`/`amount` 포함) -> 한국어 헤더. dict 순서가 곧
+# 파일의 컬럼 순서다 — `SELECTION_TRAILING_COLUMNS`(파싱상태)만 계정과목명/금액 뒤로
+# 밀려난다.
+SELECTION_EXPORT_COLUMN_LABELS: dict[str, str] = {
+    **{
+        col: RESULT_COLUMN_LABELS[col]
+        for col in SELECTION_BASE_COLUMNS
+        if col not in SELECTION_TRAILING_COLUMNS
+    },
+    "account_name": "계정과목명",
+    "amount": "금액",
+    **{col: RESULT_COLUMN_LABELS[col] for col in SELECTION_TRAILING_COLUMNS},
+}
+
+SELECTION_EXPORT_COLUMNS: list[str] = list(SELECTION_EXPORT_COLUMN_LABELS.keys())
+
+
+def results_to_selection_dataframe(results: Sequence[Result]) -> pd.DataFrame:
+    """`results` 레코드를 "회사 × 계정과목" long 포맷 DataFrame으로 변환.
+
+    회사 1건이 `SELECTION_ACCOUNT_COLUMNS` 개수(19)만큼의 행이 되고, 기본정보
+    컬럼(`SELECTION_BASE_COLUMNS`)은 그 행들에 그대로 반복된다. 입력 순서
+    (호출부의 id 오름차순)를 보존한다. 컬럼 순서는 `SELECTION_EXPORT_COLUMNS`가
+    정한다 — `parse_status`는 계정과목명/금액 뒤(맨 마지막)로 간다.
+
+    값이 없는(`None`) 계정과목도 **행은 그대로 만들고 금액만 비운다** — 어떤
+    계정과목이 결측인지 파일에서 알 수 있어야 하므로 스킵하지 않는다. 이를 위해
+    "금액" 컬럼은 object dtype으로 고정한다(그대로 두면 pandas가 float64로 올려
+    `10000000000.0`처럼 소수점이 붙고 결측이 `NaN`으로 출력된다).
+    """
+    rows: list[dict[str, object | None]] = []
+    amounts: list[object | None] = []
+    for result in results:
+        base = {col: getattr(result, col, None) for col in SELECTION_BASE_COLUMNS}
+        for col in SELECTION_ACCOUNT_COLUMNS:
+            value = getattr(result, col, None)
+            rows.append({**base, "account_name": SELECTION_ACCOUNT_LABELS[col], "amount": value})
+            amounts.append(value)
+
+    df = pd.DataFrame(rows, columns=SELECTION_EXPORT_COLUMNS)
+    df["amount"] = pd.Series(amounts, dtype=object, index=df.index)
+    return df
+
+
+def export_selection_results(
+    results: Sequence[Result], fmt: Literal["xlsx", "csv"]
+) -> bytes:
+    """선택 다운로드용 기본정보 파일(long 포맷)을 xlsx/csv 바이트로 직렬화.
+
+    `export_results()`와 형식(시트명 `results`, csv의 UTF-8 BOM)은 같고 컬럼
+    구성만 다르다 — 전체 내보내기는 계속 `export_results()`를 쓴다.
+    """
+    if fmt not in ("xlsx", "csv"):
+        raise ValueError(f"지원하지 않는 형식입니다: {fmt}")
+
+    df = results_to_selection_dataframe(results).rename(columns=SELECTION_EXPORT_COLUMN_LABELS)
+
+    buffer = io.BytesIO()
+    if fmt == "xlsx":
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            df.to_excel(writer, sheet_name="results", index=False)
+    else:
+        buffer.write(df.to_csv(index=False).encode("utf-8-sig"))
+
+    return buffer.getvalue()
+
+
+# ---------------------------------------------------------------------------
 # 다중 선택 다운로드(§4-11, M9) — results + financial_history 2시트 xlsx
 # ---------------------------------------------------------------------------
 
@@ -213,16 +364,28 @@ def export_results_with_history(
     results: Sequence[Result],
     snapshots: Sequence[FinancialSnapshot],
     corp_name_by_result_id: Mapping[int, str | None],
+    use_selection_format: bool = False,
 ) -> bytes:
     """기본정보(`results`) + 재무이력(`financial_history`) 2시트 xlsx 바이트 생성.
 
-    시트 ①`results`는 `export_results(..., "xlsx")`와 **완전히 같은 컬럼**이고
-    (선택된 회사만 담긴다는 점만 다름), 시트 ②`financial_history`는 회사×회계연도
-    그레인이라 행 수가 다르다 — 그래서 한 시트에 합치지 않고 시트를 나눈다.
-    csv는 다중 시트를 표현할 수 없으므로 이 함수에 대응하는 csv 형식은 없다
-    (API가 `format=csv`+`include_history=true` 조합을 400으로 거부한다).
+    시트 ②`financial_history`는 회사×회계연도 그레인이라 시트 ①과 행 수가 다르다
+    — 그래서 한 시트에 합치지 않고 시트를 나눈다. csv는 다중 시트를 표현할 수
+    없으므로 이 함수에 대응하는 csv 형식은 없다(API가 `format=csv`+
+    `include_history=true` 조합을 400으로 거부한다).
+
+    시트 ①`results`의 컬럼 구성은 `use_selection_format`이 정한다 — True면
+    `export_selection_results(..., "xlsx")`와 **완전히 같은 long 포맷**(회사 ×
+    계정과목), False면 `export_results(..., "xlsx")`와 같은 기존 wide 포맷이다.
+    호출부(`export_job_results()`)가 `selected_ids is not None`을 그대로 넘기므로
+    **포맷은 오직 `ids` 유무로만 갈린다** — `include_history`만 붙인 필터 전체
+    내보내기의 기본정보 시트는 wide 그대로다(dart-qa 2026-07-28 리뷰 반영).
+    시트 ②는 어느 쪽이든 동일하다.
     """
-    results_df = results_to_dataframe(results).rename(columns=RESULT_COLUMN_LABELS)
+    results_df = (
+        results_to_selection_dataframe(results).rename(columns=SELECTION_EXPORT_COLUMN_LABELS)
+        if use_selection_format
+        else results_to_dataframe(results).rename(columns=RESULT_COLUMN_LABELS)
+    )
     history_df = snapshots_to_dataframe(snapshots, corp_name_by_result_id).rename(
         columns=FINANCIAL_SNAPSHOT_COLUMN_LABELS
     )

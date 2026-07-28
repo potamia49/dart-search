@@ -22,7 +22,12 @@ import {
 } from '@mantine/core'
 import { notifications } from '@mantine/notifications'
 import { getJob } from '../api/jobs'
-import { exportResults, listResults } from '../api/results'
+import {
+  SelectionExportUnsupportedError,
+  SelectionExportUnverifiableError,
+  exportResults,
+  listResults,
+} from '../api/results'
 import type {
   JobResponse,
   ParseStatus,
@@ -64,21 +69,40 @@ function sortKeyOf(column: ResultColumn): string | null {
   return column.sortKey ?? column.key
 }
 
-function tabToParams(tab: FilterTab): {
+type ResultFilterParams = {
   parse_status?: ParseStatus
   excluded_by_revenue?: boolean
   excluded_by_assets?: boolean
   excluded_by_stale_disclosure?: boolean
   has_disclosure?: boolean
   auditor_changed?: boolean
-} {
+}
+
+function tabToParams(tab: FilterTab): ResultFilterParams {
   // "휴면·폐업 추정"(최근 1년 이내 DART 공시 없음) 건은 노이즈 성격이 강해
   // 전용 탭이 아닌 모든 화면(전체 탭 포함)에서 기본적으로 숨긴다 — 사용자가
   // 명시적으로 탭을 선택했을 때만 예외로 노출한다(2026-07-22 확정 UX).
   if (tab === 'STALE_DISCLOSURE') {
     return { excluded_by_stale_disclosure: true }
   }
-  const baseline = { excluded_by_stale_disclosure: false }
+  // 매출액/총자산 조건에 걸려 제외된 건도 같은 취급이다(2026-07-28) — 조건에
+  // 맞지 않아 이미 탈락한 회사라 기본 목록에 섞이면 안 된다. 전용 탭에서만 본다.
+  //
+  // 단 전용 탭에서는 **자기 필드만** true로 덮어쓰고 다른 제외 사유는 아예 걸지
+  // 않는다: B4의 매출액 필터와 총자산 필터는 서로 독립이라 한 회사가 두 플래그를
+  // 동시에 1로 가질 수 있고, 그런 회사에 반대쪽 조건(`false`)까지 걸면 두 탭
+  // 어디에도 나오지 않는 사각지대가 생긴다.
+  if (tab === 'EXCLUDED_REVENUE') {
+    return { excluded_by_stale_disclosure: false, excluded_by_revenue: true }
+  }
+  if (tab === 'EXCLUDED_ASSETS') {
+    return { excluded_by_stale_disclosure: false, excluded_by_assets: true }
+  }
+  const baseline = {
+    excluded_by_stale_disclosure: false,
+    excluded_by_revenue: false,
+    excluded_by_assets: false,
+  }
   switch (tab) {
     case 'OK':
       return { ...baseline, parse_status: 'OK' }
@@ -91,10 +115,6 @@ function tabToParams(tab: FilterTab): {
       return { ...baseline, parse_status: 'FAILED', has_disclosure: true }
     case 'NO_DISCLOSURE':
       return { ...baseline, parse_status: 'FAILED', has_disclosure: false }
-    case 'EXCLUDED_REVENUE':
-      return { ...baseline, excluded_by_revenue: true }
-    case 'EXCLUDED_ASSETS':
-      return { ...baseline, excluded_by_assets: true }
     // 연도별 감사인이 바뀐 회사만(2026-07-26). 판정 불가(NULL — 감사인을 확인한
     // 연도가 1개 이하)인 건은 백엔드 tri-state 규칙상 이 탭에서 빠진다.
     case 'AUDITOR_CHANGED':
@@ -166,11 +186,22 @@ function FinancialsResultsView({ jobId }: { jobId: number }) {
   // "휴면·폐업 추정"으로 기본 숨김 처리된 건수 — 무통보로 사라지지 않도록 탭
   // 뱃지와 "총 N건" 옆 안내 문구로 항상 고지한다(2026-07-22 디자인 리뷰 반영).
   const [staleCount, setStaleCount] = useState<number | null>(null)
+  // 매출액/총자산 조건으로 기본 숨김 처리된 건수 — 위와 완전히 같은 이유·같은
+  // 방식이다(2026-07-28). 각 탭이 실제로 쓰는 조건(tabToParams)을 그대로 재사용해
+  // "N건 숨김"과 그 탭을 열었을 때의 "총 N건"이 어긋나지 않게 한다.
+  const [excludedRevenueCount, setExcludedRevenueCount] = useState<number | null>(null)
+  const [excludedAssetsCount, setExcludedAssetsCount] = useState<number | null>(null)
 
   useEffect(() => {
-    listResults(jobId, { page: 1, page_size: 1, excluded_by_stale_disclosure: true })
+    listResults(jobId, { page: 1, page_size: 1, ...tabToParams('STALE_DISCLOSURE') })
       .then((res) => setStaleCount(res.total))
       .catch(() => setStaleCount(null))
+    listResults(jobId, { page: 1, page_size: 1, ...tabToParams('EXCLUDED_REVENUE') })
+      .then((res) => setExcludedRevenueCount(res.total))
+      .catch(() => setExcludedRevenueCount(null))
+    listResults(jobId, { page: 1, page_size: 1, ...tabToParams('EXCLUDED_ASSETS') })
+      .then((res) => setExcludedAssetsCount(res.total))
+      .catch(() => setExcludedAssetsCount(null))
   }, [jobId])
 
   // 다른 Job의 결과 id가 선택에 남아 있으면 백엔드가 400(스코프 검증)을 준다.
@@ -187,16 +218,20 @@ function FinancialsResultsView({ jobId }: { jobId: number }) {
     return () => clearTimeout(timer)
   }, [search])
 
+  // 현재 탭이 실제로 거는 필터. "N건 숨김" 안내를 탭 이름으로 하드코딩하지 않고
+  // 이 값에서 파생시켜(그 탭이 정말 그 조건을 false로 걸 때만 고지) 어긋남을 막는다.
+  const activeParams = useMemo(() => tabToParams(tab), [tab])
+
   // 목록 조회와 다운로드가 공유하는 필터/정렬 조건. 매 렌더마다 새 객체가 되면
   // 아래 useEffect가 무한 루프를 도므로 값이 바뀔 때만 다시 만든다.
   const query = useMemo(
     () => ({
-      ...tabToParams(tab),
+      ...activeParams,
       q: debouncedSearch || undefined,
       // 다중 정렬은 콤마 구분 `field:dir` 목록으로 백엔드에 전달한다(서버 사이드 정렬).
       sort: sorts.length ? sorts.map((s) => `${s.key}:${s.dir}`).join(',') : undefined,
     }),
-    [tab, debouncedSearch, sorts],
+    [activeParams, debouncedSearch, sorts],
   )
 
   useEffect(() => {
@@ -275,8 +310,33 @@ function FinancialsResultsView({ jobId }: { jobId: number }) {
     setSelectionExporting(true)
     try {
       await exportResults(jobId, format, {}, { ids, includeHistory })
-    } catch {
-      notifications.show({ color: 'red', message: '선택 항목 다운로드에 실패했습니다.' })
+    } catch (err) {
+      // 구버전 백엔드가 `ids`를 무시하고 전체 결과를 내려준 경우는 "실패"와 다르게
+      // 안내한다 — 파일이 받아지긴 하지만 체크하지 않은 회사까지 들어 있어, 그대로
+      // 저장하면 잘못된 자료를 쓰게 된다(2026-07-28).
+      if (err instanceof SelectionExportUnsupportedError) {
+        // 고정 id로 띄워 재시도 때마다 같은 알림이 겹겹이 쌓이지 않게 한다
+        // (autoClose: false라 수동으로 닫아야 하고, 목록 하단 페이지네이션을 가린다).
+        notifications.show({
+          id: 'selection-export-unsupported',
+          color: 'red',
+          title: '선택 항목 다운로드를 중단했습니다',
+          message:
+            '서버가 선택 항목만 내보내는 기능을 지원하지 않는 구버전이라, 체크하지 않은 회사까지 들어간 전체 파일이 돌아왔습니다. 프로그램을 껐다 다시 켜 보고, 같은 안내가 계속 나오면 최신 버전 프로그램으로 교체가 필요합니다(담당자에게 문의하세요). 지금 당장 전체 결과가 필요하다면 위쪽 "Excel 다운로드" / "CSV 다운로드"를 쓰세요.',
+          autoClose: false,
+        })
+      } else if (err instanceof SelectionExportUnverifiableError) {
+        notifications.show({
+          id: 'selection-export-unverifiable',
+          color: 'red',
+          title: '선택 항목 다운로드를 중단했습니다',
+          message:
+            '다운로드 응답 정보를 읽지 못해, 받은 파일이 체크한 회사만 담고 있는지 확인할 수 없었습니다. 프로그램을 껐다 다시 켠 뒤 다시 시도하고, 같은 안내가 계속 나오면 담당자에게 문의하세요. 지금 당장 전체 결과가 필요하다면 위쪽 "Excel 다운로드" / "CSV 다운로드"를 쓰세요.',
+          autoClose: false,
+        })
+      } else {
+        notifications.show({ color: 'red', message: '선택 항목 다운로드에 실패했습니다.' })
+      }
     } finally {
       setSelectionExporting(false)
     }
@@ -330,8 +390,30 @@ function FinancialsResultsView({ jobId }: { jobId: number }) {
             <Tabs.Tab value="PARTIAL">부분 성공</Tabs.Tab>
             <Tabs.Tab value="FAILED">파싱 실패 (검수 필요)</Tabs.Tab>
             <Tabs.Tab value="NO_DISCLOSURE">감사보고서 없음</Tabs.Tab>
-            <Tabs.Tab value="EXCLUDED_REVENUE">매출액 제외 건</Tabs.Tab>
-            <Tabs.Tab value="EXCLUDED_ASSETS">총자산 제외 건</Tabs.Tab>
+            <Tabs.Tab
+              value="EXCLUDED_REVENUE"
+              rightSection={
+                excludedRevenueCount !== null ? (
+                  <Badge size="xs" variant="light" color="gray">
+                    {excludedRevenueCount}
+                  </Badge>
+                ) : undefined
+              }
+            >
+              매출액 제외 건
+            </Tabs.Tab>
+            <Tabs.Tab
+              value="EXCLUDED_ASSETS"
+              rightSection={
+                excludedAssetsCount !== null ? (
+                  <Badge size="xs" variant="light" color="gray">
+                    {excludedAssetsCount}
+                  </Badge>
+                ) : undefined
+              }
+            >
+              총자산 제외 건
+            </Tabs.Tab>
             <Tabs.Tab value="AUDITOR_CHANGED">감사인 변동</Tabs.Tab>
             <Tabs.Tab
               value="STALE_DISCLOSURE"
@@ -392,6 +474,16 @@ function FinancialsResultsView({ jobId }: { jobId: number }) {
           연도별 감사인이 저장돼 있지 않아 목록에서는 전부 판정 불가(-)로 보이지만,
           <b>상세의 "감사인" 행은 원문을 그때그때 읽어 채우므로 기존 작업에서도 연도별로
           확인할 수 있습니다</b>.
+        </Alert>
+      )}
+
+      {(tab === 'EXCLUDED_REVENUE' || tab === 'EXCLUDED_ASSETS') && (
+        <Alert color="gray">
+          감사보고서 원문에서 확인한 {tab === 'EXCLUDED_REVENUE' ? '매출액' : '총자산'}이 검색
+          조건 범위를 벗어나 <b>제외된 회사</b>입니다 — 조건에 맞지 않는 회사이므로
+          <b> "휴면·폐업 추정" 탭을 제외한 모든 탭(전체 포함)에서는 기본적으로 숨겨져
+          있습니다</b>(휴면·폐업 추정 탭은 공시 여부만으로 걸러 이 회사들도 함께 보입니다).
+          매출액·총자산 조건에 모두 걸린 회사는 두 탭 양쪽에 나옵니다.
         </Alert>
       )}
 
@@ -483,7 +575,7 @@ function FinancialsResultsView({ jobId }: { jobId: number }) {
                 </UnstyledButton>
               </>
             )}
-            {tab !== 'STALE_DISCLOSURE' && !!staleCount && (
+            {activeParams.excluded_by_stale_disclosure === false && !!staleCount && (
               <> · 휴면·폐업 추정 {staleCount.toLocaleString()}건 숨김 (
               <UnstyledButton
                 component="span"
@@ -494,6 +586,42 @@ function FinancialsResultsView({ jobId }: { jobId: number }) {
               </UnstyledButton>
               )</>
             )}
+            {/* 매출액/총자산 숨김 건수는 **전체 탭에서만** 알린다(2026-07-28 디자인
+                리뷰). 이 건수는 Job 전역 기준인데, `excluded_by_revenue=1`인 행은
+                정의상 원문을 열어 값을 파싱한 행이라 "파싱 실패"·"감사보고서 없음"
+                같은 세부 탭에서는 실제로 숨겨지는 행이 사실상 없다 — 그런 검수
+                화면에 이 숫자가 뜨면 "검수할 게 더 있나?"라는 오해만 만든다. */}
+            {tab === 'ALL' && activeParams.excluded_by_revenue === false && !!excludedRevenueCount && (
+              <> · 매출액 조건 제외 {excludedRevenueCount.toLocaleString()}건 숨김 (
+              <UnstyledButton
+                component="span"
+                td="underline"
+                onClick={() => handleTabChange('EXCLUDED_REVENUE')}
+              >
+                보기
+              </UnstyledButton>
+              )</>
+            )}
+            {tab === 'ALL' && activeParams.excluded_by_assets === false && !!excludedAssetsCount && (
+              <> · 총자산 조건 제외 {excludedAssetsCount.toLocaleString()}건 숨김 (
+              <UnstyledButton
+                component="span"
+                td="underline"
+                onClick={() => handleTabChange('EXCLUDED_ASSETS')}
+              >
+                보기
+              </UnstyledButton>
+              )</>
+            )}
+            {/* 두 건수는 서로 배타적이지 않다 — 매출액·총자산 조건에 동시에 걸린
+                회사가 양쪽에 들어간다. 백엔드에 OR 필터가 없어 정확한 합집합
+                건수를 낼 수 없으므로, 숫자를 나란히 보여줄 때만 문구로 명시해
+                "합이 안 맞는다"는 오해를 막는다(2026-07-28 디자인 리뷰). */}
+            {tab === 'ALL' &&
+              activeParams.excluded_by_revenue === false &&
+              activeParams.excluded_by_assets === false &&
+              !!excludedRevenueCount &&
+              !!excludedAssetsCount && <> (두 조건에 모두 걸린 회사는 두 건수에 중복 계상됩니다)</>}
           </Text>
           <Table.ScrollContainer minWidth={800}>
             <Table striped highlightOnHover withTableBorder>
