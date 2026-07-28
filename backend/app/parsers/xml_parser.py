@@ -295,9 +295,18 @@ def _first_cell_text(table: etree._Element) -> str:
     return _text_of(cells[0]) if cells else ""
 
 
+# 헤더 셀 텍스트 정규화(공백/전각공백/개행/탭 전부 제거). `_classify_period`와
+# `_is_ordinal_period`가 같은 기준을 써야 한다 — 실측(20240401002723)에 헤더가
+# `'제\n 8(\n당\n) \n기'`처럼 셀 안에 개행이 섞여 있어, 공백만 지우던 예전
+# `_classify_period`는 "(당)" 명시 표기를 못 잡고 차수 순서 폴백으로 새 버렸다
+# (이 프로젝트는 `_apply_sign`에서 이미 "판정은 반드시 정규화 라벨로"라는 동일
+# 교훈을 겪었다).
+_HEADER_COMPACT = str.maketrans({" ": None, "　": None, "\n": None, "\r": None, "\t": None})
+
+
 def _classify_period(text: str) -> str | None:
     """헤더 셀 텍스트가 당기/전기 어느 쪽인지 판정. 아니면(과목/주석 등) None."""
-    t = text.replace(" ", "").replace("　", "")
+    t = text.translate(_HEADER_COMPACT)
     has_cur = "(당)" in t or "당기" in t
     has_prv = "(전)" in t or "전기" in t
     if has_cur and not has_prv:
@@ -322,16 +331,51 @@ def _classify_period(text: str) -> str | None:
 # 달라질 때 옳고 그름이 조용히 뒤집힐 수 있기 때문이다(첫 번째 차수 열=당기,
 # 두 번째=전기, 그 뒤 열은 무시).
 #
-# "제 9(당) 기말" / "제 8(당) 기말"처럼 **전기 열에도 "(당)"이 잘못 붙은** 원문
-# 3건(20240329003157/20250331003688/20250409002265)도 이 폴백이 흡수한다 —
-# 명시 표기만 보면 두 열 모두 당기가 돼 열 계획이 서지 않던 사례다.
+# "제 9(당) 기말" / "제 8(당) 기말"처럼 **두 열 모두에 같은 "(당)"(혹은 둘 다
+# "(전)")이 잘못 붙어 명시 표기가 자기모순인** 원문 6건(20240329003157/
+# 20250331003688/20250409002265/20230404003064/20250321000287/20260327000738)도
+# 이 폴백이 흡수한다 — 두 열의 명시 역할이 서로 다르면(정상 표기) 그 명시를
+# 그대로 신뢰하고, 한쪽만 명시돼 있으면 명시된 쪽을 존중한 채 나머지 열을
+# 채우며, 양쪽이 서로 같은 역할(둘 다 당기 혹은 둘 다 전기)로 충돌하면 명시
+# 자체를 무시하고 등장 순서로 되돌아간다(`_resolve_ordinal_roles` 참고).
 _ORDINAL_PERIOD_RE = re.compile(r"제\d+(?:\([당전]\))?기")
-_ORDINAL_COMPACT = str.maketrans({" ": None, "　": None, "\n": None, "\r": None, "\t": None})
 
 
 def _is_ordinal_period(text: str) -> bool:
     """헤더 셀 텍스트가 "제N기"/"제N기 기말" 같은 차수 기반 기간 제목인지 판정."""
-    return bool(_ORDINAL_PERIOD_RE.search(text.translate(_ORDINAL_COMPACT)))
+    return bool(_ORDINAL_PERIOD_RE.search(text.translate(_HEADER_COMPACT)))
+
+
+def _ordinal_group_role(cols: list[int], cur: list[int], prv: list[int]) -> str | None:
+    """차수 헤더 그룹(열 범위)이 명시 표기(cur/prv) 중 어느 쪽으로 이미 분류돼
+    있는지 판정. 한쪽에만 걸쳐 있으면 그 역할, 걸치지 않으면 None."""
+    cur_set, prv_set = set(cur), set(prv)
+    in_cur = any(c in cur_set for c in cols)
+    in_prv = any(c in prv_set for c in cols)
+    if in_cur and not in_prv:
+        return "cur"
+    if in_prv and not in_cur:
+        return "prv"
+    return None
+
+
+def _resolve_ordinal_roles(
+    group0: list[int], group1: list[int], cur: list[int], prv: list[int]
+) -> tuple[list[int], list[int]]:
+    """차수 헤더 두 그룹(등장 순서: group0가 먼저)의 최종 (당기열, 전기열)을 정한다.
+
+    이미 명시 표기(cur/prv)로 한쪽만 걸려 있으면 그 명시를 존중하고 나머지
+    그룹을 반대쪽으로 채운다. 양쪽 다 명시가 없거나(순수 차수 표기), 양쪽이
+    서로 같은 역할로 충돌하면(예: 두 열 다 "(당)") 명시를 무시하고 등장
+    순서(첫 번째=당기, 두 번째=전기)로 되돌아간다.
+    """
+    role0 = _ordinal_group_role(group0, cur, prv)
+    role1 = _ordinal_group_role(group1, cur, prv)
+    if role0 == role1:
+        return group0, group1
+    if role0 == "prv" or role1 == "cur":
+        return group1, group0
+    return group0, group1
 
 
 def _build_period_column_plan(header_cells: list[etree._Element]) -> tuple[list[int], list[int]] | None:
@@ -343,15 +387,17 @@ def _build_period_column_plan(header_cells: list[etree._Element]) -> tuple[list[
     당기·전기 값 열의 (본문 셀) 인덱스 목록만 돌려준다.
 
     명시 표기로 당기·전기를 **둘 다** 잡지 못했을 때만, 차수 기반 표기
-    ("제6기 기말"/"제 6 기", `_ORDINAL_PERIOD_RE` 주석 참고)로 등장 순서에 따라
-    첫 번째 차수 열=당기 / 두 번째=전기로 폴백한다. 명시 표기가 성립하는 기존
-    표들은 이 폴백에 도달하지 않아 동작이 그대로다.
+    ("제6기 기말"/"제 6 기", `_ORDINAL_PERIOD_RE` 주석 참고)로 처음 두 차수
+    헤더의 역할을 정한다(`_resolve_ordinal_roles`) — 한쪽만 명시 표기가 있으면
+    그 명시를 존중하고, 명시가 아예 없거나 양쪽이 같은 역할로 충돌하면 등장
+    순서(첫 번째=당기, 두 번째=전기)로 정한다. 명시 표기가 양쪽 다 성립하는
+    기존 표들은 이 폴백에 도달하지 않아 동작이 그대로다.
 
     둘 다 끝내 찾지 못하면 None(이 표는 재무제표 데이터 표가 아님)."""
     col = 0
     cur: list[int] = []
     prv: list[int] = []
-    ordinals: list[tuple[int, int]] = []  # 차수 기반 헤더 셀의 (시작 열, 열 수)
+    ordinals: list[list[int]] = []  # 차수 기반 헤더 셀의 열 인덱스 목록(그룹별)
     for cell in header_cells:
         raw_span = cell.get("COLSPAN", "1") or "1"
         try:
@@ -366,16 +412,12 @@ def _build_period_column_plan(header_cells: list[etree._Element]) -> tuple[list[
             elif role == "prv":
                 prv.append(c)
         if _is_ordinal_period(text):
-            ordinals.append((col, span))
+            ordinals.append(list(range(col, col + span)))
         col += span
     if cur and prv:
         return cur, prv
     if len(ordinals) >= 2:
-        (cur_col, cur_span), (prv_col, prv_span) = ordinals[0], ordinals[1]
-        return (
-            list(range(cur_col, cur_col + cur_span)),
-            list(range(prv_col, prv_col + prv_span)),
-        )
+        return _resolve_ordinal_roles(ordinals[0], ordinals[1], cur, prv)
     return None
 
 

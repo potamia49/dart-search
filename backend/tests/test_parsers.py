@@ -27,7 +27,13 @@ from app.parsers.base import (
     parse_won_amount,
 )
 from app.parsers.pdf_parser import parse_pdf_financials
-from app.parsers.xml_parser import _apply_sign, _decode_raw_xml, parse_xml_financials
+from app.parsers.xml_parser import (
+    _apply_sign,
+    _build_period_column_plan,
+    _classify_period,
+    _decode_raw_xml,
+    parse_xml_financials,
+)
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -1020,6 +1026,185 @@ def test_parse_xml_financials_eps_suffix_extra_paren_recovers():
         )
         == "당기순이익(손실)"
     )
+
+
+# ---------------------------------------------------------------------------
+# IFRS "(첨부)재무제표" 서식 중 열 제목이 "당기"/"전기"가 아니라 **회계 차수**
+# ("제6기 기말"/"제 6 기")로만 적힌 변형 (2026-07-28 실측).
+#
+# 로컬 문서 캐시 8,748건 전수 스캔: 첨부 서식 462건 중 63건(표 기준 184개)이
+# 이 표기를 쓴다. 열 계획이 서지 않아 "재무상태표/손익계산서 테이블을 찾을 수
+# 없음"으로 재무 데이터가 통째로 유실되던 회귀(전량 PARTIAL)를 잠근다.
+# ---------------------------------------------------------------------------
+
+
+def _header_cells(xml: str) -> list:
+    from lxml import etree
+
+    return list(etree.fromstring(xml))
+
+
+def test_build_period_column_plan_ordinal_headers_use_document_order():
+    """차수 표기 헤더는 **등장 순서**로 당기/전기를 정한다(차수 숫자 크기 아님).
+
+    실측 184개 표 전부 큰 차수가 먼저 나오는 내림차순이었지만, 숫자 크기로
+    판정하면 표기 방식이 달라질 때 조용히 뒤집힐 수 있어 순서 기준으로 고정한다.
+    COLSPAN=2(상세/합계 2열)도 그대로 펼쳐져야 한다.
+    """
+    plan = _build_period_column_plan(
+        _header_cells(
+            '<THEAD><TH>과 목</TH><TH>주 석</TH>'
+            '<TH COLSPAN="2">제6기 기말</TH><TH COLSPAN="2">제5기 기말</TH></THEAD>'
+        )
+    )
+    assert plan == ([2, 3], [4, 5])
+    # 글자 사이 공백("제 6 기")과 "(당)"/"(전)"이 낀 차수 표기도 같은 규칙.
+    assert _build_period_column_plan(
+        _header_cells("<THEAD><TH>과목</TH><TH>주석</TH><TH>제 6 기</TH><TH>제 5 기</TH></THEAD>")
+    ) == ([2], [3])
+
+
+def test_build_period_column_plan_explicit_labels_take_precedence():
+    """"당기"/"전기" 명시 표기가 있으면 등장 순서와 무관하게 그 표기를 따른다.
+
+    전기 열이 먼저 오는 표에서 차수 폴백이 우선하면 당기/전기가 통째로 뒤집힌다 —
+    폴백은 명시 표기로 **둘 다** 잡지 못했을 때만 동작해야 한다.
+    """
+    plan = _build_period_column_plan(
+        _header_cells(
+            "<THEAD><TH>과목</TH><TH>주석</TH>"
+            "<TH>제 5 기(전기)</TH><TH>제 6 기(당기)</TH></THEAD>"
+        )
+    )
+    assert plan == ([3], [2])
+
+
+def test_classify_period_ignores_embedded_linebreaks():
+    """헤더 셀 텍스트 안에 개행/탭이 섞여도 "(당)"/"(전)" 명시를 잡아야 한다.
+
+    실측(20240401002723)의 THEAD 헤더가 `'제\\n 8(\\n당\\n) \\n기'`처럼 셀 안에
+    개행이 낀 채 저장돼 있다. 공백만 지우던 예전 `_classify_period`는 이를
+    못 잡고 차수 순서 폴백으로 새 버렸다 — `_apply_sign`이 이미 겪은 "판정은
+    반드시 정규화 라벨로" 교훈과 동일하다.
+    """
+    assert _classify_period("제\n 8(\n당\n) \n기") == "cur"
+    assert _classify_period("제\t7(\t전\t)\t기") == "prv"
+
+
+def test_build_period_column_plan_partial_explicit_label_is_respected():
+    """헤더 한쪽만 "(당)"/"(전)"이 명시돼 있고 반대쪽은 순수 차수 표기뿐일 때,
+    등장 순서 폴백이 그 명시를 뒤집으면 안 된다(dart-qa 2026-07-28 지적).
+
+    "제 5 기(전) / 제 6 기"처럼 **전기 열이 먼저** 오면서 당기 열에만 표기가
+    빠진 경우, 예전 폴백(cur/prv가 둘 다 안 잡혔을 때만 발동)은 명시된 "(전)"
+    정보를 통째로 버리고 등장 순서로 재판정해 "제5기(전)"을 당기로 뒤집었다.
+    """
+    plan = _build_period_column_plan(
+        _header_cells(
+            "<THEAD><TH>과목</TH><TH>주석</TH>"
+            "<TH>제 5 기(전)</TH><TH>제 6 기</TH></THEAD>"
+        )
+    )
+    assert plan == ([3], [2])  # 당기=제6기(뒤), 전기=제5기(전)(앞) — 명시 존중
+
+    # 대칭 케이스: 당기 열에만 "(당)"이 있고 전기 열은 순수 차수 표기.
+    plan2 = _build_period_column_plan(
+        _header_cells(
+            "<THEAD><TH>과목</TH><TH>주석</TH>"
+            "<TH>제 5 기</TH><TH>제 6 기(당)</TH></THEAD>"
+        )
+    )
+    assert plan2 == ([3], [2])  # 당기=제6기(당)(명시), 전기=제5기(나머지)
+
+
+def test_build_period_column_plan_single_ordinal_header_is_not_a_plan():
+    """차수 표기가 1개뿐인 행(첨부 서식의 기간 캡션 표: "제6기 2025년 12월 31일
+    현재"가 한 행에 하나씩)은 데이터 표가 아니므로 열 계획을 세우지 않는다."""
+    assert (
+        _build_period_column_plan(_header_cells("<TR><TE>제6기 2025년 12월 31일 현재</TE></TR>"))
+        is None
+    )
+
+
+def test_parse_xml_financials_ifrs_attach_ordinal_period_headers():
+    """합천수상태양광(rcept 20260331004483) — 사용자 실측 신고 케이스.
+
+    "(첨부)재 무 제 표" 서식인데 재무상태표 THEAD가 `<TH COLSPAN="2">제6기 기말</TH>`
+    / `<TH COLSPAN="2">제5기 기말</TH>`, 손익계산서가 `<TH>제 6 기</TH>` /
+    `<TH>제 5 기</TH>`라 "당기"/"전기" 단서가 본문 3표에 전혀 없다(같은 문서의 주석
+    표에는 "당기"/"전기"가 정상적으로 쓰인다). 열 계획이 서지 않아 4개 회계연도
+    보고서가 전부 PARTIAL("재무상태표/손익계산서 테이블을 찾을 수 없음")이었다.
+
+    당기/전기가 뒤집히지 않았음은 **직전 연도 보고서(20250328000382)의 당기
+    유동자산 18,342,554,401과 이 보고서의 전기가 일치**하는 것으로 교차 확인했다.
+    """
+    parsed = parse_xml_financials(_read_fixture("20260331004483"))
+    assert parsed.parse_status == "OK"
+    assert parsed.values_cur["current_assets"] == 20_681_407_089
+    assert parsed.values_prv["current_assets"] == 18_342_554_401  # 전년도 보고서의 당기값
+    assert parsed.values_cur["noncurrent_assets"] == 55_257_773_260
+    assert parsed.values_cur["total_assets"] == (
+        parsed.values_cur["total_liab"] + parsed.values_cur["total_equity"]
+    )
+    assert parsed.values_cur["gross_profit"] == (
+        parsed.values_cur["revenue"] - parsed.values_cur["cogs"]
+    )
+    assert parsed.values_cur["operating_income"] == 4_956_873_463
+    assert parsed.values_cur["net_income"] == 2_423_036_118
+    assert parsed.values_cur["cf_operating"] == 6_179_654_468
+
+
+def test_parse_xml_financials_ifrs_attach_ordinal_headers_both_marked_current():
+    """제일에프에이(rcept 20240329003157) — 위 차수 표기 서식의 변형.
+
+    전기 열에도 "(당)"이 잘못 붙어 있다("제 9(당) 기말" / "제 8(당) 기말"). 명시
+    표기만 보면 두 열이 모두 당기가 돼 전기 열을 못 찾고 열 계획이 무산됐다 —
+    차수 폴백이 등장 순서로 이 원문도 흡수한다. 당기/전기가 뒤집히지 않았음은
+    다음 연도 보고서(20250331003688)의 전기 유동자산 14,399,181,758과 이 보고서의
+    당기가 일치하는 것으로 교차 확인했다.
+    """
+    parsed = parse_xml_financials(_read_fixture("20240329003157"))
+    assert parsed.parse_status == "OK"
+    assert parsed.values_cur["current_assets"] == 14_399_181_758  # 익년도 보고서의 전기값
+    assert parsed.values_prv["current_assets"] == 10_664_342_536
+    assert parsed.values_cur["total_assets"] == (
+        parsed.values_cur["total_liab"] + parsed.values_cur["total_equity"]
+    )
+    assert parsed.values_cur["gross_profit"] == (
+        parsed.values_cur["revenue"] - parsed.values_cur["cogs"]
+    )
+    assert parsed.values_prv["gross_profit"] == (
+        parsed.values_prv["revenue"] - parsed.values_prv["cogs"]
+    )
+
+
+def test_parse_account_detail_ifrs_attach_ordinal_headers():
+    """세부계정 펼치기도 같은 `attach_period_plan`을 쓰므로 함께 복구돼야 한다.
+
+    (합천수상태양광은 재무상태표 전 행이 들여쓰기 0 + 로마숫자 대분류라 BS
+    세부계정은 기존 계층 휴리스틱상 비어 있다 — 이 서식의 별개 한계이며, 수정
+    전에는 손익계산서/현금흐름표까지 통째로 비어 있었다.)
+    """
+    raw = _read_fixture("20260331004483")
+    detail = parse_account_detail(raw)
+    summary = parse_xml_financials(raw)
+    assert detail.fiscal_year_cur == "2025"
+
+    op_rows = {r.label.strip(): r for r in detail.accounts["operating_income"]}
+    assert op_rows["금융수익"].cur == 63_033_002
+    assert op_rows["금융원가"].prv == 2_228_346_668
+
+    cf_rows = detail.accounts["cf_operating"]
+    assert cf_rows[0].label.strip() == "(1) 당기순이익"
+    assert cf_rows[0].cur == summary.values_cur["net_income"]
+
+
+def test_extract_section_html_ifrs_attach_ordinal_headers():
+    """원문 섹션 열람은 열 계획을 쓰지 않아 이 서식도 원래 열렸다 — 무회귀 확인."""
+    found, html = extract_section_html(_read_fixture("20260331004483"), "bs")
+    assert found is True
+    assert "제6기기말" in html.replace(" ", "")  # 차수 표기 헤더가 그대로 렌더링된다
+    assert "20,681,407,089" in html
 
 
 def test_parse_xml_financials_invalid_xml_returns_failed():
