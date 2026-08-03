@@ -746,21 +746,28 @@ def test_export_include_history_writes_two_sheets_with_joined_corp_name(client_w
 
     ws_history = wb["financial_history"]
     header = [c.value for c in next(ws_history.iter_rows(min_row=1, max_row=1))]
-    assert "회사명" in header and "회계연도" in header and "감사인" in header
-    assert ws_history.max_row == 3  # 헤더 + 선택한 회사의 2개 연도
+    # 2026-07-29부터 재무이력 시트도 long 포맷(계정과목 세로) — 감사인/파싱상태 없음.
+    assert header == ["결과ID", "회사명", "회계연도", "접수번호", "재무제표명", "계정과목", "금액"]
+    assert ws_history.max_row == 39  # 헤더 + 2개 연도 × 계정과목 19행
     rows = [
         [ws_history.cell(row=r, column=c + 1).value for c in range(len(header))]
-        for r in (2, 3)
+        for r in range(2, 40)
     ]
-    name_i, year_i, assets_i = (
+    name_i, year_i, stmt_i, account_i, amount_i = (
         header.index("회사명"),
         header.index("회계연도"),
-        header.index("자산총계"),
+        header.index("재무제표명"),
+        header.index("계정과목"),
+        header.index("금액"),
     )
     # result_id -> fiscal_year 오름차순으로 정렬되고, 회사명은 results에서 조인된다.
-    assert [str(r[year_i]) for r in rows] == ["2024", "2025"]
-    assert [r[name_i] for r in rows] == ["㈜성공테스트", "㈜성공테스트"]
-    assert [r[assets_i] for r in rows] == [5_000_000_000, 6_000_000_000]
+    assert [str(r[year_i]) for r in rows] == ["2024"] * 19 + ["2025"] * 19
+    assert {r[name_i] for r in rows} == {"㈜성공테스트"}
+    assert [r[stmt_i] for r in rows[:19]] == (
+        ["재무상태표"] * 7 + ["손익계산서"] * 8 + ["현금흐름표"] * 4
+    )
+    assets = [r[amount_i] for r in rows if r[account_i] == "자산총계"]
+    assert assets == [5_000_000_000, 6_000_000_000]
 
 
 def test_export_include_history_without_ids_covers_filtered_rows(client_with_db):
@@ -795,7 +802,7 @@ def test_export_include_history_without_ids_covers_filtered_rows(client_with_db)
     header = [c.value for c in next(wb["results"].iter_rows(min_row=1, max_row=1))]
     assert header == list(RESULT_COLUMN_LABELS.values())
     assert "매출액(전기)" in header and "계정과목명" not in header
-    assert wb["financial_history"].max_row == 2
+    assert wb["financial_history"].max_row == 20  # 헤더 + 스냅샷 1건 × 계정과목 19행
 
 
 def test_export_without_new_params_is_unchanged(client_with_db):

@@ -27,6 +27,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import Select, func, or_, select
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from app.config import get_settings
 from app.core.db import get_db
@@ -461,7 +462,13 @@ async def export_job_results(
       빈 파일이다.
     - `include_history`: true면 `financial_snapshots`(회사×회계연도)를 담은
       `financial_history` 시트를 추가한 **2시트 xlsx**로 응답한다. csv는 다중
-      시트를 표현할 수 없으므로 `format=csv`와 함께 오면 400이다.
+      시트를 표현할 수 없으므로 `format=csv`와 함께 오면 400이다. 이 시트는
+      2026-07-29부터 **long 포맷**이다 — 결과ID/회사명/회계연도/접수번호/
+      재무제표명/계정과목/금액 7컬럼으로, 스냅샷 1건(회사×회계연도)이 재무
+      19항목만큼 19행으로 풀린다(값이 없는 계정과목도 금액만 빈 행으로 남는다).
+      "재무제표명"은 재무상태표/손익계산서/현금흐름표 중 하나이며, 이전에 있던
+      감사인·파싱상태 컬럼은 제거됐다. 정렬은 `result_id`→`fiscal_year`
+      오름차순이고 각 스냅샷 안에서는 재무상태표→손익계산서→현금흐름표 순이다.
 
     **컬럼 구성(2026-07-28 변경)**: `ids`가 지정된 선택 다운로드의 기본정보는
     기본정보 15컬럼 + "계정과목명"/"금액" + "파싱상태" **long 포맷**(회사 1건 =
@@ -525,6 +532,14 @@ async def export_job_results(
     # 않는다, dart-qa 2026-07-28 리뷰 반영).
     use_selection_format = selected_ids is not None
 
+    # pandas/openpyxl 직렬화는 순수 동기 CPU 작업이라 `async def` 핸들러 안에서
+    # 그대로 부르면 그 시간 동안 이벤트 루프 전체가 멈춘다 — Job 진행률 폴링을
+    # 포함한 다른 모든 요청이 같이 대기한다. `financial_history` 시트를 long
+    # 포맷으로 바꾼 뒤(2026-07-29) 개발 DB 최대 규모(결과 4,383건 × 4개 회계연도
+    # = 333,108행)에서 약 45초가 걸리는 것이 실측돼(dart-qa), 아래 세 분기의
+    # 직렬화 호출만 `run_in_threadpool`로 워커 스레드에 넘긴다. DB 조회는 동기
+    # SQLAlchemy Session 그대로이며(세션을 스레드 간에 동시 사용하지 않는다 —
+    # 위에서 이미 전부 로드해 둔 ORM 객체만 워커가 읽는다) 이 변경 범위 밖이다.
     if include_history:
         result_ids = [r.id for r in rows]
         snapshots = (
@@ -540,16 +555,17 @@ async def export_job_results(
             if result_ids
             else []
         )
-        content = export_results_with_history(
+        content = await run_in_threadpool(
+            export_results_with_history,
             rows,
             snapshots,
             {r.id: r.corp_name for r in rows},
             use_selection_format=use_selection_format,
         )
     elif use_selection_format:
-        content = export_selection_results(rows, format)
+        content = await run_in_threadpool(export_selection_results, rows, format)
     else:
-        content = export_results(rows, format)
+        content = await run_in_threadpool(export_results, rows, format)
 
     # 주의: 프론트엔드(`frontend/src/api/results.ts`)가 이 `_selected` 접미어 유무로
     # 서버가 `ids`를 지원하는지(구버전 여부)를 판정하는 fail-safe 근거로 쓴다 —

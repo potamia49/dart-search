@@ -208,18 +208,33 @@ xlsx 전용)를 쓴다. DB 스키마 변경·추가 API 호출 0건인 순수 �
   (`SELECTION_ACCOUNT_COLUMNS`가 wide의 `_cur` 필드 전체와 일치하는지는
   `tests/test_exporters.py`의 드리프트 가드 테스트가 잠근다 — 새 `_cur`/`_prv`
   쌍을 추가하면 이 테스트가 먼저 깨진다). `ids`와 함께 `include_history=true`를
-  주면 2시트 xlsx의 ① 시트가 이 long 포맷이고, ② `financial_history`
-  시트(회사×회계연도)는 **무변경**이다.
+  주면 2시트 xlsx의 ① 시트가 이 long 포맷이다(② 시트는 아래 참고).
 - **필터 전체 내보내기(`ids` 없음, 상단 [Excel/CSV 다운로드])**: `include_history`
   여부와 **무관하게** 기존 wide 포맷(`RESULT_COLUMN_LABELS`, 회사 1행에 당기·전기
   전 항목) **그대로 무변경**.
 
+**② `financial_history` 시트도 long 포맷으로 전환(2026-07-29, 사용자 확정)**:
+기존 "회사×회계연도" wide(재무 19항목이 각각 컬럼 + 감사인 + 파싱상태)에서
+**"회사×회계연도×계정과목" 7컬럼**(결과ID/회사명/회계연도/접수번호/**재무제표명**/
+계정과목/금액)으로 바꿨다. 스냅샷 1건이 재무 19항목만큼 19행으로 풀리고, 값이 없는
+계정과목도 ① 시트와 같은 방침으로 **행은 남기고 금액만 빈 값**으로 둔다(금액 컬럼은
+object dtype 고정 — float 승격 시 소수점/NaN이 찍힌다). 신설 "재무제표명"은
+재무상태표(7)/손익계산서(8, 영업외수익·비용 포함)/현금흐름표(4) 중 하나이고,
+**감사인·파싱상태 컬럼은 제거**했다. 행 순서는 result_id→회계연도 오름차순(호출부
+정렬 그대로) → 그 안에서 재무상태표→손익계산서→현금흐름표다. 이 시트는 `ids` 유무와
+무관하게 항상 같은 포맷이다(포맷 분기는 여전히 ① 시트에만 있다).
+
 구현은 `app/exporters/excel.py`의 `SELECTION_EXPORT_COLUMN_LABELS`/
-`results_to_selection_dataframe()`/`export_selection_results()`이며, wide 포맷
-함수(`RESULT_COLUMN_LABELS`/`results_to_dataframe()`/`export_results()`)와 완전히
-분리돼 있다. 2시트 xlsx를 만드는 `export_results_with_history()`는
-`use_selection_format` 인자로 둘 중 하나를 골라 ① 시트를 쓴다 — 호출부가
-`selected_ids is not None`을 그대로 넘긴다.
+`results_to_selection_dataframe()`/`export_selection_results()`(① long)와
+`FINANCIAL_SNAPSHOT_ACCOUNTS_BY_STATEMENT`/`FINANCIAL_SNAPSHOT_COLUMN_LABELS`/
+`snapshots_to_dataframe()`(② long)이며, wide 포맷 함수(`RESULT_COLUMN_LABELS`/
+`results_to_dataframe()`/`export_results()`)와 완전히 분리돼 있다. ② 시트의
+계정과목 라벨·행 순서·재무제표 소속은 `FINANCIAL_SNAPSHOT_ACCOUNTS_BY_STATEMENT`
+한 곳에서만 정의하고, 그 19항목이 ①의 `_cur` 19항목과 1:1로 대응하는지는
+`tests/test_exporters.py`의 드리프트 가드 테스트가 잠근다(새 `_cur`/`_prv` 쌍을
+추가하면 두 시트 모두에서 테스트가 먼저 깨진다). 2시트 xlsx를 만드는
+`export_results_with_history()`는 `use_selection_format` 인자로 ① 시트만 골라
+쓴다(시그니처 무변경) — 호출부가 `selected_ids is not None`을 그대로 넘긴다.
 
 ### "최근 1년 이내 DART 공시 없음" 배제 (2026-07-21 추가)
 

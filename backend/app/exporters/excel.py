@@ -21,6 +21,14 @@ long 포맷(`SELECTION_EXPORT_COLUMN_LABELS`/`results_to_selection_dataframe()`/
 여전히 기존 wide 포맷(`RESULT_COLUMN_LABELS`/`export_results()`)을 쓴다 — 두 경로가
 쓰는 함수가 아예 갈라져 있다.
 
+2026-07-29(§4-11): 2시트 xlsx의 ②`financial_history` 시트도 **long 포맷**으로
+바꿨다(사용자 확정). 기존 "회사×회계연도 wide"(재무 19항목이 각각 컬럼 + 감사인 +
+파싱상태)에서 **"회사×회계연도×계정과목"** 7컬럼(결과ID/회사명/회계연도/접수번호/
+재무제표명/계정과목/금액)으로 교체했고, 감사인·파싱상태 컬럼은 제거했다. 신설
+"재무제표명"은 그 계정과목이 속한 표(재무상태표/손익계산서/현금흐름표)를 담는다 —
+분류·라벨·행 순서는 `FINANCIAL_SNAPSHOT_ACCOUNTS_BY_STATEMENT` 한 곳에서 정의한다.
+시트 ①(기본정보)의 포맷/컬럼과 `export_results_with_history()`의 시그니처는 무변경.
+
 포맷을 가르는 기준은 **`ids` 유무 하나뿐이다**(dart-qa 2026-07-28 리뷰 반영) —
 `include_history`는 어느 포맷을 쓸지에 관여하지 않는다. `ids` 없이
 `include_history=true`만 온 요청(필터 전체 + 재무이력)의 기본정보 시트는 wide다.
@@ -295,9 +303,61 @@ def export_selection_results(
 # 다중 선택 다운로드(§4-11, M9) — results + financial_history 2시트 xlsx
 # ---------------------------------------------------------------------------
 
-# `financial_snapshots`(회사×회계연도) 전용 한국어 헤더. `RESULT_COLUMN_LABELS`와
-# 같은 명명 규칙을 따르되 이 테이블은 필드에 `_cur`/`_prv` 접미어가 없으므로
-# "(당기)/(전기)" 표기를 빼고 그대로 쓴다(그래서 두 딕셔너리를 합칠 수 없다).
+# `financial_snapshots`(회사×회계연도) 시트는 2026-07-29부터 기본정보 시트와 같은
+# **long 포맷**이다 — 스냅샷 1건(회사×회계연도)이 재무 19항목만큼 19행으로 풀리고,
+# 재무 항목마다 그 항목이 속한 재무제표 이름("재무상태표"/"손익계산서"/"현금흐름표")을
+# 함께 싣는다(사용자 확정). 감사인/파싱상태 컬럼은 이때 제거됐다.
+#
+# 계정과목 라벨·순서·재무제표 소속을 **한 곳에서** 정의해 셋이 어긋날 여지를 없앤다.
+# dict 순서가 곧 한 스냅샷 안의 행 순서다(재무상태표 → 손익계산서 → 현금흐름표,
+# 각 표 안에서는 아래 나열 순서 그대로). 영업외수익/영업외비용은 손익계산서 소속으로
+# 분류한다.
+FINANCIAL_SNAPSHOT_ACCOUNTS_BY_STATEMENT: dict[str, dict[str, str]] = {
+    "재무상태표": {
+        "current_assets": "유동자산",
+        "noncurrent_assets": "비유동자산",
+        "total_assets": "자산총계",
+        "current_liab": "유동부채",
+        "noncurrent_liab": "비유동부채",
+        "total_liab": "부채총계",
+        "total_equity": "자본총계",
+    },
+    "손익계산서": {
+        "revenue": "매출액",
+        "cogs": "매출원가",
+        "gross_profit": "매출총이익",
+        "sga": "판매비와관리비",
+        "operating_income": "영업이익",
+        "net_income": "당기순이익",
+        "non_operating_income": "영업외수익",
+        "non_operating_expense": "영업외비용",
+    },
+    "현금흐름표": {
+        "cf_operating": "영업활동현금흐름",
+        "cf_investing": "투자활동현금흐름",
+        "cf_financing": "재무활동현금흐름",
+        "cf_ending_cash": "기말의현금",
+    },
+}
+
+# 세로로 풀 재무 항목 19개(위 정의 순서 = 행 순서)와 그 라벨/재무제표 소속.
+FINANCIAL_SNAPSHOT_ACCOUNT_COLUMNS: list[str] = [
+    col for accounts in FINANCIAL_SNAPSHOT_ACCOUNTS_BY_STATEMENT.values() for col in accounts
+]
+FINANCIAL_SNAPSHOT_ACCOUNT_LABELS: dict[str, str] = {
+    col: label
+    for accounts in FINANCIAL_SNAPSHOT_ACCOUNTS_BY_STATEMENT.values()
+    for col, label in accounts.items()
+}
+FINANCIAL_SNAPSHOT_STATEMENT_BY_ACCOUNT: dict[str, str] = {
+    col: statement
+    for statement, accounts in FINANCIAL_SNAPSHOT_ACCOUNTS_BY_STATEMENT.items()
+    for col in accounts
+}
+
+# DB 필드명(가상 필드 `statement_name`/`account_name`/`amount` 포함) -> 한국어 헤더.
+# dict 순서가 곧 시트의 컬럼 순서다(2026-07-29 사용자 확정: 결과ID/회사명/회계연도/
+# 접수번호/재무제표명/계정과목/금액 7컬럼).
 #
 # `corp_name`은 `financial_snapshots`에 없는 컬럼이다 — 스냅샷은 `result_id` FK만
 # 가지므로 `snapshots_to_dataframe()`이 호출부가 넘긴 `{result_id: corp_name}`
@@ -308,56 +368,60 @@ FINANCIAL_SNAPSHOT_COLUMN_LABELS: dict[str, str] = {
     "corp_name": "회사명",
     "fiscal_year": "회계연도",
     "rcept_no": "접수번호",
-    # 표준 재무 13항목
-    "current_assets": "유동자산",
-    "noncurrent_assets": "비유동자산",
-    "total_assets": "자산총계",
-    "current_liab": "유동부채",
-    "noncurrent_liab": "비유동부채",
-    "total_liab": "부채총계",
-    "total_equity": "자본총계",
-    "revenue": "매출액",
-    "cogs": "매출원가",
-    "gross_profit": "매출총이익",
-    "sga": "판매비와관리비",
-    "operating_income": "영업이익",
-    "net_income": "당기순이익",
-    # 현금흐름표 4항목
-    "cf_operating": "영업활동현금흐름",
-    "cf_investing": "투자활동현금흐름",
-    "cf_financing": "재무활동현금흐름",
-    "cf_ending_cash": "기말의현금",
-    # 영업외수익/영업외비용 2항목
-    "non_operating_income": "영업외수익",
-    "non_operating_expense": "영업외비용",
-    # 그 연도를 당기로 감사한 감사인 (2026-07-26) — 전기 열 유래 행은 항상 빈 값이다.
-    "auditor_name": "감사인",
-    "parse_status": "파싱상태",
+    "statement_name": "재무제표명",
+    "account_name": "계정과목",
+    "amount": "금액",
 }
 
 FINANCIAL_SNAPSHOT_COLUMNS: list[str] = list(FINANCIAL_SNAPSHOT_COLUMN_LABELS.keys())
+
+# 각 행마다 반복되는 스냅샷 식별 컬럼(계정과목/금액을 뺀 나머지).
+FINANCIAL_SNAPSHOT_BASE_COLUMNS: list[str] = ["result_id", "corp_name", "fiscal_year", "rcept_no"]
 
 
 def snapshots_to_dataframe(
     snapshots: Sequence[FinancialSnapshot],
     corp_name_by_result_id: Mapping[int, str | None],
 ) -> pd.DataFrame:
-    """`financial_snapshots` 레코드 목록을 DB 필드명 컬럼의 DataFrame으로 변환.
+    """`financial_snapshots`를 "회사 × 회계연도 × 계정과목" long 포맷으로 변환.
+
+    스냅샷 1건이 `FINANCIAL_SNAPSHOT_ACCOUNT_COLUMNS` 개수(19)만큼의 행이 되고,
+    식별 컬럼(결과ID/회사명/회계연도/접수번호)은 그 행들에 그대로 반복된다.
 
     스냅샷은 회사명을 직접 갖고 있지 않으므로(`result_id` FK만), 호출부가
     `results` 조회 결과로 만든 `{result_id: corp_name}` 매핑을 함께 넘겨 조인한다.
     매핑에 없는 `result_id`는 회사명을 빈 값(None)으로 둔다 — 파일 생성을 실패시키지
     않는다.
 
+    값이 없는(`None`) 계정과목도 **행은 그대로 만들고 금액만 비운다** — 기본정보
+    시트(`results_to_selection_dataframe()`)와 동일한 방침이다(어떤 항목이 결측인지
+    파일에서 알 수 있어야 하므로 스킵하지 않는다). "금액" 컬럼은 같은 이유로 object
+    dtype으로 고정한다(그대로 두면 pandas가 float64로 올려 `5000000000.0`처럼
+    소수점이 붙고 결측이 `NaN`으로 출력된다).
+
     행 순서는 **입력 순서를 그대로 보존**한다(호출부가 `ORDER BY result_id,
     fiscal_year`로 정렬해 넘긴다 — 회사별로 묶인 뒤 연도 오름차순).
     """
-    rows = []
+    rows: list[dict[str, object | None]] = []
+    amounts: list[object | None] = []
     for snapshot in snapshots:
-        row = {col: getattr(snapshot, col, None) for col in FINANCIAL_SNAPSHOT_COLUMNS}
-        row["corp_name"] = corp_name_by_result_id.get(snapshot.result_id)
-        rows.append(row)
-    return pd.DataFrame(rows, columns=FINANCIAL_SNAPSHOT_COLUMNS)
+        base = {col: getattr(snapshot, col, None) for col in FINANCIAL_SNAPSHOT_BASE_COLUMNS}
+        base["corp_name"] = corp_name_by_result_id.get(snapshot.result_id)
+        for col in FINANCIAL_SNAPSHOT_ACCOUNT_COLUMNS:
+            value = getattr(snapshot, col, None)
+            rows.append(
+                {
+                    **base,
+                    "statement_name": FINANCIAL_SNAPSHOT_STATEMENT_BY_ACCOUNT[col],
+                    "account_name": FINANCIAL_SNAPSHOT_ACCOUNT_LABELS[col],
+                    "amount": value,
+                }
+            )
+            amounts.append(value)
+
+    df = pd.DataFrame(rows, columns=FINANCIAL_SNAPSHOT_COLUMNS)
+    df["amount"] = pd.Series(amounts, dtype=object, index=df.index)
+    return df
 
 
 def export_results_with_history(
@@ -368,8 +432,8 @@ def export_results_with_history(
 ) -> bytes:
     """기본정보(`results`) + 재무이력(`financial_history`) 2시트 xlsx 바이트 생성.
 
-    시트 ②`financial_history`는 회사×회계연도 그레인이라 시트 ①과 행 수가 다르다
-    — 그래서 한 시트에 합치지 않고 시트를 나눈다. csv는 다중 시트를 표현할 수
+    시트 ②`financial_history`는 회사×회계연도×계정과목 그레인이라 시트 ①과 행 수가
+    다르다 — 그래서 한 시트에 합치지 않고 시트를 나눈다. csv는 다중 시트를 표현할 수
     없으므로 이 함수에 대응하는 csv 형식은 없다(API가 `format=csv`+
     `include_history=true` 조합을 400으로 거부한다).
 

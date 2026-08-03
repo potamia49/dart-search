@@ -8,7 +8,10 @@ import openpyxl
 import pytest
 
 from app.exporters.excel import (
+    FINANCIAL_SNAPSHOT_ACCOUNT_COLUMNS,
+    FINANCIAL_SNAPSHOT_ACCOUNT_LABELS,
     FINANCIAL_SNAPSHOT_COLUMN_LABELS,
+    FINANCIAL_SNAPSHOT_STATEMENT_BY_ACCOUNT,
     RESULT_COLUMN_LABELS,
     SELECTION_ACCOUNT_COLUMNS,
     SELECTION_ACCOUNT_LABELS,
@@ -247,19 +250,107 @@ def _sample_snapshots() -> list[FinancialSnapshot]:
 
 
 def test_snapshots_to_dataframe_joins_corp_name_by_result_id():
+    """스냅샷 1건이 계정과목 19행으로 풀리고 식별 컬럼은 각 행에 반복된다(2026-07-29 long)."""
     df = snapshots_to_dataframe(_sample_snapshots(), {1: "㈜테스트"})
+
     assert list(df.columns) == list(FINANCIAL_SNAPSHOT_COLUMN_LABELS.keys())
-    assert list(df["corp_name"]) == ["㈜테스트", "㈜테스트"]
-    assert list(df["fiscal_year"]) == ["2024", "2025"]
-    assert df.loc[0, "total_assets"] == 5_000_000_000
-    assert df.loc[0, "auditor_name"] == "안경회계법인"
+    assert len(df) == 2 * len(FINANCIAL_SNAPSHOT_ACCOUNT_COLUMNS) == 38
+    assert set(df["corp_name"]) == {"㈜테스트"}
+    # 입력 순서(result_id → fiscal_year 오름차순) 보존: 앞 19행이 2024, 뒤 19행이 2025
+    assert list(df["fiscal_year"])[:19] == ["2024"] * 19
+    assert list(df["fiscal_year"])[19:] == ["2025"] * 19
+    assert list(df["rcept_no"])[:19] == ["20250401000001"] * 19
+
+    y2024 = df[df["fiscal_year"] == "2024"]
+    assert y2024[y2024["account_name"] == "자산총계"].iloc[0]["amount"] == 5_000_000_000
+    assert y2024[y2024["account_name"] == "영업활동현금흐름"].iloc[0]["amount"] == 1_000_000
+    assert y2024[y2024["account_name"] == "영업외수익"].iloc[0]["amount"] == 2_000_000
+
+
+def test_snapshots_to_dataframe_column_order_and_statement_classification():
+    """컬럼 순서(7개)와 재무제표명 분류·행 순서를 사용자 확정안대로 잠근다(2026-07-29)."""
+    df = snapshots_to_dataframe(_sample_snapshots()[:1], {1: "㈜테스트"})
+
+    assert list(FINANCIAL_SNAPSHOT_COLUMN_LABELS.values()) == [
+        "결과ID",
+        "회사명",
+        "회계연도",
+        "접수번호",
+        "재무제표명",
+        "계정과목",
+        "금액",
+    ]
+    # 감사인/파싱상태는 완전히 제거됐다.
+    assert "감사인" not in FINANCIAL_SNAPSHOT_COLUMN_LABELS.values()
+    assert "파싱상태" not in FINANCIAL_SNAPSHOT_COLUMN_LABELS.values()
+    assert "auditor_name" not in df.columns and "parse_status" not in df.columns
+
+    # 재무제표명 → 계정과목 순서: 재무상태표 7 → 손익계산서 8(영업외손익 포함) → 현금흐름표 4
+    assert list(df["statement_name"]) == ["재무상태표"] * 7 + ["손익계산서"] * 8 + ["현금흐름표"] * 4
+    assert list(df["account_name"]) == [
+        "유동자산",
+        "비유동자산",
+        "자산총계",
+        "유동부채",
+        "비유동부채",
+        "부채총계",
+        "자본총계",
+        "매출액",
+        "매출원가",
+        "매출총이익",
+        "판매비와관리비",
+        "영업이익",
+        "당기순이익",
+        "영업외수익",
+        "영업외비용",
+        "영업활동현금흐름",
+        "투자활동현금흐름",
+        "재무활동현금흐름",
+        "기말의현금",
+    ]
+
+
+def test_snapshot_account_columns_match_selection_account_columns():
+    """스냅샷 계정과목 19개가 `results`의 `_cur` 항목 전체와 1:1로 대응해야 한다.
+
+    새 `_cur`/`_prv` 쌍이 추가되면 `financial_snapshots`에도 접미어 없는 같은
+    필드가 생기는데(CF 4항목·영업외손익 2항목이 그랬다), 이 시트의 하드코딩 목록에
+    반영하지 않으면 **에러 없이 조용히** 빠진다 — 그 드리프트를 여기서 잡는다.
+    """
+    assert {c.removesuffix("_cur") for c in SELECTION_ACCOUNT_COLUMNS} == set(
+        FINANCIAL_SNAPSHOT_ACCOUNT_COLUMNS
+    )
+    # 라벨도 두 시트가 같아야 한다("매출액" 등 — 한쪽만 바뀌면 대조가 어려워진다).
+    for col in SELECTION_ACCOUNT_COLUMNS:
+        assert SELECTION_ACCOUNT_LABELS[col] == FINANCIAL_SNAPSHOT_ACCOUNT_LABELS[
+            col.removesuffix("_cur")
+        ]
+    # 모든 계정과목이 정확히 하나의 재무제표에 속한다.
+    assert set(FINANCIAL_SNAPSHOT_STATEMENT_BY_ACCOUNT) == set(FINANCIAL_SNAPSHOT_ACCOUNT_COLUMNS)
+    assert set(FINANCIAL_SNAPSHOT_STATEMENT_BY_ACCOUNT.values()) == {
+        "재무상태표",
+        "손익계산서",
+        "현금흐름표",
+    }
+
+
+def test_snapshots_to_dataframe_keeps_rows_for_missing_amounts():
+    """값이 None인 계정과목도 행은 남기고 금액만 비운다(기본정보 시트와 동일 방침)."""
+    df = snapshots_to_dataframe(_sample_snapshots()[:1], {1: "㈜테스트"})
+
+    assert len(df) == 19
+    assert df[df["account_name"] == "유동자산"].iloc[0]["amount"] is None
+    # 값이 있는 것은 4개(자산총계/매출액/영업활동현금흐름/영업외수익)
+    assert len(df[df["amount"].isna()]) == 15
+    # float64로 승격되면 5000000000.0처럼 소수점이 붙는다.
+    assert df["amount"].dtype == object
 
 
 def test_snapshots_to_dataframe_unknown_result_id_leaves_corp_name_blank():
     """매핑에 없는 result_id는 회사명만 비고 파일 생성 자체는 실패하지 않는다."""
     df = snapshots_to_dataframe(_sample_snapshots(), {})
     assert df["corp_name"].isna().all()
-    assert len(df) == 2
+    assert len(df) == 38
 
 
 def test_export_results_with_history_writes_two_sheets():
@@ -279,10 +370,24 @@ def test_export_results_with_history_writes_two_sheets():
     history_ws = wb["financial_history"]
     history_header = [c.value for c in next(history_ws.iter_rows(min_row=1, max_row=1))]
     assert history_header == list(FINANCIAL_SNAPSHOT_COLUMN_LABELS.values())
-    assert history_ws.max_row == 3  # 헤더 + 스냅샷 2행
+    assert history_ws.max_row == 39  # 헤더 + 스냅샷 2건 × 계정과목 19행(2026-07-29 long)
     assert history_ws.cell(row=2, column=history_header.index("회사명") + 1).value == "㈜테스트"
     year_cell = history_ws.cell(row=2, column=history_header.index("회계연도") + 1).value
     assert str(year_cell) == "2024"
+
+    stmt_col = history_header.index("재무제표명") + 1
+    account_col = history_header.index("계정과목") + 1
+    amount_col = history_header.index("금액") + 1
+    assert history_ws.cell(row=2, column=stmt_col).value == "재무상태표"
+    assert history_ws.cell(row=2, column=account_col).value == "유동자산"
+    assert history_ws.cell(row=2, column=amount_col).value is None  # 결측은 빈 셀
+    # 2024 스냅샷의 자산총계(재무상태표 3번째 행 = 시트 4행)
+    assert history_ws.cell(row=4, column=account_col).value == "자산총계"
+    assert history_ws.cell(row=4, column=amount_col).value == 5_000_000_000
+    # 첫 스냅샷(2024)이 2~20행, 두 번째 스냅샷(2025)은 21행부터 시작한다.
+    year_col = history_header.index("회계연도") + 1
+    assert str(history_ws.cell(row=20, column=year_col).value) == "2024"
+    assert str(history_ws.cell(row=21, column=year_col).value) == "2025"
 
 
 def test_export_results_with_history_uses_long_format_only_when_asked():
@@ -305,8 +410,8 @@ def test_export_results_with_history_uses_long_format_only_when_asked():
     long_header = [c.value for c in next(long_ws.iter_rows(min_row=1, max_row=1))]
     assert long_header == list(SELECTION_EXPORT_COLUMN_LABELS.values())
     assert long_ws.max_row == 20  # 헤더 + 회사 1건 × 계정과목 19행
-    # 시트 ②는 포맷과 무관하게 동일하다.
-    assert long_wb["financial_history"].max_row == 3
+    # 시트 ②는 포맷과 무관하게 동일하다(스냅샷 2건 × 계정과목 19행 + 헤더).
+    assert long_wb["financial_history"].max_row == 39
 
     wide_wb = openpyxl.load_workbook(
         io.BytesIO(
@@ -323,7 +428,7 @@ def test_export_results_with_history_uses_long_format_only_when_asked():
     assert wide_header == list(RESULT_COLUMN_LABELS.values())
     assert "매출액(전기)" in wide_header and "계정과목명" not in wide_header
     assert wide_ws.max_row == 2
-    assert wide_wb["financial_history"].max_row == 3
+    assert wide_wb["financial_history"].max_row == 39
 
 
 def test_export_results_with_history_empty_inputs_return_header_only_sheets():
