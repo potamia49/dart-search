@@ -3,6 +3,14 @@
 상세개발계획.md §6 (M2~M4 범위):
     GET /api/jobs/{id}/results                  결과 목록 (페이징, parse_status/제외 여부 필터)
     GET /api/jobs/{id}/export?format=xlsx|csv    결과 파일 다운로드
+    POST /api/jobs/{id}/generate-report          선택 회사별 감사 수임 제안 보고서(HTML)
+                                                 + 발송처 목록 엑셀을 로컬 폴더에 생성
+                                                 (2026-08-03 추가)
+    POST /api/jobs/{id}/results/selection-summary 선택한 id 목록의 요약 집계
+                                                 (확인 모달용, 2026-08-03 추가.
+                                                  `failed`/`no_disclosure`/
+                                                  `no_history` 구분은 응답 모델
+                                                  docstring 참고)
     GET /api/jobs/{id}/results/{result_id}/history  회사 1건의 연도별 재무 이력
                                                      (STEP 7, 2026-07-15 추가)
 
@@ -14,6 +22,12 @@ STEP 5(파싱, M3)가 채워져 `parse_status`/재무 항목이 실제 값을 �
 `include_history`(재무이력 시트 추가, xlsx 전용) 쿼리 파라미터를 함께 받는다 —
 기존 "현재 필터·정렬 전체 내보내기" 동작은 두 파라미터가 없을 때 그대로다.
 
+`/results`는 2026-08-03부터 `ids_only=true`를 받는다 — 페이징 없이 현재 필터를
+통과한 `results.id`만 전부 돌려주는 경량 응답으로, 화면의 "현재 필터 전체 선택"이
+페이지를 순회하지 않고 선택 목록(`/export?ids=` · `/generate-report`의 입력)을
+한 번에 만들기 위한 것이다. 새 엔드포인트를 만들지 않고 기존 목록 조회에 옵션
+하나만 얹은 형태이며, 필터·정렬 파라미터의 의미는 완전히 동일하다.
+
 `/results/{result_id}/history`는 `financial_snapshots`(STEP 7)를 조회한다.
 기존 `/results` 목록 응답은 무겁게 만들지 않기 위해 그대로 두고(이력은
 포함하지 않음), 상세 조회에서만 lazy-load하게 별도 엔드포인트로 분리했다.
@@ -21,10 +35,11 @@ STEP 5(파싱, M3)가 채워져 `parse_status`/재무 항목이 실제 값을 �
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Response
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import Select, func, or_, select
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
@@ -39,7 +54,12 @@ from app.exporters.excel import (
 )
 from app.models.financial_snapshot import FinancialSnapshot
 from app.models.job import Job, JobPhase
-from app.models.result import Result
+from app.models.result import ParseStatus, Result
+from app.reports.audit_proposal import (
+    ReportGenerationError,
+    ReportInput,
+    generate_reports,
+)
 from app.parsers.account_detail import parse_account_detail
 from app.parsers.auditor import extract_auditor
 from app.parsers.document_sections import SECTION_TITLE_MARKS, extract_section_html
@@ -263,6 +283,13 @@ class ResultListResponse(BaseModel):
     page: int
     page_size: int
     items: list[ResultResponse]
+    # `?ids_only=true`일 때만 채워지는 경량 응답 필드 (2026-08-03, §4-11 "필터 전체
+    # 선택"용). 그 외에는 항상 **null**이며(빈 배열이 아니다), 그 차이가 프론트의
+    # fail-safe 근거다 — `ids`를 모르는 구버전 백엔드는 `ids_only`를 조용히 무시하고
+    # 200 + 페이지 1쪽만 돌려주므로, 응답에 `ids` 키가 없으면(=null) "서버가 전체
+    # 선택을 지원하지 않음"으로 판정해야 한다(`/export`의 `_selected` 파일명 접미어와
+    # 같은 방식의 양방향 계약).
+    ids: list[int] | None = None
 
 
 @router.get("/{job_id}/results", response_model=ResultListResponse)
@@ -270,6 +297,7 @@ async def list_results(
     job_id: int,
     page: int = 1,
     page_size: int = 50,
+    ids_only: bool = False,
     parse_status: str | None = None,
     excluded_by_revenue: bool | None = None,
     excluded_by_assets: bool | None = None,
@@ -302,6 +330,20 @@ async def list_results(
       화이트리스트(`SORTABLE_COLUMNS`) 밖 컬럼/형식 오류는 무시한다.
     - `sort_by`/`sort_dir`: 레거시 단일 정렬 컬럼과 방향(`asc`/`desc`, 기본
       오름차순). `sort`가 있으면 무시된다(하위호환). 값이 없는 행은 항상 뒤로 보낸다.
+    - `ids_only`: true면 **페이징 없이** 위 필터를 통과한 `results.id` 전체를
+      `ids`에 담아 돌려준다(아래 참고). 화면의 "현재 필터 전체 선택"(체크박스)이
+      페이지를 넘나들지 않고 한 번에 선택 목록을 만들기 위한 옵션이다(2026-08-03).
+
+    **`ids_only=true`의 응답 규약** (§4-11 "선택 항목 다운로드/보고서 생성"의 전제):
+
+    - `items`는 **항상 빈 배열**이고 `ids`가 정렬 순서 그대로 전체 id를 담는다.
+      `page`/`page_size` 파라미터는 무시하며(전체를 한 번에 준다), 응답의
+      `page`는 1, `page_size`는 반환한 id 개수(=`total`)로 채운다.
+    - 전체 필드를 담은 `items`(컬럼 63개, 실측 약 1.9KB/행)를 다시 내려받지 않기
+      위해 SQL 자체가 `results.id` 한 컬럼만 SELECT한다 — 4,383건 기준 응답이
+      약 8.5MB → 약 26KB로 줄고, `page_size` 상한(500) 때문에 필요했던 9회
+      페이지 순회도 1회로 줄어든다.
+    - `total`은 반환한 `ids`의 개수와 **항상 일치**한다(같은 쿼리에서 세므로).
     """
     job = db.get(Job, job_id)
     if job is None:
@@ -318,11 +360,26 @@ async def list_results(
         auditor_changed,
     )
 
+    sort_specs = _resolve_sort_specs(sort, sort_by, sort_dir)
+
+    if ids_only:
+        # id 한 컬럼만 SELECT한다(`with_only_columns`) — ORM 엔티티를 만들지 않으므로
+        # 수천 건이어도 메모리/직렬화 비용이 무시할 수준이다. 정렬은 목록과 동일하게
+        # 적용해 "화면에 보이는 순서 = 선택 순서"가 되게 한다(`_apply_sort`의 NULL
+        # 후순위 규칙도 그대로 따라간다 — ORDER BY 컬럼이 SELECT 목록에 없어도 무방).
+        ids = list(
+            db.execute(_apply_sort(stmt.with_only_columns(Result.id), sort_specs))
+            .scalars()
+            .all()
+        )
+        return ResultListResponse(
+            total=len(ids), page=1, page_size=len(ids), items=[], ids=ids
+        )
+
     total = db.execute(select(func.count()).select_from(stmt.subquery())).scalar_one()
 
     page = max(page, 1)
     page_size = max(min(page_size, 500), 1)
-    sort_specs = _resolve_sort_specs(sort, sort_by, sort_dir)
     rows = (
         db.execute(
             _apply_sort(stmt, sort_specs).offset((page - 1) * page_size).limit(page_size)
@@ -505,13 +562,7 @@ async def export_job_results(
             if selected_ids
             else []
         )
-        found = {r.id for r in rows}
-        missing = [i for i in selected_ids if i not in found]
-        if missing:
-            raise HTTPException(
-                status_code=400,
-                detail=f"이 Job에 속하지 않는 결과 id가 있습니다: {missing}",
-            )
+        _assert_ids_belong_to_job(selected_ids, {r.id for r in rows})
     else:
         stmt = _build_results_query(
             job_id,
@@ -578,6 +629,305 @@ async def export_job_results(
         content=content,
         media_type=_EXPORT_CONTENT_TYPES[format],
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+class GenerateReportRequest(BaseModel):
+    """선택 항목 보고서 생성 요청 — 체크박스로 고른 `results.id` 목록."""
+
+    ids: list[int] = Field(..., min_length=1)
+
+
+class GeneratedReportFileResponse(BaseModel):
+    result_id: int | None
+    corp_name: str | None
+    filename: str
+
+
+class ReportWarningResponse(BaseModel):
+    result_id: int | None
+    corp_name: str | None
+    message: str
+
+
+class SkippedReportResponse(BaseModel):
+    """보고서를 만들지 않고 건너뛴 회사(2026-08-03 추가)."""
+
+    result_id: int | None
+    corp_name: str | None
+    reason: str
+
+
+class GenerateReportResponse(BaseModel):
+    """생성 결과 — 화면에 "이 경로에 저장됐습니다"를 그대로 보여줄 수 있는 형태."""
+
+    # 생성된 폴더의 절대 경로(예: `C:\\claude\\dart-search\\backend\\report\\2026-08-03`)
+    output_dir: str
+    generated_count: int
+    files: list[GeneratedReportFileResponse]
+    # 같은 폴더에 함께 만든 우편 발송용 라벨 엑셀 파일명
+    label_file: str
+    # 생성은 됐지만 검수가 필요한 회사에 대한 경고(부분 파싱 값 포함, 결측 연도
+    # 제외 등) + 생성하지 않은 회사 안내. 요청 전체의 실패가 아니다.
+    warnings: list[ReportWarningResponse]
+    # 쓸 수 있는 재무 이력이 없어 **생성하지 않은** 회사 목록(2026-08-03).
+    # 선택 건수 != generated_count인 이유가 여기에 있다.
+    skipped: list[SkippedReportResponse] = []
+
+
+def _validate_report_ids(ids: Sequence[int]) -> list[int]:
+    """요청 바디의 `ids`를 정규화한다(중복 제거, 순서 보존, 범위 검증).
+
+    `_parse_export_ids()`와 같은 이유로 SQLite INTEGER 범위(양수 int64)를 벗어난
+    값을 400으로 막는다 — 그대로 `IN (...)`에 바인딩하면 `OverflowError`로 500이 된다.
+    """
+    normalized: list[int] = []
+    seen: set[int] = set()
+    for value in ids:
+        if not 0 < value <= 2**63 - 1:
+            raise HTTPException(
+                status_code=400,
+                detail=f"ids에 결과 id로 쓸 수 없는 값이 있습니다: {value!r}",
+            )
+        if value in seen:
+            continue
+        seen.add(value)
+        normalized.append(value)
+    return normalized
+
+
+def _assert_ids_belong_to_job(
+    selected_ids: Sequence[int], found_ids: set[int]
+) -> None:
+    """선택 id 중 이 Job에 없는 것이 있으면 400 — 선택 기반 3개 경로의 공통 계약.
+
+    `/export?ids=`(선택 다운로드) · `POST /generate-report`(보고서 생성) ·
+    `POST /results/selection-summary`(선택 요약)가 **같은 메시지로** 거부해야
+    한다 — 요약이 200을 주고 생성이 400을 주면 확인 모달이 거짓 안내를 하게 된다.
+    """
+    missing = [i for i in selected_ids if i not in found_ids]
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"이 Job에 속하지 않는 결과 id가 있습니다: {missing}",
+        )
+
+
+@router.post("/{job_id}/generate-report", response_model=GenerateReportResponse)
+async def generate_selection_report(
+    job_id: int,
+    payload: GenerateReportRequest,
+    db: Session = Depends(get_db),
+) -> GenerateReportResponse:
+    """선택한 회사들의 **감사 수임 제안 보고서(HTML)** 를 로컬 폴더에 생성한다.
+
+    "선택 항목 다운로드"(`GET /export?ids=...`)가 파일을 브라우저로 내려보내는
+    것과 달리, 이 엔드포인트는 **서버(=사용자 PC) 로컬 폴더에 파일을 떨궈 놓고
+    그 경로를 알려준다** — 회사마다 HTML이 1개씩 나오고 우편 발송용 라벨 엑셀이
+    함께 만들어지므로, 브라우저 다운로드보다 폴더로 받는 편이 쓰기 쉽기 때문이다.
+
+        <REPORT_OUTPUT_DIR>/YYYY-MM-DD[_2, _3 ...]/
+            ├─ (주)OO산업.html   ← 회사 1건 = 파일 1개(파일명은 회사명)
+            └─ 발송처_목록.xlsx   ← 회사명/주소 2컬럼
+
+    같은 날 다시 호출하면 기존 폴더를 덮어쓰지 않고 `_2`, `_3` ... 폴더를 새로 만든다.
+
+    이 앱은 로컬 오피스 PC의 단일 사용자 도구라(CLAUDE.md) 선택 건수만큼을 그
+    자리에서 동기 처리한다 — Job 크롤링처럼 백그라운드로 빼지 않는다. 다만 템플릿
+    렌더링·파일 쓰기는 동기 I/O라 `run_in_threadpool`로 넘겨 진행률 폴링 등 다른
+    요청을 막지 않는다(`/export`와 동일한 처리).
+
+    - 다른 Job의 결과 id가 섞여 있으면 400이다(`/export?ids=`와 동일한 스코프 검증).
+    - **쓸 수 있는 재무 이력이 한 연도도 없는 회사는 생성하지 않고** `skipped`와
+      `warnings`에 남긴다(요청 전체는 성공이다). 빈 재무이력을 넣으면 템플릿 렌더가
+      도중에 중단돼 연락처도 없는 반쪽 문서가 나오기 때문이다(§4-12 참고).
+    - 파싱 실패(FAILED) 연도는 제외하고, 부분 파싱(PARTIAL)·전기 유래 연도가 실린
+      경우 `warnings`로 알린다 — 검수되지 않은 값이 대외 문서에 섞였다는 사실이
+      사용자에게 보여야 한다.
+    - 파일 저장 실패(권한/디스크 공간 등)는 500 스택트레이스 대신 사용자가 읽을 수
+      있는 한국어 메시지와 함께 **507**로 응답한다.
+    """
+    job = db.get(Job, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job을 찾을 수 없습니다.")
+
+    selected_ids = _validate_report_ids(payload.ids)
+    rows = (
+        db.execute(
+            select(Result)
+            .where(Result.job_id == job_id, Result.id.in_(selected_ids))
+            .order_by(Result.id.asc())
+        )
+        .scalars()
+        .all()
+    )
+    _assert_ids_belong_to_job(selected_ids, {r.id for r in rows})
+
+    # 재무이력은 새로 쿼리하지 않고 상세 Drawer가 쓰는 기존 조회 함수를 그대로
+    # 재사용한다 — 연도 오름차순 정렬/소속 검증이 한 곳(`get_result_history`)에만
+    # 있어야 화면과 보고서의 값이 갈리지 않는다.
+    items = [
+        ReportInput(result=row, snapshots=await get_result_history(job_id, row.id, db))
+        for row in rows
+    ]
+
+    try:
+        outcome = await run_in_threadpool(generate_reports, items)
+    except ReportGenerationError as exc:
+        raise HTTPException(status_code=507, detail=str(exc)) from exc
+
+    return GenerateReportResponse(
+        output_dir=str(outcome.output_dir),
+        generated_count=len(outcome.files),
+        files=[
+            GeneratedReportFileResponse(
+                result_id=f.result_id, corp_name=f.corp_name, filename=f.filename
+            )
+            for f in outcome.files
+        ],
+        label_file=outcome.label_filename,
+        warnings=[
+            ReportWarningResponse(
+                result_id=w.result_id, corp_name=w.corp_name, message=w.message
+            )
+            for w in outcome.warnings
+        ],
+        skipped=[
+            SkippedReportResponse(
+                result_id=s.result_id, corp_name=s.corp_name, reason=s.reason
+            )
+            for s in outcome.skipped
+        ],
+    )
+
+
+class SelectionSummaryRequest(BaseModel):
+    """선택 요약 조회 요청 — `POST /generate-report`와 **완전히 같은 입력 계약**이다."""
+
+    ids: list[int] = Field(..., min_length=1)
+
+
+class SelectionSummaryResponse(BaseModel):
+    """체크된 회사들의 "위험 신호" 집계 (2026-08-03, §4-12-A).
+
+    화면이 확인 모달에 "선택 N건 중 휴면·폐업 추정 X건이 포함돼 있습니다"를 그대로
+    찍을 수 있는 형태다. 필드는 전부 **건수**이며, 한 회사가 여러 조건에 동시에
+    걸릴 수 있어(매출액·총자산 필터는 서로 독립 판정이다) **합계가 `total`을 넘을 수
+    있다** — 화면에서 더하지 말 것.
+
+    **`failed`와 `no_disclosure`는 반드시 분리해서 읽어야 한다** (2026-08-03
+    dart-qa 실측 반영). Phase 2 B1이 감사보고서 공시를 못 찾은 건에
+    `parse_status=FAILED`와 `excluded_by_stale_disclosure=1`을 **동시에** 쓰기
+    때문에(`app/core/pipeline.py`), FAILED 전체를 세면 "검수 필요"가 실제보다
+    수천 배 부풀려진다(개발 DB 실측: FAILED 2,215건 중 2,214건이 `rcept_no IS
+    NULL`이고 진짜 검수 필요는 1건). 그래서 두 필드는 결과 화면의 탭 구분과
+    **정확히 같은 조건**을 쓴다:
+
+    - `failed`        = "파싱 실패 (검수 필요)" 탭 (`parse_status=FAILED` **AND**
+                        `rcept_no IS NOT NULL`) — 원문은 있는데 못 읽은 건.
+    - `no_disclosure` = "감사보고서 없음" 탭 (`rcept_no IS NULL`) — 열어볼 원문이
+                        애초에 없어 **검수 대상이 아니다**. 경고로 취급할 필요는
+                        없지만, 보고서에 실을 재무 이력이 없을 가능성이 높아
+                        화면 안내에 쓸 수 있게 건수를 내려준다.
+
+    `no_history`는 위 둘과 또 다른 축이다 — `financial_snapshots`가 0건인 회사는
+    `generate_reports()`가 **생성하지 않고 건너뛰므로**(§4-12), 확인 모달의
+    "N건 생성" 문구는 `total`이 아니라 `total - no_history`(=최대 생성 가능
+    건수)를 기준으로 써야 한다. 실측(Job 27): 4,383건 중 3,149건이 스냅샷 0건이라
+    실제 산출물은 최대 1,234건이었다. 스냅샷이 있어도 전 연도가 파싱 실패/결측이면
+    추가로 건너뛸 수 있어 어디까지나 **상한**이다.
+    """
+
+    total: int
+    stale_disclosure: int
+    excluded_revenue: int
+    excluded_assets: int
+    # `parse_status=FAILED` **이면서** 원문(rcept_no)이 있는 건 = 진짜 검수 필요
+    failed: int
+    # `rcept_no IS NULL` = 감사보고서 자체가 없는 건(검수 대상 아님)
+    no_disclosure: int
+    # 재무 이력(financial_snapshots)이 0건이라 보고서 생성이 건너뛰어질 건
+    no_history: int
+
+
+@router.post("/{job_id}/results/selection-summary", response_model=SelectionSummaryResponse)
+async def get_selection_summary(
+    job_id: int,
+    payload: SelectionSummaryRequest,
+    db: Session = Depends(get_db),
+) -> SelectionSummaryResponse:
+    """체크된 `results.id` 목록에 대한 요약 집계 (§4-12-A, 2026-08-03).
+
+    "선택 항목 보고서 생성"(`POST /generate-report`)의 **사전 확인 모달**이 쓰는
+    읽기 전용 조회다 — 클릭 한 번으로 수천 건이 선택될 수 있고(§4-11-A "현재 필터
+    전체 선택"), 선택은 여러 탭을 넘나들며 **합집합으로 누적**되므로 조건에 맞지
+    않는 회사(휴면·폐업 추정 / 매출액·총자산 조건 제외 / 파싱 실패)가 조용히 우편
+    발송 대상에 섞일 수 있다. 그 사실을 생성 **전에** 보여주기 위한 것이다.
+
+    필터 조건이 아니라 **명시적 id 목록**에 대한 집계라 `GET /results`의 필터
+    파라미터에 얹지 않고 별도 엔드포인트로 뒀다(설계 근거는 §4-12-A). 입력·검증·
+    에러 계약은 `POST /generate-report`와 완전히 동일하다 — 같은 `ids`로 이 요약이
+    200을 받았다면 생성도 같은 이유로 거부되지 않는다:
+
+    - `ids`가 비면 422(pydantic `min_length=1`), 중복은 제거한다.
+    - SQLite INTEGER 범위를 벗어난 값은 400(`_validate_report_ids`).
+    - 다른 Job의 결과 id가 섞이면 400(`_assert_ids_belong_to_job` — 생성 시와 동일 메시지).
+
+    **`failed` / `no_disclosure` / `no_history`의 의미 구분은
+    `SelectionSummaryResponse`의 docstring에 정리돼 있다** — 특히 `failed`는
+    화면의 "파싱 실패 (검수 필요)" 탭과 **정확히 같은 조건**(`rcept_no IS NOT
+    NULL` 포함)이라, FAILED 전체 건수와 다르다는 점을 주의할 것.
+
+    DB 스키마 변경·추가 API 호출은 0건이다. 집계에 필요한 6개 컬럼만 SELECT하고
+    (ORM 엔티티를 만들지 않아 수천 건이어도 가볍다), 재무 이력 유무는 스냅샷의
+    `result_id`만 DISTINCT로 한 번 더 조회해 판정한다 — 회사마다
+    `get_result_history()`를 부르면 선택 건수만큼 쿼리가 나가고 이력 전체를
+    직렬화하게 되는데, 여기서 필요한 건 "0건인가"뿐이다.
+    """
+    job = db.get(Job, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job을 찾을 수 없습니다.")
+
+    selected_ids = _validate_report_ids(payload.ids)
+    rows = db.execute(
+        select(
+            Result.id,
+            Result.rcept_no,
+            Result.excluded_by_stale_disclosure,
+            Result.excluded_by_revenue,
+            Result.excluded_by_assets,
+            Result.parse_status,
+        ).where(Result.job_id == job_id, Result.id.in_(selected_ids))
+    ).all()
+    _assert_ids_belong_to_job(selected_ids, {row.id for row in rows})
+
+    # 재무 이력이 1건이라도 있는 result_id 집합 — 나머지가 `no_history`다.
+    with_history = set(
+        db.execute(
+            select(FinancialSnapshot.result_id)
+            .where(FinancialSnapshot.result_id.in_(selected_ids))
+            .distinct()
+        )
+        .scalars()
+        .all()
+    )
+
+    return SelectionSummaryResponse(
+        total=len(rows),
+        # 기존 완료 Job의 행은 이 플래그들이 NULL일 수 있어(컬럼 추가 시 소급 계산
+        # 없음 관례) `== 1`로만 센다 — NULL/0은 모두 "해당 없음"이다.
+        stale_disclosure=sum(1 for row in rows if row.excluded_by_stale_disclosure == 1),
+        excluded_revenue=sum(1 for row in rows if row.excluded_by_revenue == 1),
+        excluded_assets=sum(1 for row in rows if row.excluded_by_assets == 1),
+        # 공시를 못 찾은 건에도 파이프라인이 FAILED를 쓰기 때문에(위 docstring),
+        # `rcept_no` 유무로 "검수 필요"와 "원문 자체가 없음"을 갈라 센다.
+        failed=sum(
+            1
+            for row in rows
+            if row.parse_status == ParseStatus.FAILED and row.rcept_no is not None
+        ),
+        no_disclosure=sum(1 for row in rows if row.rcept_no is None),
+        no_history=sum(1 for row in rows if row.id not in with_history),
     )
 
 

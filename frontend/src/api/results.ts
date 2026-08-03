@@ -5,9 +5,11 @@ import type {
   DocumentSectionResponse,
   ExportFormat,
   FinancialSnapshotResponse,
+  GenerateReportResponse,
   ParseStatus,
   ResultListResponse,
   ResultResponse,
+  SelectionSummaryResponse,
   SortDir,
 } from '../types'
 
@@ -36,6 +38,10 @@ export interface ListResultsParams {
   /** 레거시 단일 정렬 컬럼과 방향 — `sort`가 있으면 백엔드가 무시한다(하위호환). */
   sort_by?: string
   sort_dir?: SortDir
+  /** true면 페이징 없이 현재 필터를 통과한 `results.id` 전체만 받는 경량 응답
+   * (`items`는 빈 배열, `ids`에 전체 id). "현재 필터 전체 선택"에서만 쓴다 —
+   * 직접 호출하지 말고 아래 `listAllResultIds()`를 쓸 것(구버전 서버 판별 포함). */
+  ids_only?: boolean
 }
 
 export async function listResults(
@@ -48,7 +54,42 @@ export async function listResults(
   return data
 }
 
-/** §4-11 다중 선택 다운로드 옵션 — 기존 "현재 필터 전체 내보내기"와 병행하는 별개 경로다. */
+/** "현재 필터 전체 선택"을 요청했는데 **서버가 `ids_only`를 모르는 구버전**인 경우.
+ *
+ * `ids_only`는 2026-08-03에 추가된 파라미터라, 그 이전 코드로 떠 있는 백엔드
+ * (재시작하지 않은 uvicorn, 구버전 배포 exe)는 모르는 쿼리 파라미터를 조용히
+ * 무시하고 200 + **1페이지(50건)만** 돌려준다. 그 응답에는 `ids` 키가 없으므로
+ * (=`null`), 그대로 선택에 반영하면 "전체 선택했는데 50건만 들어간" 파일이 된다.
+ * `ids: []`(조건에 맞는 결과가 진짜 0건)와 반드시 구분해야 한다 —
+ * `SelectionExportUnsupportedError`와 같은 fail-safe 계약이다. */
+export class SelectAllUnsupportedError extends Error {
+  constructor() {
+    super('서버가 필터 전체 선택(ids_only)을 지원하지 않습니다.')
+    this.name = 'SelectAllUnsupportedError'
+  }
+}
+
+/** "현재 필터 전체 선택" — 목록 화면과 **똑같은 필터·정렬**로 조회한 결과의 id를
+ * 페이징 없이 전부 받아온다(2026-08-03).
+ *
+ * 목록 조회를 `page_size`만 키워 재사용할 수는 없다 — 백엔드가 `page_size`를 500으로
+ * 조용히 상한 처리하고(에러 없이 잘림), 결과 1행이 63개 필드라 전체를 받으면
+ * 무겁기 때문이다(실측 1,222건 약 2.4MB vs id만 12.4KB).
+ *
+ * 응답에 `ids`가 없으면(구버전 서버) 빈 배열로 뭉개지 말고 `SelectAllUnsupportedError`를
+ * 던져 호출부가 "선택을 적용하지 않았다"고 안내하게 한다. */
+export async function listAllResultIds(
+  jobId: number,
+  filters: Omit<ListResultsParams, 'page' | 'page_size' | 'ids_only'> = {},
+): Promise<number[]> {
+  const data = await listResults(jobId, { ...filters, ids_only: true })
+  // `== null`은 null과 undefined(키 자체가 없는 구버전 응답)를 함께 잡는다.
+  if (data.ids == null) throw new SelectAllUnsupportedError()
+  return data.ids
+}
+
+/** §4-11 다중 선택 다운로드 옵션 — 백엔드의 "현재 필터 전체 내보내기"와 병행하는 별개 경로다
+ * (전체 내보내기는 2026-08-03에 화면에서 버튼을 내렸고 백엔드 경로만 남아 있다). */
 export interface ExportResultsOptions {
   /** 체크박스로 고른 `results.id` 목록. 지정되면 백엔드가 다른 필터·정렬을 **전부 무시**하고
    * 정확히 이 id들만 id 오름차순으로 내보낸다(타 Job의 id가 섞이거나 정수가 아니면 400). */
@@ -133,6 +174,45 @@ export async function exportResults(
   link.click()
   link.remove()
   window.URL.revokeObjectURL(blobUrl)
+}
+
+/** §4-12 선택 항목 보고서 생성 — 체크한 회사들의 감사 수임 제안서(HTML)를 **서버 로컬
+ * 폴더에** 만들고 그 경로를 돌려받는다.
+ *
+ * `exportResults()`와 달리 blob 다운로드가 아니다 — 이 앱은 사무실 PC에서 단일
+ * 사용자가 쓰는 데스크톱형 도구라(CLAUDE.md) 회사별 HTML + 발송처 라벨 엑셀을
+ * 한 폴더에 떨궈 두는 편이 쓰기 쉽기 때문이다. 브라우저 다운로드를 흉내내지 말 것.
+ *
+ * `ids`는 최소 1개 필수다(빈 배열이면 백엔드가 422). 다른 Job의 결과 id가 섞이면 400,
+ * 파일 저장/템플릿 부재 등 서버측 I/O 실패는 507 + 한국어 `detail`로 온다. */
+export async function generateReport(
+  jobId: number,
+  ids: number[],
+): Promise<GenerateReportResponse> {
+  const { data } = await apiClient.post<GenerateReportResponse>(
+    `/jobs/${jobId}/generate-report`,
+    { ids },
+  )
+  return data
+}
+
+/** §4-12-A 선택 요약 — 보고서 생성 **전에** 확인 모달이 부르는 읽기 전용 집계.
+ *
+ * `generateReport()`와 **입력·에러 계약이 완전히 동일**하다(빈 배열 422, 타 Job의 id 혼입
+ * 400, 없는 Job 404). 그래서 이 호출이 200이면 같은 `ids`로 생성을 눌러도 같은 이유로
+ * 거부되지 않는다 — 확인 모달은 이 응답이 성공했을 때만 생성 버튼을 열어 준다.
+ *
+ * 응답 4개 건수는 서로 배타적이지 않다(한 회사가 매출액·총자산 조건에 동시에 걸릴 수
+ * 있다) — 합산하지 말고 각각 따로 보여줄 것. */
+export async function getSelectionSummary(
+  jobId: number,
+  ids: number[],
+): Promise<SelectionSummaryResponse> {
+  const { data } = await apiClient.post<SelectionSummaryResponse>(
+    `/jobs/${jobId}/results/selection-summary`,
+    { ids },
+  )
+  return data
 }
 
 /** CandidatesView "선택 취소" — 후보 목록에서 특정 회사를 재무정보 수집 대상에서

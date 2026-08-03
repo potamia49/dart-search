@@ -28,6 +28,10 @@ backend/data/corp_cache/*
 backend/data/documents/*
 !backend/data/documents/.gitkeep
 
+# --- 선택 항목 보고서 산출물 (POST /api/jobs/{id}/generate-report, 2026-08-03) ---
+# 실행 시 REPORT_OUTPUT_DIR(기본 backend/report) 아래 날짜 폴더로 생성되는 결과물이다.
+backend/report/
+
 # --- Node / 프론트엔드 ---
 node_modules/
 dist/

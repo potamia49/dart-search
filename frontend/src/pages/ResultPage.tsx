@@ -22,13 +22,18 @@ import {
 } from '@mantine/core'
 import { notifications } from '@mantine/notifications'
 import { getJob } from '../api/jobs'
+import { extractApiErrorMessage } from '../api/client'
 import {
+  SelectAllUnsupportedError,
   SelectionExportUnsupportedError,
   SelectionExportUnverifiableError,
   exportResults,
+  generateReport,
+  listAllResultIds,
   listResults,
 } from '../api/results'
 import type {
+  GenerateReportResponse,
   JobResponse,
   ParseStatus,
   ResultListResponse,
@@ -40,6 +45,8 @@ import type { ResultColumn } from '../util/resultColumns'
 import { summarizeJobConditions } from '../util/jobSummary'
 import ColumnToggle from '../components/ColumnToggle'
 import ResultDetailDrawer from '../components/ResultDetailDrawer'
+import ReportConfirmModal from '../components/ReportConfirmModal'
+import ReportResultModal from '../components/ReportResultModal'
 import CandidatesView from '../components/CandidatesView'
 
 type FilterTab =
@@ -161,11 +168,38 @@ function AuditorChangedCell({ value, label }: { value: number | null; label: str
   )
 }
 
+/** 파싱비고 셀 (2026-08-03) — 파서가 남긴 검수 사유는 길이가 들쭉날쭉해("필수 항목 결측:
+ * revenue" 한 줄부터 XML 파서 오류 로그까지) 그대로 흘리면 행 높이가 크게 튄다.
+ * 두 줄로 잘라 보여주고 전체 문구는 툴팁으로 준다(값이 없으면 그냥 '-'). */
+function ParseNoteCell({ text }: { text: string }) {
+  if (text === '-') {
+    return (
+      <Text span size="sm" c="dimmed">
+        -
+      </Text>
+    )
+  }
+  return (
+    <Tooltip multiline w={360} label={text} withinPortal>
+      <Text size="sm" lineClamp={2} maw={280} style={{ cursor: 'help' }}>
+        {text}
+      </Text>
+    </Tooltip>
+  )
+}
+
 /** phase='FINANCIALS'(Phase 2 완료/진행) Job의 "확정 결과" 뷰 — M2~M4 시점과 동일한
  * 결과 테이블/필터 탭/컬럼 토글/상세 Drawer/다운로드. §4-7-2로 "총자산 제외" 탭만 추가됐다.
+ *
+ * 다운로드 경로는 **선택 항목 다운로드(§4-11) 하나뿐이다** — 상단에 있던
+ * "Excel 다운로드"/"CSV 다운로드"(현재 필터 전체를 당기·전기 wide 포맷으로 받던 버튼)는
+ * 2026-08-03에 제거했다. "필터 전체 선택"이 생겨 체크 → 선택 항목 다운로드로 같은 일을
+ * 할 수 있게 됐고, 전기 금액이 필요 없다는 사용자 확인으로 wide 포맷을 따로 남길 이유도
+ * 없어졌기 때문이다(백엔드의 `ids` 없는 export 경로 자체는 그대로 살아 있다).
+ *
  * `viewerOnly`는 뷰어 전용 배포 빌드(App.tsx VIEWER_JOB_ID)에서 true로 내려와 다운로드
- * 관련 UI(상단 Excel/CSV 버튼, 선택 체크박스 열, 선택 항목 다운로드)를 통째로 숨긴다 —
- * 조회·필터·정렬·상세보기는 그대로 동작한다. */
+ * 관련 UI(선택 체크박스 열, 선택 표시줄, 선택 항목 다운로드/보고서 생성)를 통째로
+ * 숨긴다 — 조회·필터·정렬·상세보기는 그대로 동작한다. */
 function FinancialsResultsView({ jobId, viewerOnly = false }: { jobId: number; viewerOnly?: boolean }) {
   const [tab, setTab] = useState<FilterTab>('ALL')
   const [page, setPage] = useState(1)
@@ -176,11 +210,21 @@ function FinancialsResultsView({ jobId, viewerOnly = false }: { jobId: number; v
     new Set(DEFAULT_VISIBLE_KEYS),
   )
   const [selected, setSelected] = useState<ResultResponse | null>(null)
-  const [exporting, setExporting] = useState(false)
   // §4-11 다중 선택 다운로드 — 체크한 결과 id 집합. **페이지를 넘기거나 필터 탭을
   // 바꿔도 유지**하고(화면 탐색 수단일 뿐이므로), Job이 바뀔 때만 초기화한다.
   const [selectedIds, setSelectedIds] = useState<Set<number>>(() => new Set())
   const [selectionExporting, setSelectionExporting] = useState(false)
+  // "현재 필터 전체 선택"(2026-08-03) 진행 중 표시 — 1,000건대에서도 수백 ms지만
+  // 서버 왕복이라 버튼에 로딩을 건다.
+  const [selectingAll, setSelectingAll] = useState(false)
+  // §4-12 선택 항목 보고서 생성 — 선택 상태(`selectedIds`)는 다운로드와 그대로
+  // 공유하고, 진행 중 표시와 결과 안내만 별도로 둔다.
+  const [reportGenerating, setReportGenerating] = useState(false)
+  const [reportResult, setReportResult] = useState<GenerateReportResponse | null>(null)
+  // §4-12-A 생성 **전** 확인 모달(2026-08-03) — "선택 항목 보고서 생성"은 클릭 한 번으로
+  // 수천 개 HTML을 로컬 폴더에 만들 수 있고, 선택이 탭을 넘나들며 합집합으로 누적돼
+  // 조건에 안 맞는 회사가 섞이기 쉬워 무엇이 만들어지는지 먼저 되묻는다.
+  const [reportConfirmOpen, setReportConfirmOpen] = useState(false)
   const [search, setSearch] = useState('')
   const [debouncedSearch, setDebouncedSearch] = useState('')
   // 다중 컬럼 정렬 — 배열 앞쪽이 1순위(주 정렬), 뒤쪽이 보조 정렬이다. 일반 클릭은
@@ -291,18 +335,6 @@ function FinancialsResultsView({ jobId, viewerOnly = false }: { jobId: number; v
     })
   }
 
-  async function handleExport(format: 'xlsx' | 'csv') {
-    setExporting(true)
-    try {
-      // 화면에서 걸러 놓고 정렬한 그대로를 내려받게 한다.
-      await exportResults(jobId, format, query)
-    } catch {
-      notifications.show({ color: 'red', message: '다운로드에 실패했습니다.' })
-    } finally {
-      setExporting(false)
-    }
-  }
-
   /** §4-11 선택 항목 다운로드 — 체크한 회사만 내보낸다. 필터/정렬은 넘기지 않는다
    * (백엔드도 `ids`가 있으면 무시한다 — 이미 화면에서 골라 놓은 것이라 다운로드
    * 시점에 필터를 다시 태우면 "체크했는데 파일에 없다"가 된다).
@@ -325,7 +357,7 @@ function FinancialsResultsView({ jobId, viewerOnly = false }: { jobId: number; v
           color: 'red',
           title: '선택 항목 다운로드를 중단했습니다',
           message:
-            '서버가 선택 항목만 내보내는 기능을 지원하지 않는 구버전이라, 체크하지 않은 회사까지 들어간 전체 파일이 돌아왔습니다. 프로그램을 껐다 다시 켜 보고, 같은 안내가 계속 나오면 최신 버전 프로그램으로 교체가 필요합니다(담당자에게 문의하세요). 지금 당장 전체 결과가 필요하다면 위쪽 "Excel 다운로드" / "CSV 다운로드"를 쓰세요.',
+            '서버가 선택 항목만 내보내는 기능을 지원하지 않는 구버전이라, 체크하지 않은 회사까지 들어간 전체 파일이 돌아왔습니다. 받은 파일은 저장하지 않았습니다. 프로그램을 껐다 다시 켜 보고, 같은 안내가 계속 나오면 최신 버전 프로그램으로 교체가 필요합니다(담당자에게 문의하세요).',
           autoClose: false,
         })
       } else if (err instanceof SelectionExportUnverifiableError) {
@@ -334,7 +366,7 @@ function FinancialsResultsView({ jobId, viewerOnly = false }: { jobId: number; v
           color: 'red',
           title: '선택 항목 다운로드를 중단했습니다',
           message:
-            '다운로드 응답 정보를 읽지 못해, 받은 파일이 체크한 회사만 담고 있는지 확인할 수 없었습니다. 프로그램을 껐다 다시 켠 뒤 다시 시도하고, 같은 안내가 계속 나오면 담당자에게 문의하세요. 지금 당장 전체 결과가 필요하다면 위쪽 "Excel 다운로드" / "CSV 다운로드"를 쓰세요.',
+            '다운로드 응답 정보를 읽지 못해, 받은 파일이 체크한 회사만 담고 있는지 확인할 수 없었습니다. 받은 파일은 저장하지 않았습니다. 프로그램을 껐다 다시 켠 뒤 다시 시도하고, 같은 안내가 계속 나오면 담당자에게 문의하세요.',
           autoClose: false,
         })
       } else {
@@ -345,6 +377,54 @@ function FinancialsResultsView({ jobId, viewerOnly = false }: { jobId: number; v
     }
   }
 
+  /** §4-12 선택 항목 보고서 생성 — 체크한 회사마다 감사 수임 제안서 HTML을 만들어
+   * **서버(=이 프로그램이 돌고 있는 PC)의 로컬 폴더**에 저장한다. 브라우저로 파일이
+   * 내려오지 않으므로, 성공하면 저장 폴더 경로를 복사할 수 있게 모달로 안내한다.
+   * 선택 대상은 다운로드와 똑같이 `selectedIds` 전체다(현재 필터·탭과 무관). */
+  async function handleGenerateReport() {
+    const ids = [...selectedIds].sort((a, b) => a - b)
+    if (ids.length === 0) return
+    setReportGenerating(true)
+    try {
+      const result = await generateReport(jobId, ids)
+      // 경고(warnings)가 있어도 실패가 아니다 — 파일은 만들어졌고 generated_count에
+      // 포함된다. 반면 재무 이력이 없는 회사는 skipped로 빠져 **파일이 아예 생성되지
+      // 않으므로**, 선택 전원이 스킵되면 generated_count가 0이 될 수 있다. 이때
+      // 초록 토스트를 띄우면 "0건 생성 완료"라는 모순된 안내가 된다.
+      const nothingGenerated = result.generated_count === 0
+      notifications.show({
+        id: 'report-generated',
+        color: nothingGenerated ? 'yellow' : 'green',
+        message: nothingGenerated
+          ? '생성된 보고서가 없습니다 — 선택한 회사가 모두 제외되었습니다.'
+          : `보고서 ${result.generated_count.toLocaleString()}건 생성 완료`,
+      })
+      setReportResult(result)
+    } catch (err) {
+      // 400(다른 Job의 id 혼입)·404(Job 없음)·507(저장 실패/템플릿 부재)은 백엔드가
+      // 이미 사용자용 한국어 문장을 detail로 주므로 그대로 노출한다.
+      notifications.show({
+        color: 'red',
+        title: '보고서 생성에 실패했습니다',
+        message: extractApiErrorMessage(
+          err,
+          '보고서를 생성하지 못했습니다. 프로그램이 실행 중인지 확인한 뒤 다시 시도하세요.',
+        ),
+        autoClose: false,
+      })
+    } finally {
+      setReportGenerating(false)
+    }
+  }
+
+  /** 확인 모달(§4-12-A)의 "N건 생성" — 위 생성 로직을 **그대로** 실행하고 끝나면 모달을
+   * 닫는다. 생성 중에는 모달이 열린 채 버튼만 로딩 상태가 돼 중복 클릭을 막는다
+   * (실패해도 닫는다 — 원인은 autoClose:false 알림으로 남는다). */
+  async function handleConfirmGenerateReport() {
+    await handleGenerateReport()
+    setReportConfirmOpen(false)
+  }
+
   function toggleRowSelected(id: number, checked: boolean) {
     setSelectedIds((prev) => {
       const next = new Set(prev)
@@ -352,6 +432,39 @@ function FinancialsResultsView({ jobId, viewerOnly = false }: { jobId: number; v
       else next.delete(id)
       return next
     })
+  }
+
+  /** "현재 필터 전체 선택"(2026-08-03) — 지금 탭/검색/정렬 조건을 통과하는 결과를
+   * **페이지를 넘기지 않고 한 번에** 선택한다.
+   *
+   * 헤더 체크박스는 보이는 50건만 잡아서 1,200건대 Job은 25번 페이지를 넘겨야 했다.
+   * 목록 API에 `ids_only=true`만 얹어 id 배열을 받아온다(전체 행을 다시 받지 않는다).
+   *
+   * 기존 선택은 **지우지 않고 합집합**으로 더한다 — 다른 탭에서 골라 둔 회사가
+   * 소리 없이 빠지면 다운로드/보고서 결과가 달라지기 때문이다. */
+  async function handleSelectAllInFilter() {
+    setSelectingAll(true)
+    try {
+      const ids = await listAllResultIds(jobId, query)
+      setSelectedIds((prev) => new Set([...prev, ...ids]))
+    } catch (err) {
+      if (err instanceof SelectAllUnsupportedError) {
+        // 구버전 서버는 `ids_only`를 무시하고 1페이지만 준다 — 그걸 전체로 착각해
+        // 선택하면 "전체 선택했는데 50건만 담긴 파일"이 된다. 선택은 손대지 않는다.
+        notifications.show({
+          id: 'select-all-unsupported',
+          color: 'red',
+          title: '전체 선택을 적용하지 않았습니다',
+          message:
+            '서버가 필터 전체 선택을 지원하지 않는 구버전이라, 일부만 선택되는 것을 막기 위해 중단했습니다. 프로그램을 껐다 다시 켜 보고, 같은 안내가 계속 나오면 최신 버전 프로그램으로 교체가 필요합니다(담당자에게 문의하세요).',
+          autoClose: false,
+        })
+      } else {
+        notifications.show({ color: 'red', message: '전체 선택에 실패했습니다.' })
+      }
+    } finally {
+      setSelectingAll(false)
+    }
   }
 
   /** 헤더 체크박스 — **현재 페이지에 보이는 행만** 전체선택/해제한다
@@ -371,10 +484,19 @@ function FinancialsResultsView({ jobId, viewerOnly = false }: { jobId: number; v
   // "휴면·폐업 추정" 탭에서는 판정 근거(최근 공시일자)를 항상 볼 수 있어야
   // 하므로 컬럼 토글 상태와 무관하게 표시한다(2026-07-22). ColumnToggle에도
   // 같은 집합을 넘겨 체크박스 상태가 실제 표시 상태와 어긋나지 않게 한다.
-  const forcedVisibleKeys = useMemo<Set<keyof ResultResponse>>(
-    () => (tab === 'STALE_DISCLOSURE' ? new Set(['latest_disclosure_date']) : new Set()),
-    [tab],
-  )
+  //
+  // 같은 이유로 검수 탭("파싱 실패"/"부분 성공")에서는 **파싱비고**를 항상 표시한다
+  // (2026-08-03) — 그 탭에 있는 행은 전부 "왜 실패/부분인가"를 봐야 하는 행이고,
+  // 상단 wide 다운로드 버튼을 없앤 뒤로 그 사유를 화면에서 볼 경로가 개별 회사
+  // 상세 Drawer 하나뿐이었다. 다른 탭에서는 컬럼 토글로 켤 수 있다.
+  const forcedVisibleKeys = useMemo<Set<keyof ResultResponse>>(() => {
+    if (tab === 'STALE_DISCLOSURE') return new Set(['latest_disclosure_date'])
+    if (tab === 'FAILED' || tab === 'PARTIAL') return new Set(['parse_note'])
+    return new Set()
+  }, [tab])
+  // 확인 모달(§4-12-A)에 넘길 선택 id — 매 렌더 새 배열이면 모달이 요약 조회를 반복하므로
+  // 선택이 실제로 바뀔 때만 다시 만든다(정렬 기준은 handleGenerateReport와 동일).
+  const selectedIdList = useMemo(() => [...selectedIds].sort((a, b) => a - b), [selectedIds])
   const visibleColumns = ALL_COLUMNS.filter(
     (c) => visibleKeys.has(c.key) || forcedVisibleKeys.has(c.key),
   )
@@ -382,6 +504,9 @@ function FinancialsResultsView({ jobId, viewerOnly = false }: { jobId: number; v
   const pageRows = data?.items ?? []
   const selectedOnPage = pageRows.filter((row) => selectedIds.has(row.id)).length
   const allPageSelected = pageRows.length > 0 && selectedOnPage === pageRows.length
+  const hasSelection = selectedIds.size > 0
+  // "현재 필터 전체 선택"은 지금 조건으로 잡히는 결과가 있을 때만 의미가 있다.
+  const canSelectAll = !!data && data.total > 0
 
   return (
     <Stack>
@@ -443,22 +568,14 @@ function FinancialsResultsView({ jobId, viewerOnly = false }: { jobId: number; v
             }
             w={260}
           />
+          {/* 다운로드 버튼은 여기에 두지 않는다 — 목록에서 대상을 고른 뒤
+              아래 선택 표시줄에서 내려받는 경로 하나로 통일했다(2026-08-03). */}
           <ColumnToggle
             allColumns={ALL_COLUMNS}
             visibleKeys={visibleKeys}
             onToggle={toggleColumn}
             forcedVisibleKeys={forcedVisibleKeys}
           />
-          {!viewerOnly && (
-            <>
-              <Button variant="default" loading={exporting} onClick={() => handleExport('xlsx')}>
-                Excel 다운로드
-              </Button>
-              <Button variant="default" loading={exporting} onClick={() => handleExport('csv')}>
-                CSV 다운로드
-              </Button>
-            </>
-          )}
         </Group>
       </Group>
 
@@ -502,62 +619,116 @@ function FinancialsResultsView({ jobId, viewerOnly = false }: { jobId: number; v
         </Alert>
       )}
 
-      {/* §4-11 선택 항목 다운로드 표시줄 — 선택 0건이면 통째로 숨긴다. 페이지 로딩
-          중에도 선택은 유지되므로 테이블 바깥(로딩 조건 밖)에 둔다. 뷰어 전용 빌드는
-          다운로드 자체가 목적이 없는 체크박스 열(아래)을 렌더링하지 않으므로 선택이
-          쌓일 일이 없다 — 그래도 방어적으로 이 표시줄도 함께 숨긴다. */}
-      {!viewerOnly && selectedIds.size > 0 && (
-        <Paper withBorder p="xs" bg="var(--mantine-color-blue-0)">
+      {/* §4-11 선택 항목 다운로드 + §4-12 보고서 생성 표시줄 — 두 기능은 같은 선택
+          (selectedIds)을 쓰므로 활성 조건도 같다. 페이지 로딩 중에도 선택은 유지되므로
+          테이블 바깥(로딩 조건 밖)에 둔다.
+
+          **선택 0건이어도 숨기지 않는다**(2026-08-03): 상단 "Excel/CSV 다운로드" 버튼을
+          없앤 뒤로 이 표시줄이 화면의 유일한 다운로드 입구라, 아무것도 고르지 않은 상태에서
+          숨어 버리면 "내려받는 곳이 없다"가 된다. 대신 버튼을 비활성으로 두고 무엇을 해야
+          하는지(체크 또는 "현재 필터 전체 선택") 그 자리에서 안내한다.
+
+          뷰어 전용 빌드는 다운로드 자체가 목적이 없어 체크박스 열(아래)을 렌더링하지 않으므로
+          이 표시줄도 통째로 숨긴다. */}
+      {!viewerOnly && (
+        <Paper
+          withBorder
+          p="xs"
+          bg={hasSelection ? 'var(--mantine-color-blue-0)' : undefined}
+        >
           <Group justify="space-between">
             <Group gap="xs">
-              <Text size="sm" fw={600}>
-                선택 {selectedIds.size.toLocaleString()}건
-                {selectedIds.size > selectedOnPage && (
-                  <Text component="span" size="xs" c="dimmed" fw={400}>
-                    {' '}
-                    (이 페이지 {selectedOnPage}건 · 현재 화면 밖{' '}
-                    {(selectedIds.size - selectedOnPage).toLocaleString()}건)
+              {hasSelection ? (
+                <>
+                  <Text size="sm" fw={600}>
+                    선택 {selectedIds.size.toLocaleString()}건
+                    {selectedIds.size > selectedOnPage && (
+                      <Text component="span" size="xs" c="dimmed" fw={400}>
+                        {' '}
+                        (이 페이지 {selectedOnPage}건 · 현재 화면 밖{' '}
+                        {(selectedIds.size - selectedOnPage).toLocaleString()}건)
+                      </Text>
+                    )}
                   </Text>
-                )}
-              </Text>
-              <Button
-                size="compact-xs"
-                variant="subtle"
-                onClick={() => setSelectedIds(new Set())}
-              >
-                선택 해제
-              </Button>
+                  <Button
+                    size="compact-xs"
+                    variant="subtle"
+                    onClick={() => setSelectedIds(new Set())}
+                  >
+                    선택 해제
+                  </Button>
+                </>
+              ) : (
+                <Text size="sm" c="dimmed">
+                  왼쪽 체크박스로 회사를 고르면 그 회사만 내려받거나 보고서를 만들 수 있습니다.
+                </Text>
+              )}
+              {/* "현재 필터 전체 선택"(2026-08-03) — 헤더 체크박스는 보이는 50건만 잡아
+                  1,000건대 결과를 다 고르려면 페이지를 수십 번 넘겨야 했다. 지금 탭·검색·정렬
+                  조건 그대로 서버에 id만 물어 한 번에 선택한다(기존 선택은 유지·합집합). */}
+              {canSelectAll && (
+                <Button
+                  size="compact-xs"
+                  variant={hasSelection ? 'subtle' : 'light'}
+                  loading={selectingAll}
+                  onClick={handleSelectAllInFilter}
+                >
+                  현재 필터 전체 선택 (총 {data!.total.toLocaleString()}건)
+                </Button>
+              )}
               {selectedIds.size > LARGE_SELECTION_HINT && (
                 <Text size="xs" c="dimmed">
                   선택이 많아 파일 생성에 시간이 걸릴 수 있습니다.
                 </Text>
               )}
             </Group>
-            <Menu position="bottom-end" withinPortal>
-              <Menu.Target>
-                <Button loading={selectionExporting}>선택 항목 다운로드</Button>
-              </Menu.Target>
-              <Menu.Dropdown>
-                <Menu.Label>
-                  선택한 {selectedIds.size.toLocaleString()}건만 내보내기 — 현재 필터·탭과
-                  무관하게 지금까지 체크한 전체 건이 대상입니다
-                </Menu.Label>
-                <Menu.Item onClick={() => handleSelectionExport('xlsx', true)}>
-                  Excel (기본정보 + 재무이력)
-                </Menu.Item>
-                <Menu.Item onClick={() => handleSelectionExport('xlsx', false)}>
-                  Excel (기본정보만)
-                </Menu.Item>
-                {/* CSV는 시트가 하나뿐이라 재무이력을 담을 수 없다 — 조합 자체를 제공하지 않는다. */}
-                <Menu.Item onClick={() => handleSelectionExport('csv', false)}>
-                  CSV (기본정보만)
-                </Menu.Item>
-                <Menu.Label>
-                  재무 이력이 수집된 회사만 재무이력 시트에 실립니다(감사보고서 없음 등은
-                  제외)
-                </Menu.Label>
-              </Menu.Dropdown>
-            </Menu>
+            <Group gap="xs">
+              <Menu position="bottom-end" withinPortal disabled={!hasSelection}>
+                <Menu.Target>
+                  <Button loading={selectionExporting} disabled={!hasSelection}>
+                    선택 항목 다운로드
+                  </Button>
+                </Menu.Target>
+                <Menu.Dropdown>
+                  <Menu.Label>
+                    선택한 {selectedIds.size.toLocaleString()}건만 내보내기 — 현재 필터·탭과
+                    무관하게 지금까지 체크한 전체 건이 대상입니다
+                  </Menu.Label>
+                  <Menu.Item onClick={() => handleSelectionExport('xlsx', true)}>
+                    Excel (기본정보 + 재무이력)
+                  </Menu.Item>
+                  <Menu.Item onClick={() => handleSelectionExport('xlsx', false)}>
+                    Excel (기본정보만)
+                  </Menu.Item>
+                  {/* CSV는 시트가 하나뿐이라 재무이력을 담을 수 없다 — 조합 자체를 제공하지 않는다. */}
+                  <Menu.Item onClick={() => handleSelectionExport('csv', false)}>
+                    CSV (기본정보만)
+                  </Menu.Item>
+                  <Menu.Label>
+                    재무 이력이 수집된 회사만 재무이력 시트에 실립니다(감사보고서 없음 등은
+                    제외)
+                  </Menu.Label>
+                </Menu.Dropdown>
+              </Menu>
+              {/* §4-12 — 다운로드와 같은 선택(selectedIds)을 쓰지만 결과물이 다르다:
+                  브라우저로 파일이 내려오는 게 아니라 이 PC의 로컬 폴더에 회사별 제안서
+                  HTML이 저장된다. 클릭하면 바로 만들지 않고 **확인 모달**(§4-12-A)을
+                  먼저 열어 무엇이 만들어지는지(건수·위험 신호·저장 위치) 보여준다. */}
+              <Tooltip
+                multiline
+                w={280}
+                label="선택한 회사마다 감사 수임 제안서(HTML)를 만들어 이 PC의 폴더에 저장합니다. 브라우저로 내려받는 것이 아니라 저장된 폴더 경로를 알려드립니다. 생성 전에 확인 창이 먼저 열립니다."
+              >
+                <Button
+                  variant="light"
+                  loading={reportGenerating}
+                  disabled={!hasSelection}
+                  onClick={() => setReportConfirmOpen(true)}
+                >
+                  선택 항목 보고서 생성
+                </Button>
+              </Tooltip>
+            </Group>
           </Group>
         </Paper>
       )}
@@ -714,6 +885,8 @@ function FinancialsResultsView({ jobId, viewerOnly = false }: { jobId: number; v
                             value={row.auditor_changed}
                             label={formatCell(col, row)}
                           />
+                        ) : col.key === 'parse_note' ? (
+                          <ParseNoteCell text={formatCell(col, row)} />
                         ) : (
                           formatCell(col, row)
                         )}
@@ -734,6 +907,20 @@ function FinancialsResultsView({ jobId, viewerOnly = false }: { jobId: number; v
       )}
 
       <ResultDetailDrawer jobId={jobId} result={selected} onClose={() => setSelected(null)} />
+
+      {/* 생성 **전** 확인(§4-12-A)과 생성 **후** 결과 안내(§4-12)는 별개 모달이다 —
+          확인 모달은 생성이 끝나면 스스로 닫히고, 그 직후 결과 모달이 열린다. */}
+      <ReportConfirmModal
+        opened={reportConfirmOpen}
+        jobId={jobId}
+        ids={selectedIdList}
+        generating={reportGenerating}
+        largeSelectionThreshold={LARGE_SELECTION_HINT}
+        onCancel={() => setReportConfirmOpen(false)}
+        onConfirm={handleConfirmGenerateReport}
+      />
+
+      <ReportResultModal result={reportResult} onClose={() => setReportResult(null)} />
     </Stack>
   )
 }

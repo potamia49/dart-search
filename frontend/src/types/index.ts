@@ -165,6 +165,14 @@ export interface ResultListResponse {
   page: number
   page_size: number
   items: ResultResponse[]
+  /** `?ids_only=true`로 요청했을 때만 채워지는 경량 응답 — 현재 필터를 통과한
+   * `results.id` 전체다(정렬 순서 그대로, 페이징 없음. 이때 `items`는 빈 배열).
+   *
+   * **그 외에는 항상 `null`/부재이며 빈 배열(`[]`)과 반드시 구분해야 한다** —
+   * `ids_only`를 모르는 구버전 백엔드는 그 파라미터를 조용히 무시하고 200 +
+   * 1페이지만 돌려주므로, 이 필드가 없으면 "서버가 필터 전체 선택을 지원하지
+   * 않음"으로 판정한다(§4-11 `_selected` 파일명 접미어와 같은 양방향 계약). */
+  ids?: number[] | null
 }
 
 export interface RegionMeta {
@@ -307,6 +315,71 @@ export interface DocumentSectionResponse {
   available: boolean
   html: string
   notice: string | null
+}
+
+/** §4-12 선택 항목 보고서 생성 — POST /jobs/{id}/generate-report.
+ *
+ * "선택 항목 다운로드"와 달리 **파일을 브라우저로 내려주지 않는다** — 서버(=이 프로그램을
+ * 실행 중인 바로 그 PC)의 로컬 폴더에 회사별 HTML + 발송처 라벨 엑셀을 저장하고, 그
+ * 폴더 경로만 응답으로 알려준다. 화면은 그 경로를 사용자가 복사해 탐색기로 열 수 있게
+ * 보여주는 것이 전부다. */
+export interface GeneratedReportFile {
+  result_id: number | null
+  corp_name: string | null
+  filename: string
+}
+
+/** **파일은 만들어졌지만** 일부 연도가 결측/PARTIAL이라 내용이 부실한 경우의 안내 —
+ * 실패가 아니며 `generated_count`에 포함돼 있다. `result_id`가 `null`이면 특정 회사가
+ * 아니라 **요청 전체에 대한 안내**(예: 사무소 연락처 미설정)다 — 회사별 경고와 섞어
+ * 세지 말 것(한 회사가 여러 경고를 낼 수도 있다). */
+export interface ReportWarning {
+  result_id: number | null
+  corp_name: string | null
+  message: string
+}
+
+/** 재무 이력이 아예 없거나 전부 FAILED라 **파일 자체를 만들지 않은** 회사.
+ * `warnings`와 달리 `generated_count`에 포함되지 않는다. */
+export interface SkippedReport {
+  result_id: number
+  corp_name: string
+  reason: string
+}
+
+export interface GenerateReportResponse {
+  /** 생성된 폴더의 절대 경로(예: `C:\claude\dart-search\backend\report\2026-08-03`).
+   * 같은 날 다시 생성하면 덮어쓰지 않고 `_2`, `_3` 폴더가 새로 생긴다. */
+  output_dir: string
+  generated_count: number
+  files: GeneratedReportFile[]
+  /** 같은 폴더에 함께 만들어진 우편 발송용 라벨 엑셀 파일명. */
+  label_file: string
+  warnings: ReportWarning[]
+  /** 생성 대상에서 제외된 회사 목록(재무 이력 없음 등). 선택 전원이 여기 담기면
+   * `generated_count`가 0이 될 수 있다. */
+  skipped: SkippedReport[]
+}
+
+/** §4-12-A 선택 요약 — POST /jobs/{id}/results/selection-summary.
+ *
+ * "선택 항목 보고서 생성"의 **사전 확인 모달**이 쓰는 읽기 전용 집계다. 클릭 한 번으로
+ * 수천 건이 선택될 수 있고(§4-11-A "현재 필터 전체 선택") 선택은 탭을 넘나들며 합집합으로
+ * 누적되므로, 조건에 맞지 않는 회사가 우편 발송 대상에 섞였는지 생성 **전에** 알린다.
+ *
+ * 필드는 전부 **건수**다. 한 회사가 여러 조건에 동시에 걸릴 수 있어(매출액·총자산 필터는
+ * 서로 독립 판정) **넷의 합이 `total`을 넘을 수 있다 — 화면에서 더해 "총 위험 N건"으로
+ * 표시하지 말 것.** `failed`는 `parse_status='FAILED'` 전부라 "감사보고서 없음"(rcept_no
+ * 부재로 검수 대상이 아닌 건)도 포함한다.
+ *
+ * 입력·에러 계약은 `POST /generate-report`와 완전히 동일하다 — 같은 `ids`로 이 요약이
+ * 200을 받았다면 생성도 같은 이유로 거부되지 않는다. */
+export interface SelectionSummaryResponse {
+  total: number
+  stale_disclosure: number
+  excluded_revenue: number
+  excluded_assets: number
+  failed: number
 }
 
 /** 계정 상세 1행 — 원문 라벨(각주 포함)/상대 계층 레벨/당기·전기 값. */

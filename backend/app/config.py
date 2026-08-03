@@ -55,6 +55,16 @@ class Settings(BaseSettings):
     corp_cache_dir: str = str(BACKEND_DIR / "data" / "corp_cache")
     document_cache_dir: str = str(BACKEND_DIR / "data" / "documents")
 
+    # --- 선택 항목 보고서 생성 (2026-08-03) ---
+    # 생성된 보고서(회사별 HTML + 발송처 목록 엑셀)가 저장되는 기준 폴더. 실제
+    # 산출물은 이 아래 날짜 폴더(`YYYY-MM-DD`, 중복 시 `_2`, `_3` ...)에 들어간다.
+    # DB/문서 캐시와 동일하게 BACKEND_DIR 기준이라 exe 배포본에서는 exe 옆에 남는다.
+    report_output_dir: str = str(BACKEND_DIR / "report")
+    # 보고서 템플릿 HTML 경로. 비워 두면 `app/reports/audit_proposal.py`의
+    # `resolve_template_path()`가 표준 위치(번들 리소스 → BACKEND_DIR → 저장소 루트의
+    # `tamplate/`)를 순서대로 찾는다.
+    report_template_path: str = ""
+
     # --- OpenDART 호출 정책 (상세개발계획.md §4-5) ---
     daily_quota_limit: int = 19000
     request_delay_sec: float = 0.1

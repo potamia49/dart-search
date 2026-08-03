@@ -164,6 +164,11 @@ export const STATUS_COLUMNS: ResultColumn[] = [
       return row.parse_status ?? '-'
     },
   },
+  // 파싱비고 — 파서가 남긴 검수 사유("필수 항목 결측: revenue" 등, 2026-08-03 추가).
+  // 기본 숨김이고 컬럼 토글로 켠다. 다만 "파싱 실패"/"부분 성공" 탭에서는 ResultPage가
+  // 강제로 표시한다(그 탭의 모든 행이 사유를 봐야 하는 행이므로).
+  // 문구가 길고 서식이 제각각이라 정렬 대상으로는 의미가 없어 정렬을 막는다.
+  { key: 'parse_note', label: '파싱비고', sortKey: false },
   // 최신 DART 공시 접수일자 — "휴면·폐업 추정" 판정의 근거값(2026-07-22).
   // YYYYMMDD를 YYYY-MM-DD로 보기 좋게 바꿔 표시한다.
   {

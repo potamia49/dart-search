@@ -1,0 +1,768 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>감사 수임 제안 재무분석 보고서</title>
+<style>
+  :root{
+    --navy:#0f2942; --navy2:#173a5e; --gold:#b8892b; --gold-l:#f4e6c9;
+    --gray:#5a6472; --line:#e2e6ea; --bg:#f6f7f9;
+    --green:#1e8a5f; --amber:#c98a10; --red:#c0392b; --blue:#2f7ab8; --grayfill:#8ea4bd;
+  }
+  *{box-sizing:border-box;}
+  body{font-family:"Malgun Gothic","Pretendard",sans-serif;margin:0;background:var(--bg);color:#1c2733;font-size:13px;}
+  .page{
+    width:210mm;min-height:297mm;margin:10mm auto;background:#fff;
+    padding:14mm 16mm;position:relative;box-shadow:0 0 8px rgba(0,0,0,.08);
+    page-break-after:always;
+  }
+  @media print{
+    body{background:#fff;}
+    .page{margin:0;box-shadow:none;width:auto;min-height:297mm;}
+    .no-print{display:none;}
+  }
+  .doc-header{display:flex;justify-content:space-between;align-items:flex-end;border-bottom:3px solid var(--navy);padding-bottom:8px;margin-bottom:14px;}
+  .doc-header .brand{font-size:11px;color:var(--gold);font-weight:700;letter-spacing:1px;}
+  .doc-header h1{font-size:20px;margin:2px 0 0;color:var(--navy);}
+  .doc-header .meta{text-align:right;font-size:11px;color:var(--gray);}
+  .page-num{position:absolute;bottom:8mm;right:16mm;font-size:10px;color:var(--gray);}
+
+  .company-box{display:flex;justify-content:space-between;background:var(--navy);color:#fff;border-radius:8px;padding:14px 18px;margin-bottom:16px;}
+  .company-box h2{margin:0 0 4px;font-size:18px;}
+  .company-box .sub{font-size:11.5px;color:#cfe0ee;}
+  .company-box .badges{display:flex;gap:8px;align-items:center;}
+  .badge{background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.35);border-radius:20px;padding:4px 12px;font-size:11px;}
+  .badge.opinion-적정{background:var(--green);border-color:var(--green);}
+  .badge.opinion-한정{background:var(--amber);border-color:var(--amber);}
+  .badge.opinion-의견거절{background:var(--red);border-color:var(--red);}
+
+  .section-title{display:flex;align-items:center;gap:8px;font-size:14px;font-weight:700;color:var(--navy);margin:18px 0 8px;}
+  .section-title::before{content:"";width:5px;height:16px;background:var(--gold);border-radius:2px;display:inline-block;}
+
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px;}
+  .grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;}
+  .card{border:1px solid var(--line);border-radius:8px;padding:12px;background:#fff;}
+  .chart-card{border:1px solid var(--line);border-radius:8px;padding:10px 12px;}
+  .chart-card .ctitle{font-size:11.5px;font-weight:700;color:var(--navy2);margin-bottom:4px;}
+  .chart-box{width:100%;}
+  .chart-box svg{width:100%;height:auto;display:block;}
+  .legend{display:flex;gap:14px;justify-content:center;margin-top:4px;flex-wrap:wrap;}
+  .legend span{display:inline-flex;align-items:center;gap:5px;font-size:10px;color:var(--gray);}
+  .legend i{width:10px;height:10px;border-radius:2px;display:inline-block;}
+
+  table{width:100%;border-collapse:collapse;font-size:11px;}
+  th,td{border-bottom:1px solid var(--line);padding:5px 6px;text-align:right;}
+  th{background:#f0f2f5;color:var(--navy);text-align:center;font-size:10.5px;}
+  td.name{text-align:left;}
+  tr.target{background:var(--gold-l);font-weight:700;}
+  .opinion-tag{font-size:9.5px;padding:1px 6px;border-radius:10px;color:#fff;}
+  .opinion-tag.적정{background:var(--green);}
+  .opinion-tag.한정{background:var(--amber);}
+  .opinion-tag.의견거절{background:var(--red);}
+  .footnote{font-size:9.5px;color:var(--gray);margin-top:4px;}
+
+  /* 리스크 경보 */
+  .risk-list{display:flex;flex-direction:column;gap:6px;}
+  .risk-item{display:flex;gap:8px;align-items:flex-start;border-radius:6px;padding:8px 10px;font-size:11.5px;}
+  .risk-item .dot{width:9px;height:9px;border-radius:50%;margin-top:3px;flex:none;}
+  .risk-red{background:#fdecea;} .risk-red .dot{background:var(--red);}
+  .risk-amber{background:#fdf3e0;} .risk-amber .dot{background:var(--amber);}
+  .risk-green{background:#e9f7f0;} .risk-green .dot{background:var(--green);}
+  .risk-item b{color:#1c2733;}
+
+  /* 등급 카드 */
+  .grade-card{text-align:center;border-radius:8px;padding:14px 8px;color:#fff;}
+  .grade-card .label{font-size:11.5px;opacity:.9;}
+  .grade-card .grade{font-size:34px;font-weight:800;line-height:1.1;}
+  .grade-card .desc{font-size:10.5px;opacity:.92;margin-top:2px;}
+  .grade-A{background:linear-gradient(135deg,#1e8a5f,#146347);}
+  .grade-B{background:linear-gradient(135deg,#2f7ab8,#1c5687);}
+  .grade-C{background:linear-gradient(135deg,#c98a10,#a56b06);}
+  .grade-D{background:linear-gradient(135deg,#c0392b,#8f2a1f);}
+
+  .review-item{border-left:3px solid var(--gold);background:#fbf7ee;padding:8px 12px;margin-bottom:8px;font-size:11.5px;border-radius:0 6px 6px 0;}
+  .review-item .tag{font-size:9.5px;color:var(--gold);font-weight:700;letter-spacing:.5px;}
+
+  .opinion-box{border:1px solid var(--line);border-radius:8px;padding:14px;background:#fbfbfc;font-size:12px;line-height:1.7;color:#2b3644;}
+
+  .firm-box{margin-top:18px;border:1px solid var(--navy);border-radius:8px;overflow:hidden;}
+  .firm-box .head{background:var(--navy);color:#fff;padding:10px 14px;font-weight:700;font-size:13px;}
+  .firm-box .body{padding:12px 14px;font-size:11.5px;line-height:1.7;}
+  .firm-box .contact{color:var(--gray);margin-top:4px;}
+  .disclaimer{margin-top:14px;font-size:9.5px;color:var(--gray);text-align:center;border-top:1px solid var(--line);padding-top:8px;}
+
+  .kpi-row{display:flex;gap:10px;margin-bottom:14px;}
+  .kpi{flex:1;border:1px solid var(--line);border-radius:8px;padding:10px 12px;text-align:center;}
+  .kpi .k{font-size:10.5px;color:var(--gray);}
+  .kpi .v{font-size:17px;font-weight:800;color:var(--navy);margin-top:2px;}
+</style>
+</head>
+<body>
+
+<!-- ============ PAGE 1 : 개요 · 추이 · 리스크 경보 ============ -->
+<div class="page" id="page1">
+  <div class="doc-header">
+    <div>
+      <div class="brand">CONFIDENTIAL · AUDIT PROPOSAL</div>
+      <h1>재무분석 보고서</h1>
+    </div>
+    <div class="meta">발행일 : <span id="issueDate"></span><br>작성 : <span id="firmNameTop"></span></div>
+  </div>
+
+  <div class="company-box">
+    <div>
+      <h2 id="companyName"></h2>
+      <div class="sub" id="companySub"></div>
+    </div>
+    <div class="badges">
+      <span class="badge" id="fiscalBadge"></span>
+      <span class="badge" id="opinionBadge"></span>
+    </div>
+  </div>
+
+  <div class="kpi-row" id="kpiRow"></div>
+
+  <div class="section-title">4개년 매출액 · 영업이익률 추이</div>
+  <div class="chart-card"><div class="chart-box" id="chartRevenue"></div></div>
+
+  <div class="grid2" style="margin-top:14px;">
+    <div class="chart-card">
+      <div class="ctitle">재무안정성 지표 추이 (부채비율 · 유동비율)</div>
+      <div class="chart-box" id="chartStability"></div>
+    </div>
+    <div class="chart-card">
+      <div class="ctitle">자산 · 부채 · 자본 구조 (최근연도)</div>
+      <div class="chart-box" id="chartStructure"></div>
+    </div>
+  </div>
+
+  <div class="section-title">리스크 조기경보</div>
+  <div class="risk-list" id="riskList"></div>
+
+  <div class="page-num">1 / 3</div>
+</div>
+
+<!-- ============ PAGE 2 : 포지셔닝 등급 · 동종업계 비교 ============ -->
+<div class="page" id="page2">
+  <div class="doc-header">
+    <div>
+      <div class="brand">CONFIDENTIAL · AUDIT PROPOSAL</div>
+      <h1>동종업계 포지셔닝 및 비교분석</h1>
+    </div>
+    <div class="meta"><span id="companyNameTop2"></span></div>
+  </div>
+
+  <div class="section-title">동종업계 포지셔닝 스코어카드</div>
+  <div class="grid3" id="gradeCards"></div>
+
+  <div class="section-title">동종업종 비교 (매출총이익률 · 영업이익률)</div>
+  <div class="chart-card"><div class="chart-box" id="chartPeer"></div></div>
+  <div class="footnote" id="peerFootnote"></div>
+
+  <div class="section-title">동일 지역·규모 비교군 순위</div>
+  <div class="chart-card"><div class="chart-box" id="chartRegionRank"></div></div>
+
+  <div class="section-title">비교군 상세 현황</div>
+  <table id="regionTable">
+    <thead><tr><th style="text-align:left;">회사명</th><th style="text-align:left;">업종</th><th>매출액(백만)</th><th>매출총이익률</th><th>감사의견</th></tr></thead>
+    <tbody></tbody>
+  </table>
+  <div class="footnote">※ 의견거절 회사는 재무제표 신뢰성에 제한이 있어 비교 해석 시 유의가 필요합니다.</div>
+
+  <div class="page-num">2 / 3</div>
+</div>
+
+<!-- ============ PAGE 3 : 중점검토영역 · 종합의견 · 법인소개 ============ -->
+<div class="page" id="page3">
+  <div class="doc-header">
+    <div>
+      <div class="brand">CONFIDENTIAL · AUDIT PROPOSAL</div>
+      <h1>감사 중점검토영역 및 종합의견</h1>
+    </div>
+    <div class="meta"><span id="companyNameTop3"></span></div>
+  </div>
+
+  <div class="section-title">감사 시 중점검토 예정 영역 (Preview)</div>
+  <div id="reviewList"></div>
+
+  <div class="section-title">종합의견</div>
+  <div class="opinion-box" id="opinionText"></div>
+
+  <div class="firm-box">
+    <div class="head" id="firmHead"></div>
+    <div class="body">
+      <div id="firmPitch"></div>
+      <div class="contact" id="firmContact"></div>
+      <div class="contact" id="firmFeeNote"></div>
+    </div>
+  </div>
+
+  <div class="disclaimer">본 보고서는 감사 수임 제안을 위한 참고 목적으로 작성되었으며, 회계감사기준에 따른 정식 감사의견을 대체하지 않습니다.<br>수치는 외부감사 전자공시(DART) 자료를 기초로 작성되었습니다.</div>
+
+  <div class="page-num">3 / 3</div>
+</div>
+
+<script>
+/* =========================================================================
+   [사용법]
+   1) 아래 EMBEDDED_DATA 객체의 값만 실제 회사 데이터로 교체하면 됩니다.
+   2) 페이지 구조(HTML/CSS)와 차트 렌더링 로직(JS 함수들)은 건드릴 필요 없습니다.
+   3) 외부 라이브러리(Chart.js 등)나 별도 JSON fetch를 사용하지 않으므로,
+      파일을 더블클릭해서 열어도(file://) 인터넷 연결 없이 항상 정상 렌더링됩니다.
+   4) financials 배열은 연도 오름차순(과거→최근)으로 최소 2개 이상 필요합니다.
+      (권장: 4개년)
+   5) peers, regionGroup은 데이터가 없는 회사는 매출액/매출총이익률을 null로
+      두면 자동으로 "-" 처리되고 순위 차트에서 제외됩니다.
+   ========================================================================= */
+const EMBEDDED_DATA = {
+  "firm": {
+    "name": "",              // 예: "금바다세무회계"
+    "manager": "",            // 예: "담당 회계사 홍길동"
+    "contact": "",            // 예: "T. 000-0000-0000  ·  E. contact@example.com"
+    "feeNote": "",            // 예: "본 견적은 회사 규모 및 감사범위 협의 후 별도 제안드립니다."
+    "pitch": ""               // 예: "20년 이상의 중소기업 외부감사 경험을 바탕으로 ..."
+  },
+  "company": {
+    "name": "",               // 회사명 (예: "(주)OOO")
+    "industry": "",           // 업종명
+    "address": "",            // 주소
+    "ceo": "",                // 대표자명
+    "fiscalDate": "",         // 결산기준일 (예: "2025-12-31")
+    "opinion": "적정",        // "적정" | "한정" | "의견거절" | "부적정"
+    "auditor": ""             // 감사인명
+  },
+  // 4개년(권장) 재무데이터. year는 오름차순으로 정렬합니다.
+  "financials": [
+    { "year": 0, "유동자산": 0, "비유동자산": 0, "자산총계": 0, "유동부채": 0, "비유동부채": 0, "부채총계": 0, "자본총계": 0, "매출액": 0, "매출원가": 0, "매출총이익": 0, "판관비": 0, "영업이익": 0, "당기순이익": 0 },
+    { "year": 0, "유동자산": 0, "비유동자산": 0, "자산총계": 0, "유동부채": 0, "비유동부채": 0, "부채총계": 0, "자본총계": 0, "매출액": 0, "매출원가": 0, "매출총이익": 0, "판관비": 0, "영업이익": 0, "당기순이익": 0 },
+    { "year": 0, "유동자산": 0, "비유동자산": 0, "자산총계": 0, "유동부채": 0, "비유동부채": 0, "부채총계": 0, "자본총계": 0, "매출액": 0, "매출원가": 0, "매출총이익": 0, "판관비": 0, "영업이익": 0, "당기순이익": 0 },
+    { "year": 0, "유동자산": 0, "비유동자산": 0, "자산총계": 0, "유동부채": 0, "비유동부채": 0, "부채총계": 0, "자본총계": 0, "매출액": 0, "매출원가": 0, "매출총이익": 0, "판관비": 0, "영업이익": 0, "당기순이익": 0 }
+  ],
+  // 동종업종 비교사 (0개 이상). 데이터 없으면 빈 배열 []로 두면 됩니다.
+  "peers": [
+    { "name": "", "매출액": 0, "매출총이익률": 0, "영업이익률": 0, "부채비율": 0, "자기자본비율": 0 }
+  ],
+  // 업종 평균 (선택). 없으면 null로 설정.
+  "industryAverage": {
+    "매출총이익률": 0,
+    "설명": ""                // 예: "OO업종 3개사 매출액가중평균"
+  },
+  // 동일 지역·규모 비교군. 대상회사는 isTarget:true 로 표시.
+  // 감사의견이 "의견거절" 등으로 재무데이터 신뢰성이 낮은 회사는
+  // 매출액/매출총이익률을 null로 두면 순위차트에서 자동 제외되고 표에는 "-"로 표시됩니다.
+  "regionGroup": [
+    { "name": "", "industry": "", "매출액": 0, "매출총이익률": 0, "opinion": "적정", "isTarget": true },
+    { "name": "", "industry": "", "매출액": 0, "매출총이익률": 0, "opinion": "적정" }
+  ],
+  // 종합의견 문단 (자유 서술)
+  "opinionSummary": ""
+};
+
+async function loadData(){
+  return EMBEDDED_DATA;
+}
+
+const fmt = n => n==null ? '-' : Math.round(n).toLocaleString('ko-KR');
+const fmtM = n => n==null ? '-' : Math.round(n/1e6).toLocaleString('ko-KR');
+const pct = n => n==null ? '-' : (n*100).toFixed(1)+'%';
+const pctSigned = n => n==null ? '-' : (n>=0?'+':'')+(n*100).toFixed(1)+'%p';
+
+function calcRatios(f){
+  return {
+    year: f.year,
+    매출총이익률: f.매출총이익/f.매출액,
+    영업이익률: f.영업이익/f.매출액,
+    순이익률: f.당기순이익/f.매출액,
+    부채비율: f.부채총계/f.자본총계,
+    유동비율: f.유동자산/f.유동부채,
+    자기자본비율: f.자본총계/f.자산총계
+  };
+}
+
+/* ===================== 순수 SVG 차트 헬퍼 (수정 불필요) ===================== */
+const SVG_NS = 'http://www.w3.org/2000/svg';
+function svgEl(tag, attrs){
+  const el = document.createElementNS(SVG_NS, tag);
+  for(const k in attrs) el.setAttribute(k, attrs[k]);
+  return el;
+}
+function niceMax(v){
+  if(v<=0) return 1;
+  const p = Math.pow(10, Math.floor(Math.log10(v)));
+  const n = v/p;
+  let m;
+  if(n<=1) m=1; else if(n<=2) m=2; else if(n<=5) m=5; else m=10;
+  return m*p;
+}
+
+function renderComboChart(container, labels, barData, lineData){
+  const W=680,H=220, padL=52,padR=48,padT=16,padB=28;
+  const plotW = W-padL-padR, plotH = H-padT-padB;
+  const barMax = niceMax(Math.max(...barData)*1.15);
+  const lineMin = Math.min(0, Math.min(...lineData));
+  const lineMax = niceMax(Math.max(...lineData)*1.3);
+  const n = labels.length;
+  const bw = plotW/n*0.45;
+
+  const svg = svgEl('svg',{viewBox:`0 0 ${W} ${H}`, preserveAspectRatio:'xMidYMid meet'});
+
+  for(let i=0;i<=4;i++){
+    const y = padT + plotH - (plotH*i/4);
+    svg.appendChild(svgEl('line',{x1:padL,x2:W-padR,y1:y,y2:y,stroke:'#eef0f3','stroke-width':1}));
+    const t = svgEl('text',{x:padL-6,y:y+3,'text-anchor':'end','font-size':'9','fill':'#8a94a3'});
+    t.textContent = fmt(barMax*i/4);
+    svg.appendChild(t);
+  }
+
+  labels.forEach((lab,i)=>{
+    const cx = padL + plotW*(i+0.5)/n;
+    const h = plotH*(barData[i]/barMax);
+    const x = cx-bw/2, y = padT+plotH-h;
+    svg.appendChild(svgEl('rect',{x,y,width:bw,height:h,rx:2,fill:'#173a5e'}));
+    const lt = svgEl('text',{x:cx,y:H-8,'text-anchor':'middle','font-size':'10','fill':'#4a5567'});
+    lt.textContent = lab;
+    svg.appendChild(lt);
+  });
+
+  const pts = labels.map((lab,i)=>{
+    const cx = padL + plotW*(i+0.5)/n;
+    const ratio = (lineData[i]-lineMin)/(lineMax-lineMin||1);
+    const cy = padT + plotH*(1-ratio);
+    return [cx,cy];
+  });
+  const path = pts.map((p,i)=> (i===0?'M':'L')+p[0].toFixed(1)+','+p[1].toFixed(1)).join(' ');
+  svg.appendChild(svgEl('path',{d:path, fill:'none', stroke:'#b8892b','stroke-width':2.5}));
+  pts.forEach((p,i)=>{
+    svg.appendChild(svgEl('circle',{cx:p[0],cy:p[1],r:3.5,fill:'#b8892b'}));
+    const t = svgEl('text',{x:p[0],y:p[1]-8,'text-anchor':'middle','font-size':'9.5','fill':'#8f640f','font-weight':'700'});
+    t.textContent = lineData[i].toFixed(1)+'%';
+    svg.appendChild(t);
+  });
+
+  container.innerHTML='';
+  container.appendChild(svg);
+  const legend = document.createElement('div');
+  legend.className='legend';
+  legend.innerHTML = `<span><i style="background:#173a5e"></i>매출액(백만원)</span><span><i style="background:#b8892b"></i>영업이익률(%)</span>`;
+  container.appendChild(legend);
+}
+
+function renderLineChart(container, labels, series){
+  const W=340,H=190, padL=42,padR=14,padT=14,padB=26;
+  const plotW=W-padL-padR, plotH=H-padT-padB;
+  const allVals = series.flatMap(s=>s.data);
+  /* [자본잠식 방어 — 2026-08-03 추가]
+     예전에는 y축이 항상 0~maxV였다(`cy = padT+plotH*(1-v/maxV)`). 완전자본잠식이면
+     부채비율(=부채총계/자본총계)이 **음수**가 되어 점/선이 plot 영역 아래(viewBox 밖)로
+     나가 통째로 잘려 보이지 않았다 — 값이 틀리게 찍히진 않지만 데이터가 없는 것처럼
+     보인다. 아래처럼 음수까지 포함해 스케일을 잡고 0선을 따로 그어, 같은 템플릿의
+     `renderGroupedBarChart`(minV/zeroY 패턴)와 동작을 일치시킨다.
+     값이 전부 양수면 minV=0이라 `yOf(v) === padT+plotH*(1-v/maxV)`로 **기존과 완전히
+     동일**하다(격자 5줄과 라벨도 그대로, 그리는 순서만 위→아래로 바뀐다). */
+  const rawMin = Math.min(...allVals);
+  const minV = rawMin < 0 ? -niceMax(Math.abs(rawMin)*1.2) : 0;
+  const maxV = niceMax(Math.max(0, ...allVals)*1.2);
+  const span = (maxV-minV) || 1;
+  const n = labels.length;
+  const yOf = v => padT + plotH*(maxV-v)/span;
+
+  const svg = svgEl('svg',{viewBox:`0 0 ${W} ${H}`, preserveAspectRatio:'xMidYMid meet'});
+  for(let i=0;i<=4;i++){
+    const y = padT+plotH*i/4;
+    svg.appendChild(svgEl('line',{x1:padL,x2:W-padR,y1:y,y2:y,stroke:'#eef0f3','stroke-width':1}));
+    const t = svgEl('text',{x:padL-5,y:y+3,'text-anchor':'end','font-size':'8.5','fill':'#8a94a3'});
+    t.textContent = Math.round(maxV-span*i/4)+'%';
+    svg.appendChild(t);
+  }
+  if(minV < 0){
+    const zeroY = yOf(0);
+    svg.appendChild(svgEl('line',{x1:padL,x2:W-padR,y1:zeroY,y2:zeroY,stroke:'#c7cdd6','stroke-width':1}));
+  }
+  labels.forEach((lab,i)=>{
+    const cx = padL+plotW*(i+0.5)/n;
+    const t = svgEl('text',{x:cx,y:H-8,'text-anchor':'middle','font-size':'9','fill':'#4a5567'});
+    t.textContent=lab;
+    svg.appendChild(t);
+  });
+  series.forEach(s=>{
+    const pts = s.data.map((v,i)=>{
+      const cx = padL+plotW*(i+0.5)/n;
+      const cy = yOf(v);
+      return [cx,cy];
+    });
+    const path = pts.map((p,i)=>(i===0?'M':'L')+p[0].toFixed(1)+','+p[1].toFixed(1)).join(' ');
+    svg.appendChild(svgEl('path',{d:path, fill:'none', stroke:s.color,'stroke-width':2.3}));
+    pts.forEach(p=> svg.appendChild(svgEl('circle',{cx:p[0],cy:p[1],r:3,fill:s.color})) );
+  });
+
+  container.innerHTML='';
+  container.appendChild(svg);
+  const legend = document.createElement('div');
+  legend.className='legend';
+  legend.innerHTML = series.map(s=>`<span><i style="background:${s.color}"></i>${s.name}</span>`).join('');
+  container.appendChild(legend);
+}
+
+function renderDoughnut(container, labels, data, colors){
+  /* [자본잠식 방어 — 2026-08-03 추가]
+     이 함수는 마지막 연도의 자본구성(유동부채/비유동부채/자본총계) 도넛 차트 하나에만
+     쓰인다. 완전자본잠식(자본총계 < 0) 회사는 합계(total)가 부채 합보다 작아져
+     - 유동부채 조각의 frac이 1을 크게 넘어 원호가 여러 바퀴 겹쳐 그려지고,
+     - 자본총계 조각은 음수 스윕(반대 방향)이 되며,
+     - 범례에 "유동부채 903.2% · 비유동부채 61.5% · 자본총계 -864.7%"처럼
+       말이 되지 않는 구성비가 인쇄됐다(실측 result_id=8583).
+     구성비(파이)는 음수 항목이 있으면 정의 자체가 성립하지 않으므로, 그럴 때는
+     도넛을 그리지 않고 **각 항목의 금액**만 안내한다. 같은 보고서의 등급(D)과
+     리스크 문구(완전자본잠식 경고)는 이미 자본잠식을 반영하고 있어, 차트만 모순된
+     숫자를 인쇄하지 않게 맞춘 것이다. */
+  const total = data.reduce((a,b)=>a+b,0);
+  if(data.some(v=>v==null || v<0) || total<=0){
+    container.innerHTML='';
+    const note = document.createElement('div');
+    note.setAttribute('style','display:flex;align-items:center;justify-content:center;'
+      +'height:120px;padding:0 16px;text-align:center;font-size:11px;line-height:1.7;color:var(--gray);');
+    note.textContent = '자본총계가 마이너스(완전자본잠식)여서 구성비를 표시할 수 없습니다. 아래 금액을 확인하시기 바랍니다.';
+    container.appendChild(note);
+    const amtLegend = document.createElement('div');
+    amtLegend.className='legend';
+    amtLegend.innerHTML = labels.map((l,i)=>`<span><i style="background:${colors[i]}"></i>${l} ${fmtM(data[i])}백만원</span>`).join('');
+    container.appendChild(amtLegend);
+    return;
+  }
+  const W=300,H=190, cx=W/2, cy=90, r=62, rInner=34;
+  const svg = svgEl('svg',{viewBox:`0 0 ${W} ${H}`, preserveAspectRatio:'xMidYMid meet'});
+  let angle = -Math.PI/2;
+  data.forEach((v,i)=>{
+    const frac = v/total;
+    const a0 = angle, a1 = angle + frac*Math.PI*2;
+    const x0 = cx+r*Math.cos(a0), y0=cy+r*Math.sin(a0);
+    const x1 = cx+r*Math.cos(a1), y1=cy+r*Math.sin(a1);
+    const xi0 = cx+rInner*Math.cos(a1), yi0=cy+rInner*Math.sin(a1);
+    const xi1 = cx+rInner*Math.cos(a0), yi1=cy+rInner*Math.sin(a0);
+    const largeArc = (a1-a0) > Math.PI ? 1 : 0;
+    const d = `M ${x0} ${y0} A ${r} ${r} 0 ${largeArc} 1 ${x1} ${y1} L ${xi0} ${yi0} A ${rInner} ${rInner} 0 ${largeArc} 0 ${xi1} ${yi1} Z`;
+    svg.appendChild(svgEl('path',{d, fill:colors[i]}));
+    angle = a1;
+  });
+  const centerText = svgEl('text',{x:cx,y:cy+4,'text-anchor':'middle','font-size':'11','fill':'#5a6472'});
+  centerText.textContent = '구성비';
+  svg.appendChild(centerText);
+
+  container.innerHTML='';
+  container.appendChild(svg);
+  const legend = document.createElement('div');
+  legend.className='legend';
+  legend.innerHTML = labels.map((l,i)=>`<span><i style="background:${colors[i]}"></i>${l} ${pct(data[i]/total)}</span>`).join('');
+  container.appendChild(legend);
+}
+
+function renderGroupedBarChart(container, labels, seriesA, seriesB, nameA, nameB, colorA, colorB){
+  const W=680,H=230, padL=46,padR=14,padT=16,padB=44;
+  const plotW=W-padL-padR, plotH=H-padT-padB;
+  const allVals = [...seriesA, ...seriesB.filter(v=>v!=null)];
+  const minV = Math.min(0, ...allVals);
+  const maxV = niceMax(Math.max(...allVals)*1.25);
+  const n = labels.length;
+  const groupW = plotW/n;
+  const bw = groupW*0.32;
+
+  const svg = svgEl('svg',{viewBox:`0 0 ${W} ${H}`, preserveAspectRatio:'xMidYMid meet'});
+  const zeroY = padT + plotH*(maxV/(maxV-minV));
+  for(let i=0;i<=4;i++){
+    const y = padT+plotH*i/4;
+    svg.appendChild(svgEl('line',{x1:padL,x2:W-padR,y1:y,y2:y,stroke:'#eef0f3','stroke-width':1}));
+  }
+  svg.appendChild(svgEl('line',{x1:padL,x2:W-padR,y1:zeroY,y2:zeroY,stroke:'#c7cdd6','stroke-width':1}));
+
+  labels.forEach((lab,i)=>{
+    const gx = padL + groupW*i;
+    const cxA = gx+groupW*0.35, cxB = gx+groupW*0.65;
+    const vA = seriesA[i], vB = seriesB[i];
+
+    const hA = plotH*Math.abs(vA)/(maxV-minV);
+    const yA = vA>=0 ? zeroY-hA : zeroY;
+    svg.appendChild(svgEl('rect',{x:cxA-bw/2,y:yA,width:bw,height:hA,rx:2,fill:colorA}));
+    const tA = svgEl('text',{x:cxA,y:(vA>=0? yA-4 : yA+hA+11),'text-anchor':'middle','font-size':'8.5','fill':'#334'});
+    tA.textContent = vA.toFixed(1)+'%';
+    svg.appendChild(tA);
+
+    if(vB!=null){
+      const hB = plotH*Math.abs(vB)/(maxV-minV);
+      const yB = vB>=0 ? zeroY-hB : zeroY;
+      svg.appendChild(svgEl('rect',{x:cxB-bw/2,y:yB,width:bw,height:hB,rx:2,fill:colorB}));
+      const tB = svgEl('text',{x:cxB,y:(vB>=0? yB-4 : yB+hB+11),'text-anchor':'middle','font-size':'8.5','fill':'#334'});
+      tB.textContent = vB.toFixed(1)+'%';
+      svg.appendChild(tB);
+    }
+
+    const lt = svgEl('text',{x:gx+groupW/2,y:H-24,'text-anchor':'middle','font-size':'9','fill':'#4a5567'});
+    lt.textContent = lab.length>10? lab.slice(0,9)+'…' : lab;
+    svg.appendChild(lt);
+  });
+
+  container.innerHTML='';
+  container.appendChild(svg);
+  const legend = document.createElement('div');
+  legend.className='legend';
+  legend.innerHTML = `<span><i style="background:${colorA}"></i>${nameA}</span><span><i style="background:${colorB}"></i>${nameB}</span>`;
+  container.appendChild(legend);
+}
+
+function renderHBarChart(container, labels, data, highlightIdx){
+  const rowH = 22, padL=140, padR=50, padT=8, padB=8;
+  const W=680, H = padT+padB+rowH*labels.length;
+  const plotW = W-padL-padR;
+  const maxV = niceMax(Math.max(...data.map(v=>Math.abs(v)))*1.2);
+  const minV = Math.min(0, ...data);
+
+  const svg = svgEl('svg',{viewBox:`0 0 ${W} ${H}`, preserveAspectRatio:'xMidYMid meet'});
+  const zeroX = padL + plotW*(0-minV)/(maxV-minV);
+  svg.appendChild(svgEl('line',{x1:zeroX,x2:zeroX,y1:padT,y2:H-padB,stroke:'#c7cdd6','stroke-width':1}));
+
+  labels.forEach((lab,i)=>{
+    const y = padT + rowH*i + rowH*0.2;
+    const h = rowH*0.6;
+    const v = data[i];
+    const w = plotW*Math.abs(v)/(maxV-minV);
+    const x = v>=0 ? zeroX : zeroX-w;
+    const color = i===highlightIdx ? '#b8892b' : '#8ea4bd';
+    svg.appendChild(svgEl('rect',{x,y,width:w,height:h,rx:2,fill:color}));
+
+    const lt = svgEl('text',{x:padL-8,y:y+h*0.75,'text-anchor':'end','font-size':'9','fill':'#334'});
+    lt.textContent = lab.length>12? lab.slice(0,11)+'…' : lab;
+    svg.appendChild(lt);
+
+    const vt = svgEl('text',{x:(v>=0? x+w+4 : x-4),y:y+h*0.75,'text-anchor':(v>=0?'start':'end'),'font-size':'9','fill':'#4a5567'});
+    vt.textContent = v.toFixed(1)+'%';
+    svg.appendChild(vt);
+  });
+
+  container.innerHTML='';
+  container.appendChild(svg);
+}
+
+/* ===================== 리스크/등급/검토영역 자동 판정 로직 (수정 불필요) ===================== */
+function buildRiskList(ratiosArr, financials){
+  const risks = [];
+  const last = ratiosArr[ratiosArr.length-1];
+  const first = ratiosArr[0];
+
+  let opDeclineStreak = 0;
+  for(let i=1;i<ratiosArr.length;i++){
+    if(ratiosArr[i].영업이익률 < ratiosArr[i-1].영업이익률) opDeclineStreak++; else opDeclineStreak=0;
+  }
+  if(opDeclineStreak >= 2){
+    risks.push({level:'red', text:`영업이익률이 ${opDeclineStreak+1}개년 연속 하락하고 있습니다 (${pct(first.영업이익률)} → ${pct(last.영업이익률)}).`});
+  } else if(ratiosArr.length>1 && last.영업이익률 < ratiosArr[ratiosArr.length-2].영업이익률){
+    risks.push({level:'amber', text:`직전연도 대비 영업이익률이 하락했습니다 (${pct(ratiosArr[ratiosArr.length-2].영업이익률)} → ${pct(last.영업이익률)}).`});
+  }
+
+  let revDeclineStreak = 0;
+  for(let i=1;i<financials.length;i++){
+    if(financials[i].매출액 < financials[i-1].매출액) revDeclineStreak++; else revDeclineStreak=0;
+  }
+  const revChange = (financials[financials.length-1].매출액 - financials[0].매출액)/financials[0].매출액;
+  if(revDeclineStreak >= 2){
+    risks.push({level: revChange < -0.2 ? 'red':'amber', text:`매출액이 ${revDeclineStreak+1}개년 연속 감소했습니다 (누적 ${pctSigned(revChange)}).`});
+  }
+
+  if(financials.length>1){
+    const curAssets = financials.map(f=>f.유동자산);
+    const assetChange = (curAssets[curAssets.length-1]-curAssets[curAssets.length-2])/curAssets[curAssets.length-2];
+    if(assetChange < -0.15){
+      risks.push({level:'amber', text:`전년 대비 유동자산이 ${pct(Math.abs(assetChange))} 감소했습니다. 자금 유동성 변동 원인에 대한 확인이 필요합니다.`});
+    }
+  }
+
+  /* [자본잠식 방어 — 2026-08-03 추가]
+     부채비율 = 부채총계/자본총계 이므로, 완전자본잠식(자본총계 < 0) 회사는 부채비율이
+     **음수**가 된다. 아래 대소 비교(last < first)만으로는 양수 → 음수, 즉 자본잠식으로
+     **악화**된 경우까지 "개선"으로 읽어 초록 문구를 찍었다(실측: 개발 DB 81건.
+     예 — 903.1% → -336.8%를 "지속 개선되어 재무안정성이 강화"로 인쇄). 같은 보고서의
+     재무안정성 등급은 scoreStability()의 자본잠식 가드로 D(주의 필요)가 나오므로
+     한 문서 안에서 서로 모순된 서술이 인쇄되는 문제가 있었다.
+     → 개선 판정은 **두 시점 모두 부채비율이 음수가 아닐 때만** 하고, 마지막 연도가
+     자본잠식이면 그 사실 자체를 red 항목으로 알린다. (시작 연도만 음수이고 마지막이
+     양수인 경우(자본잠식 탈출)는 두 값의 대소 비교 자체가 의미를 잃으므로 — 음수가
+     항상 "더 낮은 값"이 되어 개선/악화를 뒤집는다 — 어느 문구도 찍지 않는다.) */
+  if(last.부채비율 < 0){
+    risks.push({level:'red', text:`${last.year}년 자본총계가 마이너스로 완전자본잠식 상태입니다 (부채비율 ${pct(last.부채비율)}). 계속기업 가정 및 재무구조 개선방안에 대한 확인이 필요합니다.`});
+  } else if(first.부채비율 >= 0 && last.부채비율 < first.부채비율){
+    risks.push({level:'green', text:`부채비율이 ${pct(first.부채비율).replace('%','')}%에서 ${pct(last.부채비율)}로 지속 개선되어 재무안정성이 강화되었습니다.`});
+  }
+
+  if(last.유동비율 < 1){
+    risks.push({level:'red', text:`유동비율이 100% 미만(${pct(last.유동비율)})으로 단기 지급능력에 유의가 필요합니다.`});
+  }
+
+  return risks;
+}
+
+function grade(score){
+  if(score>=80) return 'A';
+  if(score>=60) return 'B';
+  if(score>=40) return 'C';
+  return 'D';
+}
+function gradeDesc(g){
+  return {A:'우수', B:'양호', C:'보통', D:'주의 필요'}[g];
+}
+function scoreStability(last){
+  /* [자본잠식 방어 — 2026-08-03 추가]
+     부채비율 = 부채총계/자본총계 이므로, 완전자본잠식(자본총계 < 0) 회사는
+     부채비율이 **음수**가 된다. 아래 임계값 비교는 음수를 "0.5 미만"으로 봐서
+     +30점을 주기 때문에, 자본이 전액 잠식된 회사가 오히려 A/B(우수·양호) 등급으로
+     인쇄되는 오류가 있었다(실측: 개발 DB에서 마지막 연도 자본총계가 음수인 회사
+     128건 전부가 B 이상). 자본잠식은 재무안정성 관점에서 최악의 상태이므로
+     여기서 먼저 걸러 D(40점 미만)를 강제한다. */
+  if(last.부채비율 < 0) return 10;
+  let s = 50;
+  if(last.부채비율 < 0.5) s += 30; else if(last.부채비율<1) s+=15; else if(last.부채비율>2) s-=25;
+  if(last.유동비율 > 2) s += 20; else if(last.유동비율>1) s+=10; else s-=20;
+  return Math.max(0,Math.min(100,s));
+}
+function scoreProfitability(last, industryAvgGpm){
+  let s = 50;
+  s += (last.영업이익률)*300;
+  if(industryAvgGpm!=null) s += (last.매출총이익률-industryAvgGpm)*200;
+  return Math.max(0,Math.min(100,s));
+}
+function scoreGrowth(financials){
+  const rev = financials.map(f=>f.매출액);
+  const change = (rev[rev.length-1]-rev[0])/rev[0];
+  let s = 50 + change*100;
+  return Math.max(0,Math.min(100,s));
+}
+function buildReviewAreas(ratiosArr, financials, peers){
+  const items = [];
+  items.push({tag:'수익성 검토', text:`매출총이익률·영업이익률 추세가 원가구조 변동과 일치하는지, 매출원가 계정의 기간별 일관성을 중점 검토할 예정입니다.`});
+  const revDecline = (financials[financials.length-1].매출액-financials[0].매출액)/financials[0].매출액;
+  if(revDecline < -0.1){
+    items.push({tag:'매출채권/수익인식 검토', text:`최근 매출액이 ${pctSigned(revDecline)} 변동한 만큼, 수익인식 시점 및 매출채권 회수가능성에 대한 확인이 필요합니다.`});
+  }
+  items.push({tag:'유동자산 구성 검토', text:`유동자산 규모 변동 추이를 감안하여 현금성자산, 재고자산, 매출채권 등 세부 구성 항목의 실재성·평가 적정성을 점검할 예정입니다.`});
+  items.push({tag:'특수관계자·우발부채 검토', text:`비유동부채 및 자본 변동 내역을 토대로 특수관계자 거래, 담보제공, 우발부채 등 주석 기재사항의 완전성을 확인할 예정입니다.`});
+  return items;
+}
+
+/* ===================== 렌더 메인 (수정 불필요) ===================== */
+(async function render(){
+  const data = await loadData();
+  const { firm, company, financials, peers, industryAverage, regionGroup, opinionSummary } = data;
+
+  document.getElementById('issueDate').textContent = new Date().toLocaleDateString('ko-KR');
+  document.getElementById('firmNameTop').textContent = firm.name;
+  document.getElementById('companyName').textContent = company.name;
+  document.getElementById('companySub').textContent = `${company.industry}  ·  ${company.address}  ·  대표자 ${company.ceo}`;
+  document.getElementById('fiscalBadge').textContent = `결산기준일 ${company.fiscalDate}`;
+  const ob = document.getElementById('opinionBadge');
+  ob.textContent = `감사의견 ${company.opinion}`;
+  ob.classList.add('opinion-'+company.opinion);
+  ['companyNameTop2','companyNameTop3'].forEach(id=>document.getElementById(id).textContent=company.name);
+
+  const ratiosArr = financials.map(calcRatios);
+  const last = ratiosArr[ratiosArr.length-1];
+  const first = ratiosArr[0];
+  const lastF = financials[financials.length-1];
+
+  const revChange = (lastF.매출액-financials[0].매출액)/financials[0].매출액;
+  const kpiRow = document.getElementById('kpiRow');
+  const kpis = [
+    ['매출액('+lastF.year+')', fmtM(lastF.매출액)+'백만원'],
+    ['영업이익률', pct(last.영업이익률)],
+    ['부채비율', pct(last.부채비율)],
+    ['유동비율', pct(last.유동비율)],
+    ['매출 변동', pctSigned(revChange)]
+  ];
+  kpiRow.innerHTML = kpis.map(([k,v])=>`<div class="kpi"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
+
+  renderComboChart(
+    document.getElementById('chartRevenue'),
+    financials.map(f=>f.year+'년'),
+    financials.map(f=>Math.round(f.매출액/1e6)),
+    ratiosArr.map(r=>+(r.영업이익률*100).toFixed(1))
+  );
+
+  renderLineChart(
+    document.getElementById('chartStability'),
+    financials.map(f=>f.year+'년'),
+    [
+      {name:'부채비율(%)', data: ratiosArr.map(r=>+(r.부채비율*100).toFixed(1)), color:'#c0392b'},
+      {name:'유동비율(%)', data: ratiosArr.map(r=>+(r.유동비율*100).toFixed(1)), color:'#1e8a5f'}
+    ]
+  );
+
+  renderDoughnut(
+    document.getElementById('chartStructure'),
+    ['유동부채','비유동부채','자본총계'],
+    [lastF.유동부채, lastF.비유동부채, lastF.자본총계],
+    ['#c0392b','#c98a10','#1e8a5f']
+  );
+
+  const risks = buildRiskList(ratiosArr, financials);
+  document.getElementById('riskList').innerHTML = risks.map(r=>
+    `<div class="risk-item risk-${r.level}"><span class="dot"></span><span>${r.text}</span></div>`
+  ).join('');
+
+  const gpmIndustry = industryAverage ? industryAverage.매출총이익률 : null;
+  const sStab = scoreStability(last);
+  const sProf = scoreProfitability(last, gpmIndustry);
+  const sGrowth = scoreGrowth(financials);
+  const grades = [
+    {label:'재무안정성', score:sStab},
+    {label:'수익성', score:sProf},
+    {label:'성장성', score:sGrowth}
+  ];
+  document.getElementById('gradeCards').innerHTML = grades.map(g=>{
+    const gr = grade(g.score);
+    return `<div class="grade-card grade-${gr}"><div class="label">${g.label}</div><div class="grade">${gr}</div><div class="desc">${gradeDesc(gr)}</div></div>`;
+  }).join('');
+
+  const peerLabels = [company.name, ...peers.map(p=>p.name)];
+  if(industryAverage) peerLabels.push('업종평균');
+  const gpmData = [+(last.매출총이익률*100).toFixed(1), ...peers.map(p=>+(p.매출총이익률*100).toFixed(1))];
+  if(industryAverage) gpmData.push(+(industryAverage.매출총이익률*100).toFixed(1));
+  const opmData = [+(last.영업이익률*100).toFixed(1), ...peers.map(p=>+(p.영업이익률*100).toFixed(1))];
+  if(industryAverage) opmData.push(null);
+
+  renderGroupedBarChart(
+    document.getElementById('chartPeer'),
+    peerLabels, gpmData, opmData,
+    '매출총이익률(%)', '영업이익률(%)', '#173a5e', '#b8892b'
+  );
+  document.getElementById('peerFootnote').textContent = `※ 비교 대상: ${peers.length>0? peers.map(p=>p.name).join(', ') : '동종업종 비교사 데이터 없음'}${industryAverage? ' / 업종평균: '+industryAverage.설명:''}`;
+
+  const validRegion = regionGroup.filter(r=>r.매출총이익률!=null).sort((a,b)=>b.매출총이익률-a.매출총이익률);
+  const targetIdx = validRegion.findIndex(r=>r.isTarget);
+  renderHBarChart(
+    document.getElementById('chartRegionRank'),
+    validRegion.map(r=>r.name),
+    validRegion.map(r=>+(r.매출총이익률*100).toFixed(1)),
+    targetIdx
+  );
+
+  const tbody = document.querySelector('#regionTable tbody');
+  tbody.innerHTML = regionGroup.map(r=>`
+    <tr class="${r.isTarget?'target':''}">
+      <td class="name">${r.name}</td>
+      <td class="name">${r.industry}</td>
+      <td>${fmtM(r.매출액)}</td>
+      <td>${pct(r.매출총이익률)}</td>
+      <td style="text-align:center;"><span class="opinion-tag ${r.opinion}">${r.opinion}</span></td>
+    </tr>`).join('');
+
+  const reviewAreas = buildReviewAreas(ratiosArr, financials, peers);
+  document.getElementById('reviewList').innerHTML = reviewAreas.map(a=>
+    `<div class="review-item"><div class="tag">${a.tag}</div><div>${a.text}</div></div>`
+  ).join('');
+
+  document.getElementById('opinionText').textContent = opinionSummary;
+
+  document.getElementById('firmHead').textContent = (firm.name||'') + ' 감사 제안';
+  document.getElementById('firmPitch').textContent = firm.pitch;
+  document.getElementById('firmContact').textContent = `${firm.manager}  ·  ${firm.contact}`;
+  document.getElementById('firmFeeNote').textContent = firm.feeNote;
+})();
+</script>
+</body>
+</html>

@@ -8,6 +8,7 @@ test_api_jobs.py와 동일한 패턴으로 dependency_override + 인메모리 SQ
 from __future__ import annotations
 
 import io
+from types import SimpleNamespace
 
 import openpyxl
 import pytest
@@ -47,6 +48,25 @@ def client_with_db():
     yield TestClient(app_main.app), factory
 
     app_main.app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def report_output_to_tmp(tmp_path, monkeypatch):
+    """보고서 산출물 폴더만 tmp_path로 돌린다(템플릿은 저장소 실제 파일 그대로).
+
+    tests/test_reports.py의 `report_settings`와 같은 방식 — 이 픽스처가 없으면
+    API 테스트가 개발 저장소의 `backend/report/`에 실제 파일을 쌓는다.
+    """
+    from app import config as app_config
+    from app.reports import audit_proposal
+
+    real = app_config.get_settings()
+    stub = SimpleNamespace(
+        report_output_dir=str(tmp_path / "report"),
+        report_template_path=real.report_template_path,
+    )
+    monkeypatch.setattr(audit_proposal, "get_settings", lambda: stub)
+    return stub
 
 
 def _seed_job_with_results(factory) -> int:
@@ -125,6 +145,71 @@ def test_list_results_returns_seeded_rows(client_with_db):
     assert resp.status_code == 200
     body = resp.json()
     assert body["total"] == 2
+    assert len(body["items"]) == 2
+
+
+def test_list_results_ids_only_returns_all_ids_without_items(client_with_db):
+    """`ids_only=true`는 페이징을 무시하고 필터를 통과한 id 전체만 돌려준다.
+
+    화면의 "현재 필터 전체 선택"이 페이지를 순회하지 않고 선택 목록을 만드는 근거다
+    (2026-08-03). `page_size=1`을 함께 줘도 잘려서는 안 된다.
+    """
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+
+    body = client.get(
+        f"/api/jobs/{job_id}/results", params={"ids_only": True, "page_size": 1}
+    ).json()
+
+    assert body["items"] == []
+    assert body["total"] == 2
+    assert len(body["ids"]) == 2
+    # total은 항상 반환한 ids 개수와 일치하고, page/page_size는 "한 쪽에 전부"를 뜻한다.
+    assert body["total"] == len(body["ids"])
+    assert (body["page"], body["page_size"]) == (1, 2)
+
+
+def test_list_results_ids_only_applies_filter_and_sort(client_with_db):
+    """`ids_only`도 목록과 똑같은 필터·정렬을 탄다 — 화면 순서 = 선택 순서."""
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+
+    all_desc = client.get(
+        f"/api/jobs/{job_id}/results",
+        params={"ids_only": True, "sort": "corp_name:desc"},
+    ).json()
+    paged_desc = client.get(
+        f"/api/jobs/{job_id}/results", params={"sort": "corp_name:desc"}
+    ).json()
+    assert all_desc["ids"] == [r["id"] for r in paged_desc["items"]]
+
+    filtered = client.get(
+        f"/api/jobs/{job_id}/results", params={"ids_only": True, "q": "성공"}
+    ).json()
+    assert filtered["total"] == 1
+    assert filtered["ids"] == [
+        r["id"]
+        for r in client.get(f"/api/jobs/{job_id}/results", params={"q": "성공"}).json()["items"]
+    ]
+
+    empty = client.get(
+        f"/api/jobs/{job_id}/results", params={"ids_only": True, "q": "없는회사"}
+    ).json()
+    assert empty["ids"] == [] and empty["total"] == 0
+
+
+def test_list_results_omits_ids_field_without_ids_only(client_with_db):
+    """`ids_only`를 주지 않으면 `ids`는 **null**이다(빈 배열이 아님).
+
+    프론트는 이 차이로 "서버가 ids_only를 지원하는지"를 판정한다 — 구버전 백엔드는
+    모르는 쿼리 파라미터를 조용히 무시하고 페이지 1쪽만 주기 때문에, `ids`가 null이면
+    전체 선택을 실행하면 안 된다(`/export`의 `_selected` 파일명 접미어와 같은 계약).
+    """
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+
+    body = client.get(f"/api/jobs/{job_id}/results").json()
+    assert body["ids"] is None
     assert len(body["items"]) == 2
 
 
@@ -821,6 +906,304 @@ def test_export_without_new_params_is_unchanged(client_with_db):
     assert "계정과목명" not in header
     assert "dart_search_job" in resp.headers["content-disposition"]
     assert "_selected" not in resp.headers["content-disposition"]
+
+
+# ---------------------------------------------------------------------------
+# POST /api/jobs/{id}/results/selection-summary — 선택 요약 (§4-12-A, 2026-08-03)
+# ---------------------------------------------------------------------------
+
+
+def _seed_flagged_results(factory, job_id: int) -> dict[str, int]:
+    """플래그 조합이 다른 결과 5건을 추가하고 {회사명: id}를 돌려준다.
+
+    `㈜공시없음`은 Phase 2 B1이 감사보고서 공시를 못 찾았을 때 실제로 쓰는 조합
+    (`rcept_no=None` + `parse_status=FAILED` + `excluded_by_stale_disclosure=1`,
+    `app/core/pipeline.py`)을 그대로 재현한다 — 이 조합을 "검수 필요(FAILED)"로
+    세면 안 된다는 것이 selection-summary의 핵심 계약이다.
+    """
+    db = factory()
+    try:
+        rows = [
+            Result(
+                job_id=job_id,
+                corp_code="00100010",
+                rcept_no="20260601000010",
+                corp_name="㈜휴면",
+                parse_status=ParseStatus.OK,
+                latest_disclosure_date="20240101",
+                excluded_by_stale_disclosure=1,
+            ),
+            Result(
+                job_id=job_id,
+                corp_code="00100011",
+                rcept_no="20260601000011",
+                corp_name="㈜매출제외",
+                parse_status=ParseStatus.OK,
+                excluded_by_revenue=1,
+            ),
+            Result(
+                job_id=job_id,
+                corp_code="00100012",
+                rcept_no="20260601000012",
+                corp_name="㈜둘다제외",
+                parse_status=ParseStatus.PARTIAL,
+                excluded_by_revenue=1,
+                excluded_by_assets=1,
+            ),
+            Result(
+                job_id=job_id,
+                corp_code="00100013",
+                rcept_no="20260601000013",
+                corp_name="㈜정상",
+                parse_status=ParseStatus.OK,
+            ),
+            Result(
+                job_id=job_id,
+                corp_code="00100014",
+                rcept_no=None,
+                corp_name="㈜공시없음",
+                parse_status=ParseStatus.FAILED,
+                parse_note="최근 감사보고서 공시를 찾을 수 없음(참고값만 존재)",
+                latest_disclosure_date=None,
+                excluded_by_stale_disclosure=1,
+            ),
+        ]
+        db.add_all(rows)
+        db.commit()
+        return {row.corp_name: row.id for row in rows}
+    finally:
+        db.close()
+
+
+def _seed_snapshot_for(
+    factory, result_id: int, fiscal_year: str = "2024", complete: bool = False
+) -> None:
+    """재무 이력 1건을 심는다 — `no_history` 집계가 0건인 회사만 세는지 확인용.
+
+    `complete=True`면 보고서 생성에 필요한 비율 계산 항목까지 모두 채운다
+    (그렇지 않으면 이력이 있어도 `select_financial_rows()`가 그 연도를 버려
+    생성이 건너뛰어진다 — `no_history`가 어디까지나 **상한**인 이유다).
+    """
+    values: dict[str, int] = {"revenue": 1_000}
+    if complete:
+        values = {
+            "current_assets": 5_000,
+            "noncurrent_assets": 5_000,
+            "total_assets": 10_000,
+            "current_liab": 2_000,
+            "noncurrent_liab": 1_000,
+            "total_liab": 3_000,
+            "total_equity": 7_000,
+            "revenue": 20_000,
+            "cogs": 12_000,
+            "gross_profit": 8_000,
+            "sga": 5_000,
+            "operating_income": 3_000,
+            "net_income": 2_000,
+        }
+    db = factory()
+    try:
+        db.add(
+            FinancialSnapshot(
+                result_id=result_id,
+                rcept_no="20260601000001",
+                fiscal_year=fiscal_year,
+                parse_status=ParseStatus.OK,
+                from_current_period=1,
+                **values,
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_selection_summary_counts_flags_for_selected_ids(client_with_db):
+    """확인 모달용 집계 — 선택한 id들만 대상으로 위험 신호 건수를 센다.
+
+    한 회사가 매출액·총자산 두 조건에 동시에 걸릴 수 있어(두 필터는 독립 판정)
+    각 건수의 합이 total을 넘을 수 있다 — 화면이 더해서 쓰면 안 되는 근거.
+    """
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)  # ㈜성공테스트(OK) + ㈜실패테스트(FAILED)
+    ids = _seed_flagged_results(factory, job_id)
+    failed_id = _get_result_id(factory, job_id, "00100002")
+
+    selected = [
+        ids["㈜휴면"],
+        ids["㈜매출제외"],
+        ids["㈜둘다제외"],
+        ids["㈜정상"],
+        ids["㈜공시없음"],
+        failed_id,
+    ]
+    resp = client.post(
+        f"/api/jobs/{job_id}/results/selection-summary", json={"ids": selected}
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "total": 6,
+        # ㈜휴면 + ㈜공시없음 (파이프라인이 공시 미발견 건에도 이 플래그를 세운다)
+        "stale_disclosure": 2,
+        "excluded_revenue": 2,
+        "excluded_assets": 1,
+        # ㈜실패테스트만 — ㈜공시없음도 parse_status=FAILED지만 rcept_no가 없어
+        # "검수 필요"가 아니다(화면의 두 탭 구분과 동일).
+        "failed": 1,
+        "no_disclosure": 1,
+        # 이 테스트는 스냅샷을 심지 않으므로 전부 재무 이력 0건이다.
+        "no_history": 6,
+    }
+
+
+def test_selection_summary_separates_failed_from_missing_disclosure(client_with_db):
+    """[dart-qa 2026-08-03] `parse_status=FAILED`만으로 "검수 필요"를 세면 안 된다.
+
+    Phase 2 B1이 공시를 못 찾은 건에 FAILED를 쓰기 때문에, 실측 개발 DB에서는
+    FAILED 2,215건 중 2,214건이 `rcept_no IS NULL`(=검수 대상 아님)이었다.
+    화면의 "파싱 실패(검수 필요)" 탭(`parse_status=FAILED` + `has_disclosure=true`)
+    과 `failed` 필드가 같은 답을 줘야 한다.
+    """
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+    ids = _seed_flagged_results(factory, job_id)
+    real_failed_id = _get_result_id(factory, job_id, "00100002")  # rcept_no 있음
+
+    only_missing = client.post(
+        f"/api/jobs/{job_id}/results/selection-summary",
+        json={"ids": [ids["㈜공시없음"]]},
+    ).json()
+    assert only_missing["failed"] == 0
+    assert only_missing["no_disclosure"] == 1
+
+    only_real = client.post(
+        f"/api/jobs/{job_id}/results/selection-summary", json={"ids": [real_failed_id]}
+    ).json()
+    assert only_real["failed"] == 1
+    assert only_real["no_disclosure"] == 0
+
+    # 같은 선택을 목록 조회의 탭 파라미터로 걸러도 답이 일치해야 한다.
+    tab = client.get(
+        f"/api/jobs/{job_id}/results",
+        params={"parse_status": "FAILED", "has_disclosure": True},
+    ).json()
+    assert [r["id"] for r in tab["items"]] == [real_failed_id]
+
+
+def test_selection_summary_counts_companies_without_financial_history(
+    client_with_db, report_output_to_tmp
+):
+    """[dart-qa 2026-08-03] `no_history` — 보고서 생성이 건너뛸 회사 수.
+
+    `generate_reports()`는 재무 이력이 0건인 회사를 생성하지 않는다(§4-12).
+    확인 모달이 "N건 생성"이라고 물으려면 그 N이 `total`이 아니라
+    `total - no_history`(=**최대** 생성 가능 건수)여야 한다(실측 Job 27:
+    4,383건 중 3,149건이 스냅샷 0건이라 실제 산출물은 최대 1,234건).
+
+    이력이 **있어도** 전 연도가 파싱 실패/결측이면 추가로 건너뛰므로,
+    `total - no_history`는 정확값이 아니라 상한이다 — 아래에서 실제 생성과
+    비교해 그 부등식이 성립하는지까지 확인한다.
+    """
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+    ids = _seed_flagged_results(factory, job_id)
+    _seed_snapshot_for(factory, ids["㈜정상"], complete=True)
+    _seed_snapshot_for(factory, ids["㈜매출제외"], fiscal_year="2023")  # 결측 연도
+
+    selected = [ids["㈜정상"], ids["㈜매출제외"], ids["㈜휴면"], ids["㈜공시없음"]]
+    body = client.post(
+        f"/api/jobs/{job_id}/results/selection-summary", json={"ids": selected}
+    ).json()
+    assert body["total"] == 4
+    assert body["no_history"] == 2  # ㈜휴면 / ㈜공시없음만 (스냅샷 0건)
+
+    generated = client.post(
+        f"/api/jobs/{job_id}/generate-report", json={"ids": selected}
+    )
+    assert generated.status_code == 200, generated.text
+    payload = generated.json()
+    # 스냅샷 0건 2건은 반드시 건너뛴다 + 결측 연도뿐인 ㈜매출제외도 건너뛴다.
+    assert payload["generated_count"] == 1
+    assert {s["result_id"] for s in payload["skipped"]} == {
+        ids["㈜휴면"],
+        ids["㈜공시없음"],
+        ids["㈜매출제외"],
+    }
+    # 화면이 쓸 "최대 N건 생성" 문구의 계약 — 실제 생성량은 이 상한을 넘지 않는다.
+    assert payload["generated_count"] <= body["total"] - body["no_history"]
+
+
+def test_selection_summary_scopes_to_given_ids_and_dedupes(client_with_db):
+    """선택하지 않은 행은 세지 않고, 중복 id는 1건으로만 센다(생성 시와 동일 정규화)."""
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+    ids = _seed_flagged_results(factory, job_id)
+
+    body = client.post(
+        f"/api/jobs/{job_id}/results/selection-summary",
+        json={"ids": [ids["㈜휴면"], ids["㈜휴면"]]},
+    ).json()
+    assert body == {
+        "total": 1,
+        "stale_disclosure": 1,
+        "excluded_revenue": 0,
+        "excluded_assets": 0,
+        "failed": 0,
+        "no_disclosure": 0,
+        "no_history": 1,
+    }
+
+    clean = client.post(
+        f"/api/jobs/{job_id}/results/selection-summary", json={"ids": [ids["㈜정상"]]}
+    ).json()
+    assert clean == {
+        "total": 1,
+        "stale_disclosure": 0,
+        "excluded_revenue": 0,
+        "excluded_assets": 0,
+        "failed": 0,
+        "no_disclosure": 0,
+        "no_history": 1,
+    }
+
+
+def test_selection_summary_shares_id_validation_with_generate_report(client_with_db):
+    """입력 검증 계약이 `POST /generate-report`와 동일해야 한다.
+
+    요약이 200인데 생성이 400이면 확인 모달이 거짓 안내를 하게 된다 — 타 Job id
+    400(같은 메시지), 범위 밖 정수 400, 빈 목록 422, 없는 Job 404까지 같다.
+    """
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+    other_job_id = _seed_job_with_results(factory)
+    own_id = _get_result_id(factory, job_id, "00100001")
+    foreign_id = _get_result_id(factory, other_job_id, "00100001")
+
+    foreign = client.post(
+        f"/api/jobs/{job_id}/results/selection-summary",
+        json={"ids": [own_id, foreign_id]},
+    )
+    assert foreign.status_code == 400
+    assert str(foreign_id) in foreign.json()["detail"]
+    # 생성 엔드포인트도 같은 메시지로 거부한다(두 경로가 한 헬퍼를 공유한다).
+    generate = client.post(
+        f"/api/jobs/{job_id}/generate-report", json={"ids": [own_id, foreign_id]}
+    )
+    assert generate.status_code == 400
+    assert generate.json()["detail"] == foreign.json()["detail"]
+
+    overflow = client.post(
+        f"/api/jobs/{job_id}/results/selection-summary", json={"ids": [2**63]}
+    )
+    assert overflow.status_code == 400
+
+    empty = client.post(f"/api/jobs/{job_id}/results/selection-summary", json={"ids": []})
+    assert empty.status_code == 422  # pydantic min_length=1
+
+    missing_job = client.post(
+        "/api/jobs/999999/results/selection-summary", json={"ids": [own_id]}
+    )
+    assert missing_job.status_code == 404
 
 
 # ---------------------------------------------------------------------------
