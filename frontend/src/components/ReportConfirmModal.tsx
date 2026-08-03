@@ -73,8 +73,10 @@ export default function ReportConfirmModal({
     }
   }, [opened, jobId, ids])
 
-  // 넷은 서로 배타적이지 않다(한 회사가 매출액·총자산 조건에 동시에 걸릴 수 있다) —
-  // 합계를 내지 않고 0보다 큰 항목만 한 줄씩 나열한다.
+  // "의도한 선택인지 되물어야 할" 경고 항목들 — 서로 배타적이지 않으므로(한 회사가 매출액·
+  // 총자산 조건에 동시에 걸릴 수 있다) 합계를 내지 않고 0보다 큰 항목만 한 줄씩 나열한다.
+  // `no_disclosure`(감사보고서 없음)는 여기 넣지 않는다 — **검수 대상이 아니라 단순 참고
+  // 사항**이라 아래에서 별도 안내 톤(파란 Alert)으로 분리해 보여준다.
   const warnings = summary
     ? [
         {
@@ -99,15 +101,18 @@ export default function ReportConfirmModal({
           key: 'failed',
           count: summary.failed,
           text: '파싱 실패(검수 미완료) 회사',
-          // 백엔드는 parse_status='FAILED'를 전부 센다 — 원문 자체가 없어 검수 대상이
-          // 아닌 "감사보고서 없음" 건도 여기 들어간다는 사실을 숨기지 않는다.
-          note: '감사보고서 원문을 찾지 못한 회사(감사보고서 없음)도 포함됩니다.',
+          // 백엔드가 2026-08-03에 세분화해, 이제 여기엔 **원문이 있는데 못 읽은** 건만
+          // 들어간다("감사보고서 없음"은 아래 no_disclosure로 분리됐다).
+          note: '감사보고서 원문 파싱에 실패해 검수가 필요한 회사입니다.',
         },
       ].filter((item) => item.count > 0)
     : []
 
   const canConfirm = !!summary && !loading && !error
   const isLargeSelection = !!summary && summary.total > largeSelectionThreshold
+  // 재무 이력이 0건인 회사는 생성 자체가 건너뛰어진다 — 실제 산출물은 이 값이 상한이다
+  // (이력이 있어도 전 연도가 결측이면 더 줄 수 있어 "최대"라고 쓴다).
+  const maxGenerated = summary ? Math.max(summary.total - summary.no_history, 0) : 0
 
   return (
     <Modal
@@ -178,6 +183,22 @@ export default function ReportConfirmModal({
               </Alert>
             )}
 
+            {/* 감사보고서 없음은 경고가 아니다 — 사용자가 고칠 것도, 검수할 것도 없고
+                "원문이 애초에 공시되지 않았다"는 사실 안내일 뿐이라 파란 안내 톤으로
+                위 경고 블록과 분리해 보여준다. */}
+            {summary.no_disclosure > 0 && (
+              <Alert color="blue" variant="light" title="참고: 감사보고서 없음 회사가 포함돼 있습니다">
+                <Text size="sm">
+                  선택한 회사 중 <b>{summary.no_disclosure.toLocaleString()}건</b>은 공시된
+                  감사보고서 원문이 아예 없어 재무 정보를 수집하지 못했습니다.{' '}
+                  <b>검수 대상은 아니며</b>, 위 파싱 실패 건수와도 겹치지 않습니다.
+                </Text>
+                <Text size="xs" c="dimmed" mt={4}>
+                  이런 회사는 대부분 재무 이력도 없어 보고서 생성에서 건너뛰어집니다.
+                </Text>
+              </Alert>
+            )}
+
             <Stack gap={4}>
               <Text size="sm" fw={600}>
                 저장 위치
@@ -194,17 +215,36 @@ export default function ReportConfirmModal({
               </Text>
             </Stack>
 
-            <Text size="xs" c="dimmed">
-              재무 이력이 없는 회사는 파일이 만들어지지 않고 생성 결과에서 사유와 함께
-              안내합니다.
-              {isLargeSelection && (
-                <>
-                  {' '}
-                  선택이 많아 <b>생성에 시간이 걸릴 수 있습니다</b> — 완료될 때까지 이 창을
-                  닫지 마세요.
-                </>
-              )}
-            </Text>
+            {/* 실제 산출물 건수 안내 — 재무 이력이 0건인 회사는 백엔드가 생성 시
+                건너뛴다. 프론트가 미리 걸러내지 않고(넘기는 id는 선택 전체 그대로)
+                기대치만 미리 맞춰 준다. */}
+            {summary.no_history > 0 ? (
+              <Stack gap={2}>
+                <Text size="sm">
+                  선택한 {summary.total.toLocaleString()}건 중{' '}
+                  <b>{summary.no_history.toLocaleString()}건</b>은 수집된 재무 이력이 없어
+                  파일이 만들어지지 않습니다 — 실제로는{' '}
+                  <b>최대 {maxGenerated.toLocaleString()}건</b>이 만들어집니다.
+                </Text>
+                <Text size="xs" c="dimmed">
+                  만들어지지 않은 회사는 생성 결과에서 사유와 함께 안내합니다. 재무 이력이
+                  있어도 연도별 값이 모두 비어 있으면 추가로 건너뛸 수 있어, 실제 건수는 위
+                  값보다 적을 수 있습니다.
+                </Text>
+              </Stack>
+            ) : (
+              <Text size="xs" c="dimmed">
+                재무 이력의 연도별 값이 모두 비어 있는 회사는 파일이 만들어지지 않을 수 있으며,
+                그런 회사는 생성 결과에서 사유와 함께 안내합니다.
+              </Text>
+            )}
+
+            {isLargeSelection && (
+              <Text size="xs" c="dimmed">
+                선택이 많아 <b>생성에 시간이 걸릴 수 있습니다</b> — 완료될 때까지 이 창을 닫지
+                마세요.
+              </Text>
+            )}
           </>
         )}
 
@@ -213,7 +253,11 @@ export default function ReportConfirmModal({
             취소
           </Button>
           <Button onClick={onConfirm} disabled={!canConfirm} loading={generating}>
-            {summary ? `${summary.total.toLocaleString()}건 생성` : '생성'}
+            {summary
+              ? summary.no_history > 0
+                ? `최대 ${maxGenerated.toLocaleString()}건 생성`
+                : `${summary.total.toLocaleString()}건 생성`
+              : '생성'}
           </Button>
         </Group>
       </Stack>

@@ -18,6 +18,7 @@ dart-design-review)를 조율해 구현 → 검증까지 일관되게 수행한�
 | 2026-07-21 | 하네스 최초 등록 — 오케스트레이터 스킬(`dart-search-team`) 신설 + 기존 5개 에이전트(dart-backend/frontend/parser/qa/design-review) 내용을 M8 최신 상태로 갱신 | 전체 | 에이전트 정의 파일만 존재하고 오케스트레이터·CLAUDE.md 등록이 없던 구조적 누락 발견. 에이전트 내용도 M1~M5 스캐폴딩 단계에 머물러 M8까지의 아키텍처 재설계(지역 필터가 금융위 API 사전 스크리닝→dart_corp_index 로컬 쿼리로 전환, Phase1/Phase2 분리, 참고값/확정치 분리 등)를 전혀 반영하지 못하는 drift를 감사로 확인 |
 | 2026-08-03 | "현재 필터 전체 선택"용 경량 id 조회 — `GET /api/jobs/{id}/results`에 `ids_only=true` 옵션 추가(`ResultListResponse.ids` 필드 신설, 새 엔드포인트·스키마 변경 없음) | dart-backend | 상단 "필터 전체 wide 내보내기"를 없애고 선택 항목 다운로드(long) 하나로 통합하기로 하면서, 페이지당 50건만 고를 수 있던 제약을 풀어야 했다. 기존 목록 조회 재사용은 `page_size` 상한 500이 **조용히** 적용돼 "전체 선택인데 500건만"이 되고, `ResultResponse` 63필드(실측 약 1.9KB/행)를 id 하나 쓰자고 수 MB 받아야 해 기각 |
 | 2026-08-03 | 결과 화면 다운로드 UI 정리 — 상단 "Excel 다운로드"/"CSV 다운로드" 버튼(필터 전체 wide 내보내기) 제거 + 선택 표시줄에 "현재 필터 전체 선택 (총 N건)" 버튼 추가(`handleSelectAllInFilter`), 선택 0건이어도 표시줄 유지(비활성 버튼 + 안내문구로 유일한 다운로드 입구임을 알림) | dart-frontend | 사용자가 "상단 버튼과 선택 항목 다운로드가 중복 아니냐"고 문제 제기 → 헤더 체크박스가 페이지당 50건만 선택돼 "전체 선택"이 비현실적이었던 게 진짜 원인으로 확인 → 위 `ids_only` 전제 위에 필터 전체 선택 기능을 추가해 선택 항목 다운로드(long 포맷) 하나로 통합, wide 포맷(당기+전기)은 사용자가 "전기 금액 불필요" 확인해 화면에서 제외 |
+| 2026-08-04 | `selection-summary` 필드 보정 — `failed`를 화면 "파싱 실패(검수 필요)" 탭과 동일한 조건(`parse_status='FAILED'` **AND** `rcept_no IS NOT NULL`)으로 좁히고 `no_disclosure`(감사보고서 없음) 분리 + `no_history`(재무이력 0건 → 생성 스킵) 신설, 회귀 테스트 2건(전체 431 passed) | dart-backend | dart-qa 실측. ① Phase 2 B1이 공시 미발견 건에도 `parse_status=FAILED`를 쓰기 때문에 FAILED 2,215건 중 2,214건(99.95%)이 `rcept_no IS NULL`이고 진짜 검수 필요는 1건인데 확인 모달은 "파싱 실패 1,871건"이라고 띄우고 있었다. ② `generate_reports()`가 재무이력 0건 회사를 건너뛰는데(실측 Job 27: 4,383건 중 3,149건) 모달은 "4,383건 생성"이라고 물어 실제 산출량(최대 1,234건)을 과장했다 |
 | 2026-08-03 | 보고서 생성 전 확인 모달의 전제 — 선택 id 목록 요약 집계 `POST /api/jobs/{id}/results/selection-summary` 신설(+ 타 Job id 400 검증을 `_assert_ids_belong_to_job()`로 공용화, tests 3건) | dart-backend | "현재 필터 전체 선택"(§4-11-A)으로 수천 건이 선택된 채 확인 없이 보고서가 생성되고, 탭을 넘나든 합집합 선택에 조건 불일치 회사(휴면·폐업 추정/매출액·총자산 제외)가 섞여 우편 발송될 수 있다는 dart-qa·dart-design-review 지적 |
 | 2026-08-03 | 선택 항목 보고서 생성 기능 백엔드 신설 — `POST /api/jobs/{id}/generate-report` + `app/reports/`(audit_proposal.py/firm_profile.py) + `Settings.report_output_dir`/`report_template_path` + tests/test_reports.py(23건) | dart-backend | 선택 회사별 감사 수임 제안서(HTML)를 로컬 폴더로 뽑아 우편 발송까지 하려는 신규 요구. 기존 "선택 항목 다운로드"(브라우저 다운로드)를 대체하지 않고 병행한다 |
 | 2026-08-03 | 보고서 생성 QA 지적 반영 — 재무연도 선별(`select_financial_rows`) 신설로 "쓸 수 있는 연도 0건이면 생성 스킵(`skipped[]`)", 결측/0분모 연도 제외, FAILED 제외·PARTIAL/전기유래 경고, `FIRM_PROFILE` 자리표시자 경고, 라벨 엑셀 제어문자 방어(507 통일) + tests/test_reports.py 34건 | dart-backend | dart-qa 리뷰 High 3/Medium 2. 특히 빈 `financials`가 템플릿 렌더 IIFE를 `TypeError`로 중단시켜 **연락처까지 빠진 반쪽 제안서가 우편 발송**될 수 있었고, 결측치가 `NaN%`로 인쇄되며 등급 산정이 "데이터가 없을수록 A"로 고장나는 것을 확인 |
@@ -392,8 +393,9 @@ object dtype 고정 — float 승격 시 소수점/NaN이 찍힌다). 신설 "�
 
 **보고서 생성 전 확인 모달의 선택 요약(§4-12-A, 백엔드·프론트 모두 2026-08-03 완료)**:
 `POST /api/jobs/{id}/results/selection-summary`, body `{"ids":[1,2,3]}`,
-응답 `{total, stale_disclosure, excluded_revenue, excluded_assets, failed}`
-(전부 건수). "현재 필터 전체 선택"(§4-11-A)으로 수천 건이 선택된 채 확인 없이
+응답 `{total, stale_disclosure, excluded_revenue, excluded_assets, failed,
+no_disclosure, no_history}`(전부 건수 — 뒤의 두 필드는 2026-08-04 추가, 아래
+"필드 의미" 항목 참고). "현재 필터 전체 선택"(§4-11-A)으로 수천 건이 선택된 채 확인 없이
 제안서가 쏟아지고, 탭을 넘나든 **합집합 선택**에 조건 불일치 회사(휴면·폐업 추정/
 매출액·총자산 제외/파싱 실패)가 섞여 우편 발송될 수 있다는 지적에서 나왔다.
 
@@ -408,18 +410,48 @@ object dtype 고정 — float 승격 시 소수점/NaN이 찍힌다). 신설 "�
 - 한 회사가 매출액·총자산 두 조건에 **동시에** 걸릴 수 있어(두 필터는 독립 판정)
   각 건수의 합이 `total`을 넘을 수 있다 — 화면에서 더해 쓰면 안 된다. 플래그는
   `== 1`로만 센다(기존 Job 행은 NULL/0일 수 있고 둘 다 "해당 없음").
+- **필드 의미 — `failed`/`no_disclosure`/`no_history`는 서로 다른 축이다**
+  (2026-08-04, dart-qa 실측 지적 반영. 최초 구현은 `failed`가 FAILED 전부를 셌다):
+  - `failed` = 화면 **"파싱 실패(검수 필요)" 탭과 동일한 조건**
+    (`parse_status='FAILED'` **AND** `rcept_no IS NOT NULL`). Phase 2 B1이 공시를
+    못 찾은 건에도 FAILED를 쓰기 때문에(`pipeline.py`) FAILED 전체를 세면 검수
+    필요 건수가 수천 배 부풀려진다 — **개발 DB 실측: FAILED 2,215건 중 2,214건
+    (99.95%)이 `rcept_no IS NULL`이고 진짜 검수 필요는 1건**인데, 모달은 "파싱
+    실패 1,871건"이라고 띄우고 있었다.
+  - `no_disclosure` = 화면 **"감사보고서 없음" 탭과 동일**(`rcept_no IS NULL`).
+    검수 대상이 아니므로 경고가 아니라 안내용이다.
+  - `no_history` = `financial_snapshots`가 0건인 회사 수. §4-12 생성 로직이 이런
+    회사를 **건너뛰므로**, 확인 모달의 "N건 생성"은 `total`이 아니라
+    `total - no_history`(=**최대** 생성 가능 건수) 기준이어야 한다(실측 Job 27:
+    4,383건 중 3,149건이 스냅샷 0건 → 실제 산출물 최대 1,234건). 이력이 있어도
+    전 연도가 파싱 실패/결측이면 추가로 건너뛰므로 어디까지나 상한이다.
 - 읽기 전용이고 DB 스키마 변경·추가 API 호출 0건이라 기존 완료 Job에서 바로 쓸 수
-  있다.
+  있다. `no_history`는 스냅샷 `result_id`를 `DISTINCT`로 한 번 더 조회해 판정한다
+  (회사마다 `get_result_history()`를 부르지 않는다 — 필요한 건 "0건인가"뿐).
 - **확인 모달 UI도 구현 완료(2026-08-03)**: `frontend/src/components/ReportConfirmModal.tsx`
   — 생성 **후** 결과를 보여주는 `ReportResultModal.tsx`와 **별개 파일**이다(이쪽이 앞
   단계). "선택 항목 보고서 생성" 버튼은 이제 곧바로 생성하지 않고 이 모달을 열며,
   모달이 열릴 때 `getSelectionSummary()`(`api/results.ts`)를 호출한다.
   `handleGenerateReport()`/`generateReport()` 본체는 **무변경**이고 그 앞 단계로만
   끼워 넣었다.
-  - 경고 4종은 **각각 한 줄씩** 나열하고(0인 항목 생략) **절대 합산하지 않는다** —
+  - 경고 4종(`stale_disclosure`/`excluded_revenue`/`excluded_assets`/`failed`)은
+    노란 Alert 안에 **각각 한 줄씩** 나열하고(0인 항목 생략) **절대 합산하지 않는다** —
     "한 회사가 여러 항목에 동시에 해당할 수 있어 합이 선택 건수와 맞지 않을 수 있다"는
-    문구를 함께 둔다. `failed`에는 **"감사보고서 없음"(검수 대상 아님)도 포함**된다는
-    사실을 그 줄에 명시한다(백엔드가 `parse_status='FAILED'` 전부를 세므로).
+    문구를 함께 둔다.
+  - **2026-08-04 백엔드 필드 보정 반영 완료(dart-frontend)**:
+    - `failed` 줄의 "감사보고서 없음도 포함됩니다" 보조 문구를 제거하고 "원문 파싱에
+      실패해 검수가 필요한 회사"로 바꿨다(이제 사실이 아니므로).
+    - `no_disclosure`는 **경고 목록에 넣지 않는다** — 사용자가 고칠 것도 검수할 것도
+      없는 사실 안내라, 노란 경고 Alert 아래에 **파란(`color="blue" variant="light"`)
+      별도 Alert**로 톤을 낮춰 분리했다("검수 대상은 아니며, 위 파싱 실패 건수와도
+      겹치지 않습니다" + "대부분 재무 이력도 없어 건너뛰어집니다"). 0건이면 표시 안 함.
+      경고가 하나도 없을 때 뜨는 초록 Alert 문구는 경고 4종만 열거한다(감사보고서
+      없음은 그 판정에 관여하지 않으므로).
+    - 확인 버튼 라벨은 `no_history > 0`이면 "**최대** N건 생성"(N = `total -
+      no_history`), 0이면 기존 "N건 생성"이다. 같은 내용을 본문에도 한 줄로 안내한다
+      (선택 T건 중 H건은 재무 이력이 없어 파일이 안 만들어짐 → 최대 N건). **넘기는
+      id 목록은 여전히 선택 전체**다 — 어떤 회사가 스킵될지는 생성 시점에 백엔드가
+      판단하므로 프론트가 미리 걸러내지 않는다(문구는 기대치 보정용일 뿐).
   - **경고가 있어도 생성을 막지 않는다**(사용자가 알고 진행하게만 한다). 반대로
     **요약 조회가 실패하면 생성 버튼을 잠근다** — 무엇이 만들어질지 모른 채 수천 건을
     만들지 않기 위함.
@@ -572,7 +604,7 @@ pip install -r requirements.txt
 cp .env.example .env            # 실제 키 발급 후 값 채워넣기 (커밋 금지)
 
 uvicorn app.main:app --reload   # http://127.0.0.1:8000, 기동 시 SQLite 테이블 자동 생성
-pytest tests/ -q                # 2026-08-03 기준 422 passed
+pytest tests/ -q                # 2026-08-04 기준 431 passed
 ```
 
 **Python 버전 주의**: 이 개발 환경의 기본 `python`이 3.14였는데, 3.14용 `pandas`/`lxml` 등의

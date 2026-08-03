@@ -368,9 +368,17 @@ export interface GenerateReportResponse {
  * 누적되므로, 조건에 맞지 않는 회사가 우편 발송 대상에 섞였는지 생성 **전에** 알린다.
  *
  * 필드는 전부 **건수**다. 한 회사가 여러 조건에 동시에 걸릴 수 있어(매출액·총자산 필터는
- * 서로 독립 판정) **넷의 합이 `total`을 넘을 수 있다 — 화면에서 더해 "총 위험 N건"으로
- * 표시하지 말 것.** `failed`는 `parse_status='FAILED'` 전부라 "감사보고서 없음"(rcept_no
- * 부재로 검수 대상이 아닌 건)도 포함한다.
+ * 서로 독립 판정) **합이 `total`을 넘을 수 있다 — 화면에서 더해 "총 위험 N건"으로
+ * 표시하지 말 것.**
+ *
+ * `failed`와 `no_disclosure`는 결과 화면의 탭 구분과 정확히 같은 조건이며 서로 배타적이다
+ * (2026-08-03 백엔드 세분화) — `failed`는 "파싱 실패 (검수 필요)"(`parse_status='FAILED'`
+ * **이면서** `rcept_no`가 있는 건)이고, `no_disclosure`는 "감사보고서 없음"(`rcept_no` 부재)
+ * 이라 애초에 열어볼 원문이 없어 **검수 대상이 아니다**.
+ *
+ * `no_history`는 또 다른 축이다 — 재무 이력(financial_snapshots)이 0건이라 생성 시
+ * **건너뛰어질** 회사 수다. 확인 모달의 "N건 생성" 문구는 `total`이 아니라
+ * `total - no_history`(최대 생성 가능 건수)를 기준으로 쓴다.
  *
  * 입력·에러 계약은 `POST /generate-report`와 완전히 동일하다 — 같은 `ids`로 이 요약이
  * 200을 받았다면 생성도 같은 이유로 거부되지 않는다. */
@@ -379,7 +387,12 @@ export interface SelectionSummaryResponse {
   stale_disclosure: number
   excluded_revenue: number
   excluded_assets: number
+  /** `parse_status='FAILED'` **이면서** 원문(rcept_no)이 있는 건 = 진짜 검수 필요 */
   failed: number
+  /** `rcept_no` 부재 = 감사보고서 자체가 없는 건(검수 대상 아님) */
+  no_disclosure: number
+  /** 재무 이력이 0건이라 보고서 생성이 건너뛰어질 건 */
+  no_history: number
 }
 
 /** 계정 상세 1행 — 원문 라벨(각주 포함)/상대 계층 레벨/당기·전기 값. */
