@@ -18,7 +18,11 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app import main as app_main
-from app.api.results import SORTABLE_COLUMNS
+from app.api.results import (
+    AUDITOR_CHANGED_EXT_VALUES,
+    PARSE_STATUS_EXT_VALUES,
+    SORTABLE_COLUMNS,
+)
 from app.core.db import get_db
 from app.exporters.excel import RESULT_COLUMN_LABELS
 from app.models import Base
@@ -443,6 +447,341 @@ def test_list_results_filters_by_auditor_changed(client_with_db):
     # 기존(도입 이전) 행은 NULL로 남아 판정 불가로 노출된다.
     seeded = client.get(f"/api/jobs/{job_id}/results", params={"q": "성공"}).json()
     assert seeded["items"][0]["auditor_changed"] is None
+
+
+# ---------------------------------------------------------------------------
+# 결과화면 컬럼 필터 (§4-13-B, 2026-08-05)
+#   - revenue_min/max, assets_min/max : 실측 파싱값 범위 (NULL은 항상 통과)
+#   - parse_status_ext                : 파싱상태 4분류 자유 조합
+#   - auditor_changed_ext             : 감사인 변동 3분류 자유 조합
+# ---------------------------------------------------------------------------
+
+
+def _seed_amount_rows(factory, job_id: int) -> None:
+    """금액 범위 필터용 행 3개 — 작은 값/큰 값/값 없음(파싱 실패)."""
+    db = factory()
+    try:
+        db.add_all(
+            [
+                Result(
+                    job_id=job_id,
+                    corp_code="00100011",
+                    rcept_no="20260601000011",
+                    corp_name="㈜소형",
+                    parse_status=ParseStatus.OK,
+                    revenue_cur=1_000_000_000,
+                    total_assets_cur=500_000_000,
+                ),
+                Result(
+                    job_id=job_id,
+                    corp_code="00100012",
+                    rcept_no="20260601000012",
+                    corp_name="㈜대형",
+                    parse_status=ParseStatus.OK,
+                    revenue_cur=100_000_000_000,
+                    total_assets_cur=80_000_000_000,
+                ),
+                Result(
+                    job_id=job_id,
+                    corp_code="00100013",
+                    rcept_no="20260601000013",
+                    corp_name="㈜금액없음",
+                    parse_status=ParseStatus.PARTIAL,
+                    revenue_cur=None,
+                    total_assets_cur=None,
+                ),
+            ]
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_list_results_amount_range_lets_null_rows_through(client_with_db):
+    """매출액/총자산 범위를 걸어도 **값이 NULL인 행은 그대로 통과**한다(§4-13-E-1).
+
+    문서 원안("엑셀의 빈 셀처럼 숨김")을 2026-08-05에 사용자가 뒤집은 결정이다 —
+    검수용 화면이라 "매출액을 못 얻은 회사" 자체가 봐야 할 대상이고, 범위를 잡는
+    순간 조용히 사라지면 안 된다.
+    """
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+    _seed_amount_rows(factory, job_id)
+
+    # 시드 2건(㈜성공테스트 revenue 100억 / ㈜실패테스트 NULL) + 위 3건 = 5건
+    assert client.get(f"/api/jobs/{job_id}/results").json()["total"] == 5
+
+    narrow = client.get(
+        f"/api/jobs/{job_id}/results",
+        params={"revenue_min": 5_000_000_000, "revenue_max": 50_000_000_000},
+    ).json()
+    # 범위 안 1건(100억) + 값이 없는 2건(㈜실패테스트/㈜금액없음)이 함께 남는다.
+    assert {r["corp_name"] for r in narrow["items"]} == {
+        "㈜성공테스트",
+        "㈜실패테스트",
+        "㈜금액없음",
+    }
+    assert narrow["total"] == 3
+
+
+def test_list_results_amount_range_applies_to_assets_and_combines_with_revenue(
+    client_with_db,
+):
+    """총자산도 같은 규칙이고, 매출액 범위와 함께 주면 AND로 결합된다."""
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+    _seed_amount_rows(factory, job_id)
+
+    assets_only = client.get(
+        f"/api/jobs/{job_id}/results", params={"assets_min": 1_000_000_000}
+    ).json()
+    # 총자산 5억(㈜소형)만 빠지고, 총자산이 NULL인 나머지는 남는다.
+    assert {r["corp_name"] for r in assets_only["items"]} == {
+        "㈜성공테스트",
+        "㈜실패테스트",
+        "㈜대형",
+        "㈜금액없음",
+    }
+
+    combined = client.get(
+        f"/api/jobs/{job_id}/results",
+        params={"revenue_max": 2_000_000_000, "assets_max": 1_000_000_000},
+    ).json()
+    # ㈜소형(매출 10억·자산 5억)은 두 조건 모두 통과, ㈜대형은 두 조건 모두 탈락.
+    assert {r["corp_name"] for r in combined["items"]} == {
+        "㈜소형",
+        "㈜실패테스트",
+        "㈜금액없음",
+    }
+
+
+def test_list_results_amount_range_rejects_out_of_range_bound(client_with_db):
+    """SQLite INTEGER 범위를 넘는 경계값은 500(OverflowError)이 아니라 400이다."""
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+
+    resp = client.get(
+        f"/api/jobs/{job_id}/results", params={"revenue_min": 2**63}
+    )
+    assert resp.status_code == 400
+    assert "revenue_min" in resp.json()["detail"]
+
+
+def _seed_parse_status_ext_rows(factory, job_id: int) -> None:
+    """파싱상태 4분류가 실제로 갈리는 행들 — 공시없음/미파싱(진행 중) 포함."""
+    db = factory()
+    try:
+        db.add_all(
+            [
+                Result(
+                    job_id=job_id,
+                    corp_code="00100021",
+                    rcept_no=None,
+                    corp_name="㈜공시없음",
+                    parse_status=ParseStatus.FAILED,
+                ),
+                Result(
+                    job_id=job_id,
+                    corp_code="00100022",
+                    rcept_no="20260601000022",
+                    corp_name="㈜부분성공",
+                    parse_status=ParseStatus.PARTIAL,
+                ),
+                # Phase 2 진행 중 — rcept_no는 찾았고 아직 파싱 전(parse_status NULL).
+                Result(
+                    job_id=job_id,
+                    corp_code="00100023",
+                    rcept_no="20260601000023",
+                    corp_name="㈜미파싱",
+                    parse_status=None,
+                ),
+            ]
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_parse_status_ext_allows_free_combination_of_four_categories(client_with_db):
+    """체크박스 4종을 자유 조합할 수 있어야 한다(§4-13-C).
+
+    특히 "검수 필요"(FAILED_REVIEW)와 "감사보고서 없음"(NO_DISCLOSURE)은 둘 다
+    `parse_status=FAILED`라, 기존 `parse_status`+`has_disclosure` 단일값 조합으로는
+    한쪽만 켜고 다른 쪽을 끄는 상태를 표현할 수 없었다.
+    """
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+    _seed_parse_status_ext_rows(factory, job_id)
+
+    def names(value: str) -> set[str]:
+        body = client.get(
+            f"/api/jobs/{job_id}/results", params={"parse_status_ext": value}
+        ).json()
+        assert body["total"] == len(body["items"])
+        return {r["corp_name"] for r in body["items"]}
+
+    assert names("OK") == {"㈜성공테스트"}
+    assert names("PARTIAL") == {"㈜부분성공"}
+    # 원문은 있는데 OK/PARTIAL이 아닌 전부 — 미파싱(진행 중) 행도 여기 들어간다.
+    assert names("FAILED_REVIEW") == {"㈜실패테스트", "㈜미파싱"}
+    assert names("NO_DISCLOSURE") == {"㈜공시없음"}
+
+    # 자유 조합: "검수 필요"만 켜고 "감사보고서 없음"은 끈 상태 / 그 반대 / 혼합
+    assert names("OK,NO_DISCLOSURE") == {"㈜성공테스트", "㈜공시없음"}
+    assert names("ok,partial") == {"㈜성공테스트", "㈜부분성공"}  # 대소문자 무시
+
+
+def test_parse_status_ext_four_values_cover_every_row(client_with_db):
+    """네 값을 다 주면 필터를 안 건 것과 **정확히 같은 집합**이어야 한다.
+
+    한 행이라도 네 분류 어디에도 속하지 않으면 화면에서 조용히 사라진다 —
+    `FAILED_REVIEW`를 catch-all로 정의한 이유다.
+    """
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+    _seed_parse_status_ext_rows(factory, job_id)
+
+    unfiltered = client.get(
+        f"/api/jobs/{job_id}/results", params={"page_size": 500}
+    ).json()
+    every = client.get(
+        f"/api/jobs/{job_id}/results",
+        params={
+            "page_size": 500,
+            "parse_status_ext": ",".join(PARSE_STATUS_EXT_VALUES),
+        },
+    ).json()
+    assert every["total"] == unfiltered["total"] == 5
+    assert {r["id"] for r in every["items"]} == {r["id"] for r in unfiltered["items"]}
+
+    # 상호배타 — 네 분류의 건수 합이 전체와 같다(어떤 행도 두 번 세지지 않는다).
+    per_value = [
+        client.get(
+            f"/api/jobs/{job_id}/results", params={"parse_status_ext": value}
+        ).json()["total"]
+        for value in PARSE_STATUS_EXT_VALUES
+    ]
+    assert sum(per_value) == unfiltered["total"]
+
+
+def test_parse_status_ext_empty_selects_nothing_and_unknown_value_is_400(client_with_db):
+    """빈 값 = "아무 것도 체크 안 함" = 0건(미지정과 구분). 모르는 값은 400."""
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+
+    empty = client.get(f"/api/jobs/{job_id}/results", params={"parse_status_ext": ""})
+    assert empty.status_code == 200
+    assert empty.json()["total"] == 0
+    assert empty.json()["items"] == []
+
+    bad = client.get(
+        f"/api/jobs/{job_id}/results", params={"parse_status_ext": "OK,FAILED"}
+    )
+    assert bad.status_code == 400
+    assert "FAILED_REVIEW" in bad.json()["detail"]
+
+
+def test_parse_status_ext_combines_with_legacy_params_and_ids_only(client_with_db):
+    """기존 `parse_status`/`has_disclosure`는 그대로 살아 있고 AND로 결합된다.
+    `ids_only=true` 경량 조회도 같은 필터를 탄다(§4-11-A)."""
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+    _seed_parse_status_ext_rows(factory, job_id)
+
+    both = client.get(
+        f"/api/jobs/{job_id}/results",
+        params={"parse_status_ext": "OK,PARTIAL", "parse_status": "OK"},
+    ).json()
+    assert [r["corp_name"] for r in both["items"]] == ["㈜성공테스트"]
+
+    ids_only = client.get(
+        f"/api/jobs/{job_id}/results",
+        params={"ids_only": True, "parse_status_ext": "NO_DISCLOSURE"},
+    ).json()
+    assert len(ids_only["ids"]) == 1 == ids_only["total"]
+
+
+def test_auditor_changed_ext_supports_three_state_free_combination(client_with_db):
+    """감사인 변동 3종(변동 있음/없음/판정 불가)의 자유 조합 — 기존 불리언
+    `auditor_changed`로는 "판정 불가만" 같은 조합을 표현할 수 없었다."""
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+
+    db = factory()
+    try:
+        db.add_all(
+            [
+                Result(
+                    job_id=job_id,
+                    corp_code="00100031",
+                    corp_name="㈜감사인교체",
+                    parse_status=ParseStatus.OK,
+                    auditor_changed=1,
+                ),
+                Result(
+                    job_id=job_id,
+                    corp_code="00100032",
+                    corp_name="㈜감사인유지",
+                    parse_status=ParseStatus.OK,
+                    auditor_changed=0,
+                ),
+            ]
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    def names(value: str) -> set[str]:
+        return {
+            r["corp_name"]
+            for r in client.get(
+                f"/api/jobs/{job_id}/results",
+                params={"auditor_changed_ext": value, "page_size": 500},
+            ).json()["items"]
+        }
+
+    assert names("CHANGED") == {"㈜감사인교체"}
+    assert names("UNCHANGED") == {"㈜감사인유지"}
+    # 시드 2건은 이 컬럼 도입 이전 행처럼 NULL이라 판정 불가다.
+    assert names("UNKNOWN") == {"㈜성공테스트", "㈜실패테스트"}
+    assert names("CHANGED,UNKNOWN") == {"㈜감사인교체", "㈜성공테스트", "㈜실패테스트"}
+    # 세 값을 다 주면 필터를 안 건 것과 같은 집합(전수 포괄).
+    assert names(",".join(AUDITOR_CHANGED_EXT_VALUES)) == {
+        "㈜감사인교체",
+        "㈜감사인유지",
+        "㈜성공테스트",
+        "㈜실패테스트",
+    }
+
+    bad = client.get(
+        f"/api/jobs/{job_id}/results", params={"auditor_changed_ext": "MAYBE"}
+    )
+    assert bad.status_code == 400
+
+
+def test_export_applies_new_column_filters(client_with_db):
+    """`/export`(ids 없는 필터 전체 내보내기)도 같은 파라미터를 그대로 받는다 —
+    화면에서 걸어 놓은 컬럼 필터가 다운로드 파일에도 적용돼야 한다."""
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+    _seed_amount_rows(factory, job_id)
+
+    resp = client.get(
+        f"/api/jobs/{job_id}/export",
+        params={
+            "format": "csv",
+            "revenue_min": 50_000_000_000,
+            "parse_status_ext": "OK,PARTIAL",
+        },
+    )
+    assert resp.status_code == 200
+    text = resp.content.decode("utf-8-sig")
+    assert "㈜대형" in text
+    assert "㈜소형" not in text
+    # 매출액이 NULL인 행은 범위를 걸어도 남는다(위 §4-13-E-1 결정) — 단
+    # parse_status_ext=OK,PARTIAL에 걸려 ㈜실패테스트(FAILED)만 빠진다.
+    assert "㈜금액없음" in text
+    assert "㈜실패테스트" not in text
 
 
 def test_list_results_not_found_returns_404(client_with_db):

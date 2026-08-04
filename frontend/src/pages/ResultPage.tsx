@@ -3,23 +3,25 @@ import { useParams } from 'react-router-dom'
 import {
   Alert,
   Badge,
+  Box,
   Button,
   Checkbox,
   CloseButton,
   Group,
   Loader,
+  LoadingOverlay,
   Menu,
   Pagination,
   Paper,
   Stack,
   Table,
-  Tabs,
   Text,
   TextInput,
   Title,
   Tooltip,
   UnstyledButton,
 } from '@mantine/core'
+import { useDebouncedValue } from '@mantine/hooks'
 import { notifications } from '@mantine/notifications'
 import { getJob } from '../api/jobs'
 import { extractApiErrorMessage } from '../api/client'
@@ -35,7 +37,6 @@ import {
 import type {
   GenerateReportResponse,
   JobResponse,
-  ParseStatus,
   ResultListResponse,
   ResultResponse,
   SortDir,
@@ -48,17 +49,20 @@ import ResultDetailDrawer from '../components/ResultDetailDrawer'
 import ReportConfirmModal from '../components/ReportConfirmModal'
 import ReportResultModal from '../components/ReportResultModal'
 import CandidatesView from '../components/CandidatesView'
-
-type FilterTab =
-  | 'ALL'
-  | 'OK'
-  | 'PARTIAL'
-  | 'FAILED'
-  | 'NO_DISCLOSURE'
-  | 'EXCLUDED_REVENUE'
-  | 'EXCLUDED_ASSETS'
-  | 'STALE_DISCLOSURE'
-  | 'AUDITOR_CHANGED'
+import {
+  ResultColumnFilterControl,
+  StaleDisclosureFilterButton,
+} from '../components/ResultColumnFilters'
+import {
+  DEFAULT_RESULT_COLUMN_FILTERS,
+  describeActiveFilters,
+  describeInvertedRanges,
+  hasNonDefaultFilters,
+  isAssetsFilterActive,
+  isRevenueFilterActive,
+  resultFiltersToParams,
+} from '../util/resultFilters'
+import type { ResultColumnFilterState } from '../util/resultFilters'
 
 const PAGE_SIZE = 50
 
@@ -74,61 +78,6 @@ const LARGE_SELECTION_HINT = 500
 function sortKeyOf(column: ResultColumn): string | null {
   if (column.sortKey === false) return null
   return column.sortKey ?? column.key
-}
-
-type ResultFilterParams = {
-  parse_status?: ParseStatus
-  excluded_by_revenue?: boolean
-  excluded_by_assets?: boolean
-  excluded_by_stale_disclosure?: boolean
-  has_disclosure?: boolean
-  auditor_changed?: boolean
-}
-
-function tabToParams(tab: FilterTab): ResultFilterParams {
-  // "휴면·폐업 추정"(최근 1년 이내 DART 공시 없음) 건은 노이즈 성격이 강해
-  // 전용 탭이 아닌 모든 화면(전체 탭 포함)에서 기본적으로 숨긴다 — 사용자가
-  // 명시적으로 탭을 선택했을 때만 예외로 노출한다(2026-07-22 확정 UX).
-  if (tab === 'STALE_DISCLOSURE') {
-    return { excluded_by_stale_disclosure: true }
-  }
-  // 매출액/총자산 조건에 걸려 제외된 건도 같은 취급이다(2026-07-28) — 조건에
-  // 맞지 않아 이미 탈락한 회사라 기본 목록에 섞이면 안 된다. 전용 탭에서만 본다.
-  //
-  // 단 전용 탭에서는 **자기 필드만** true로 덮어쓰고 다른 제외 사유는 아예 걸지
-  // 않는다: B4의 매출액 필터와 총자산 필터는 서로 독립이라 한 회사가 두 플래그를
-  // 동시에 1로 가질 수 있고, 그런 회사에 반대쪽 조건(`false`)까지 걸면 두 탭
-  // 어디에도 나오지 않는 사각지대가 생긴다.
-  if (tab === 'EXCLUDED_REVENUE') {
-    return { excluded_by_stale_disclosure: false, excluded_by_revenue: true }
-  }
-  if (tab === 'EXCLUDED_ASSETS') {
-    return { excluded_by_stale_disclosure: false, excluded_by_assets: true }
-  }
-  const baseline = {
-    excluded_by_stale_disclosure: false,
-    excluded_by_revenue: false,
-    excluded_by_assets: false,
-  }
-  switch (tab) {
-    case 'OK':
-      return { ...baseline, parse_status: 'OK' }
-    case 'PARTIAL':
-      return { ...baseline, parse_status: 'PARTIAL' }
-    // FAILED 중에서도 원문을 실제로 열어본 건만 "검수 필요"다. 원문 자체가 없는
-    // 건(rcept_no IS NULL)은 파서 문제가 아니라 DART에 감사보고서가 없는 것이라
-    // 별도 탭으로 분리한다(2026-07-20).
-    case 'FAILED':
-      return { ...baseline, parse_status: 'FAILED', has_disclosure: true }
-    case 'NO_DISCLOSURE':
-      return { ...baseline, parse_status: 'FAILED', has_disclosure: false }
-    // 연도별 감사인이 바뀐 회사만(2026-07-26). 판정 불가(NULL — 감사인을 확인한
-    // 연도가 1개 이하)인 건은 백엔드 tri-state 규칙상 이 탭에서 빠진다.
-    case 'AUDITOR_CHANGED':
-      return { ...baseline, auditor_changed: true }
-    default:
-      return baseline
-  }
 }
 
 /** 감사인 변동 셀 (2026-07-26) — 목록의 다른 상태 컬럼(파싱상태)이 평문이라,
@@ -188,8 +137,17 @@ function ParseNoteCell({ text }: { text: string }) {
   )
 }
 
-/** phase='FINANCIALS'(Phase 2 완료/진행) Job의 "확정 결과" 뷰 — M2~M4 시점과 동일한
- * 결과 테이블/필터 탭/컬럼 토글/상세 Drawer/다운로드. §4-7-2로 "총자산 제외" 탭만 추가됐다.
+/** phase='FINANCIALS'(Phase 2 완료/진행) Job의 "확정 결과" 뷰 — 결과 테이블/컬럼
+ * 헤더 필터/컬럼 토글/상세 Drawer/다운로드.
+ *
+ * **필터 탭(FilterTab)은 2026-08-05(§4-13-C)에 폐지됐다** — 전체/파싱 성공/부분 성공/
+ * 파싱 실패/감사보고서 없음/매출액 제외/총자산 제외/감사인 변동/휴면·폐업 추정 9개 탭과
+ * "…N건 숨김 (보기)" 안내 문구를 **엑셀식 컬럼 헤더 필터**로 옮겼다. 탭이 담고 있던
+ * 업무 규칙(휴면·폐업 추정 기본 숨김, 검수 필요/감사보고서 없음 구분)은 새 필터의
+ * **초기 선택값**으로 그대로 이식했다(`DEFAULT_RESULT_COLUMN_FILTERS`).
+ * 매출액/총자산은 Job 생성 조건과의 일치 여부(`excluded_by_revenue`/`_assets`)가 아니라
+ * **실측 파싱값**(`revenue_cur`/`total_assets_cur`) 범위로 거른다 — 프리셋 버튼도 두지
+ * 않는다(사용자 확정).
  *
  * 다운로드 경로는 **선택 항목 다운로드(§4-11) 하나뿐이다** — 상단에 있던
  * "Excel 다운로드"/"CSV 다운로드"(현재 필터 전체를 당기·전기 wide 포맷으로 받던 버튼)는
@@ -201,7 +159,9 @@ function ParseNoteCell({ text }: { text: string }) {
  * 관련 UI(선택 체크박스 열, 선택 표시줄, 선택 항목 다운로드/보고서 생성)를 통째로
  * 숨긴다 — 조회·필터·정렬·상세보기는 그대로 동작한다. */
 function FinancialsResultsView({ jobId, viewerOnly = false }: { jobId: number; viewerOnly?: boolean }) {
-  const [tab, setTab] = useState<FilterTab>('ALL')
+  // §4-13-C 컬럼 헤더 필터 상태(구 FilterTab 대체). 여러 컬럼 필터는 전부 AND로
+  // 결합되고, 백엔드도 그렇게 처리한다.
+  const [filters, setFilters] = useState<ResultColumnFilterState>(DEFAULT_RESULT_COLUMN_FILTERS)
   const [page, setPage] = useState(1)
   const [data, setData] = useState<ResultListResponse | null>(null)
   const [loading, setLoading] = useState(false)
@@ -230,26 +190,10 @@ function FinancialsResultsView({ jobId, viewerOnly = false }: { jobId: number; v
   // 다중 컬럼 정렬 — 배열 앞쪽이 1순위(주 정렬), 뒤쪽이 보조 정렬이다. 일반 클릭은
   // 단일 정렬로 초기화하고, Shift+클릭은 기존 기준에 이 컬럼을 보조 정렬로 추가/토글한다.
   const [sorts, setSorts] = useState<{ key: string; dir: SortDir }[]>([])
-  // "휴면·폐업 추정"으로 기본 숨김 처리된 건수 — 무통보로 사라지지 않도록 탭
-  // 뱃지와 "총 N건" 옆 안내 문구로 항상 고지한다(2026-07-22 디자인 리뷰 반영).
-  const [staleCount, setStaleCount] = useState<number | null>(null)
-  // 매출액/총자산 조건으로 기본 숨김 처리된 건수 — 위와 완전히 같은 이유·같은
-  // 방식이다(2026-07-28). 각 탭이 실제로 쓰는 조건(tabToParams)을 그대로 재사용해
-  // "N건 숨김"과 그 탭을 열었을 때의 "총 N건"이 어긋나지 않게 한다.
-  const [excludedRevenueCount, setExcludedRevenueCount] = useState<number | null>(null)
-  const [excludedAssetsCount, setExcludedAssetsCount] = useState<number | null>(null)
 
-  useEffect(() => {
-    listResults(jobId, { page: 1, page_size: 1, ...tabToParams('STALE_DISCLOSURE') })
-      .then((res) => setStaleCount(res.total))
-      .catch(() => setStaleCount(null))
-    listResults(jobId, { page: 1, page_size: 1, ...tabToParams('EXCLUDED_REVENUE') })
-      .then((res) => setExcludedRevenueCount(res.total))
-      .catch(() => setExcludedRevenueCount(null))
-    listResults(jobId, { page: 1, page_size: 1, ...tabToParams('EXCLUDED_ASSETS') })
-      .then((res) => setExcludedAssetsCount(res.total))
-      .catch(() => setExcludedAssetsCount(null))
-  }, [jobId])
+  // "…N건 숨김 (보기)" 안내를 위해 Job 전역 건수를 미리 세던 조회 3건은 §4-13-C로
+  // 함께 사라졌다 — 지금은 헤더 아이콘 강조와 상단 "적용 중인 필터" 요약이 그 역할을
+  // 대신하고, 무엇이 걸려 있는지는 필터 자체가 곧 답이다.
 
   // 다른 Job의 결과 id가 선택에 남아 있으면 백엔드가 400(스코프 검증)을 준다.
   useEffect(() => {
@@ -265,20 +209,24 @@ function FinancialsResultsView({ jobId, viewerOnly = false }: { jobId: number; v
     return () => clearTimeout(timer)
   }, [search])
 
-  // 현재 탭이 실제로 거는 필터. "N건 숨김" 안내를 탭 이름으로 하드코딩하지 않고
-  // 이 값에서 파생시켜(그 탭이 정말 그 조건을 false로 걸 때만 고지) 어긋남을 막는다.
-  const activeParams = useMemo(() => tabToParams(tab), [tab])
+  // 금액 범위는 숫자를 한 글자씩 치는 동안 값이 계속 바뀌므로(50 → 5 → '') 조회를
+  // 디바운스한다 — 검색어와 같은 이유·같은 지연이다. 헤더 아이콘 강조와 입력값 자체는
+  // 디바운스 전 `filters`를 그대로 써서 타이핑이 즉시 반영된다.
+  const [debouncedFilters] = useDebouncedValue(filters, SEARCH_DEBOUNCE_MS)
+  // 컬럼 헤더 필터 → 쿼리 파라미터(§4-13-B 계약). 억원 입력의 원 단위 환산,
+  // "전부 체크면 파라미터 생략" 같은 규칙은 전부 이 함수 한 곳에 있다.
+  const columnParams = useMemo(() => resultFiltersToParams(debouncedFilters), [debouncedFilters])
 
-  // 목록 조회와 다운로드가 공유하는 필터/정렬 조건. 매 렌더마다 새 객체가 되면
-  // 아래 useEffect가 무한 루프를 도므로 값이 바뀔 때만 다시 만든다.
+  // 목록 조회와 "현재 필터 전체 선택"이 공유하는 필터/정렬 조건. 매 렌더마다 새 객체가
+  // 되면 아래 useEffect가 무한 루프를 도므로 값이 바뀔 때만 다시 만든다.
   const query = useMemo(
     () => ({
-      ...activeParams,
+      ...columnParams,
       q: debouncedSearch || undefined,
       // 다중 정렬은 콤마 구분 `field:dir` 목록으로 백엔드에 전달한다(서버 사이드 정렬).
       sort: sorts.length ? sorts.map((s) => `${s.key}:${s.dir}`).join(',') : undefined,
     }),
-    [activeParams, debouncedSearch, sorts],
+    [columnParams, debouncedSearch, sorts],
   )
 
   useEffect(() => {
@@ -290,9 +238,17 @@ function FinancialsResultsView({ jobId, viewerOnly = false }: { jobId: number; v
       .finally(() => setLoading(false))
   }, [jobId, page, query])
 
-  function handleTabChange(next: string | null) {
-    if (!next) return
-    setTab(next as FilterTab)
+  /** 컬럼 필터 변경 — 필터가 바뀌면 결과 집합 자체가 바뀌므로 항상 1페이지로 돌아간다
+   * (3페이지를 보던 중 범위를 좁혀 결과가 1페이지뿐이면 빈 화면이 된다).
+   * **선택(selectedIds)은 건드리지 않는다** — 필터는 화면 탐색 수단일 뿐이고, 다른
+   * 조건에서 골라 둔 회사가 조용히 빠지면 다운로드/보고서 결과가 달라진다. */
+  function updateFilters(patch: Partial<ResultColumnFilterState>) {
+    setFilters((prev) => ({ ...prev, ...patch }))
+    setPage(1)
+  }
+
+  function clearAllFilters() {
+    setFilters(DEFAULT_RESULT_COLUMN_FILTERS)
     setPage(1)
   }
 
@@ -481,19 +437,24 @@ function FinancialsResultsView({ jobId, viewerOnly = false }: { jobId: number; v
     })
   }
 
-  // "휴면·폐업 추정" 탭에서는 판정 근거(최근 공시일자)를 항상 볼 수 있어야
-  // 하므로 컬럼 토글 상태와 무관하게 표시한다(2026-07-22). ColumnToggle에도
-  // 같은 집합을 넘겨 체크박스 상태가 실제 표시 상태와 어긋나지 않게 한다.
+  // 판정 근거 컬럼 강제 표시 — 탭이 하던 일을 **필터 상태**로 옮긴 것이다(§4-13-C).
   //
-  // 같은 이유로 검수 탭("파싱 실패"/"부분 성공")에서는 **파싱비고**를 항상 표시한다
-  // (2026-08-03) — 그 탭에 있는 행은 전부 "왜 실패/부분인가"를 봐야 하는 행이고,
-  // 상단 wide 다운로드 버튼을 없앤 뒤로 그 사유를 화면에서 볼 경로가 개별 회사
-  // 상세 Drawer 하나뿐이었다. 다른 탭에서는 컬럼 토글로 켤 수 있다.
+  // - 휴면·폐업 추정을 목록에 포함시켰다면 판정 근거인 "최근 공시일자"를 항상 보여준다
+  //   (2026-07-22의 취지 그대로).
+  // - 파싱상태를 검수 대상(부분 성공/검수 필요)으로만 좁혀 봤다면 **파싱비고**를 항상
+  //   보여준다(2026-08-03) — 그 목록의 모든 행이 "왜 실패/부분인가"를 봐야 하는 행이고,
+  //   상단 wide 다운로드를 없앤 뒤로 그 사유를 볼 경로가 상세 Drawer 하나뿐이었다.
+  //   파싱 성공까지 함께 보는 상태에서는 강제하지 않는다(대부분 빈 값이라 자리만 차지).
+  // ColumnToggle에도 같은 집합을 넘겨 체크박스 상태가 실제 표시 상태와 어긋나지 않게 한다.
   const forcedVisibleKeys = useMemo<Set<keyof ResultResponse>>(() => {
-    if (tab === 'STALE_DISCLOSURE') return new Set(['latest_disclosure_date'])
-    if (tab === 'FAILED' || tab === 'PARTIAL') return new Set(['parse_note'])
-    return new Set()
-  }, [tab])
+    const keys = new Set<keyof ResultResponse>()
+    if (filters.stale.includes('STALE')) keys.add('latest_disclosure_date')
+    const reviewOnly =
+      filters.parseStatus.length > 0 &&
+      filters.parseStatus.every((v) => v === 'PARTIAL' || v === 'FAILED_REVIEW')
+    if (reviewOnly) keys.add('parse_note')
+    return keys
+  }, [filters])
   // 확인 모달(§4-12-A)에 넘길 선택 id — 매 렌더 새 배열이면 모달이 요약 조회를 반복하므로
   // 선택이 실제로 바뀔 때만 다시 만든다(정렬 기준은 handleGenerateReport와 동일).
   const selectedIdList = useMemo(() => [...selectedIds].sort((a, b) => a - b), [selectedIds])
@@ -507,56 +468,36 @@ function FinancialsResultsView({ jobId, viewerOnly = false }: { jobId: number; v
   const hasSelection = selectedIds.size > 0
   // "현재 필터 전체 선택"은 지금 조건으로 잡히는 결과가 있을 때만 의미가 있다.
   const canSelectAll = !!data && data.total > 0
+  // 상단 요약용 — 필터가 걸린 컬럼을 컬럼 토글로 숨겨 두면 헤더 아이콘 강조가 보이지
+  // 않으므로, 무엇이 걸려 있는지 한 줄로도 알려 준다(§4-13-C의 "총 N건 + 모든 필터
+  // 지우기" 최소 구성에 이 한 줄만 더한 것이다).
+  const activeFilterLabels = describeActiveFilters(filters)
+  const filtersDirty = hasNonDefaultFilters(filters)
+  const amountFilterActive = isRevenueFilterActive(filters) || isAssetsFilterActive(filters)
+  // 최소>최대로 뒤집힌 금액 범위 — 그대로 적용하면 "값 있는 회사 전멸 + NULL 회사만"
+  // 목록이 정상 결과처럼 보이고, 거기서 "현재 필터 전체 선택" → 보고서 생성으로 이어질
+  // 수 있다. 범위는 적용하지 않고(util) 화면에서 크게 알린다.
+  const invertedRanges = describeInvertedRanges(filters)
 
   return (
     <Stack>
+      {/* 필터 탭은 폐지됐다(§4-13-C) — 상단에는 검색창, 전용 컬럼이 없는
+          "휴면·폐업 추정" 필터, 컬럼 토글만 둔다. 나머지 필터는 전부 컬럼 헤더에 있다. */}
       <Group justify="space-between">
-        <Tabs value={tab} onChange={handleTabChange}>
-          <Tabs.List>
-            <Tabs.Tab value="ALL">전체</Tabs.Tab>
-            <Tabs.Tab value="OK">파싱 성공</Tabs.Tab>
-            <Tabs.Tab value="PARTIAL">부분 성공</Tabs.Tab>
-            <Tabs.Tab value="FAILED">파싱 실패 (검수 필요)</Tabs.Tab>
-            <Tabs.Tab value="NO_DISCLOSURE">감사보고서 없음</Tabs.Tab>
-            <Tabs.Tab
-              value="EXCLUDED_REVENUE"
-              rightSection={
-                excludedRevenueCount !== null ? (
-                  <Badge size="xs" variant="light" color="gray">
-                    {excludedRevenueCount}
-                  </Badge>
-                ) : undefined
-              }
+        <Group gap="xs">
+          <StaleDisclosureFilterButton filters={filters} onChange={updateFilters} />
+          {filtersDirty && (
+            <Tooltip
+              multiline
+              w={260}
+              label="컬럼 헤더에 걸어 둔 모든 필터를 화면 최초 상태로 되돌립니다(휴면·폐업 추정은 기본값인 '제외'로 돌아갑니다). 검색어와 정렬은 그대로 둡니다."
             >
-              매출액 제외 건
-            </Tabs.Tab>
-            <Tabs.Tab
-              value="EXCLUDED_ASSETS"
-              rightSection={
-                excludedAssetsCount !== null ? (
-                  <Badge size="xs" variant="light" color="gray">
-                    {excludedAssetsCount}
-                  </Badge>
-                ) : undefined
-              }
-            >
-              총자산 제외 건
-            </Tabs.Tab>
-            <Tabs.Tab value="AUDITOR_CHANGED">감사인 변동</Tabs.Tab>
-            <Tabs.Tab
-              value="STALE_DISCLOSURE"
-              rightSection={
-                staleCount !== null ? (
-                  <Badge size="xs" variant="light" color="yellow">
-                    {staleCount}
-                  </Badge>
-                ) : undefined
-              }
-            >
-              휴면·폐업 추정
-            </Tabs.Tab>
-          </Tabs.List>
-        </Tabs>
+              <Button variant="subtle" color="gray" onClick={clearAllFilters}>
+                모든 필터 지우기
+              </Button>
+            </Tooltip>
+          )}
+        </Group>
 
         <Group gap="xs">
           <TextInput
@@ -581,41 +522,26 @@ function FinancialsResultsView({ jobId, viewerOnly = false }: { jobId: number; v
 
       {error && <Alert color="red">{error}</Alert>}
 
-      {tab === 'NO_DISCLOSURE' && (
-        <Alert color="gray">
-          DART에서 감사보고서 공시를 찾지 못한 회사입니다 — 파싱 실패가 아니라 열어볼 원문이
-          없는 경우로, <b>검수 대상이 아닙니다</b>. 외부감사 대상에서 빠졌거나(과거에만 제출),
-          조회 기간(재무 이력 연수) 밖에 마지막 보고서가 있는 경우가 대부분입니다.
+      {/* 뒤집힌 금액 범위 경고 — 팝오버 안의 error 표시는 팝오버를 닫으면 보이지 않으므로,
+          목록이 "왜 이런 회사만 남았지"로 읽히지 않게 화면 상단에도 남긴다. */}
+      {invertedRanges.length > 0 && (
+        <Alert color="red" title="금액 범위 입력을 확인하세요">
+          {invertedRanges.join('·')} 필터의 <b>최소값이 최대값보다 큽니다</b> — 그 범위는{' '}
+          <b>적용하지 않았습니다</b>. 해당 컬럼 헤더의 필터 아이콘을 열어 값을 고치세요. 입력
+          단위는 <b>억원</b>입니다(표에 보이는 원 단위 금액을 그대로 옮겨 적으면 이 상태가
+          됩니다).
         </Alert>
       )}
 
-      {tab === 'AUDITOR_CHANGED' && (
-        <Alert color="gray">
-          수집한 재무 이력 안에서 <b>감사인(회계법인·감사반)이 한 번 이상 바뀐</b> 회사입니다.
-          어느 해에 바뀌었는지는 행을 클릭해 상세의 재무 이력 표 <b>"감사인" 행</b>에서 확인할
-          수 있습니다. 감사인을 확인한 연도가 1개 이하라 <b>판정할 수 없는 건은 이 탭과
-          "변동 없음" 어느 쪽에도 포함되지 않습니다</b>. 이 기능이 추가되기 전에 수집된 작업은
-          연도별 감사인이 저장돼 있지 않아 목록에서는 전부 판정 불가(-)로 보이지만,
-          <b>상세의 "감사인" 행은 원문을 그때그때 읽어 채우므로 기존 작업에서도 연도별로
-          확인할 수 있습니다</b>.
-        </Alert>
-      )}
-
-      {(tab === 'EXCLUDED_REVENUE' || tab === 'EXCLUDED_ASSETS') && (
-        <Alert color="gray">
-          감사보고서 원문에서 확인한 {tab === 'EXCLUDED_REVENUE' ? '매출액' : '총자산'}이 검색
-          조건 범위를 벗어나 <b>제외된 회사</b>입니다 — 조건에 맞지 않는 회사이므로
-          <b> "휴면·폐업 추정" 탭을 제외한 모든 탭(전체 포함)에서는 기본적으로 숨겨져
-          있습니다</b>(휴면·폐업 추정 탭은 공시 여부만으로 걸러 이 회사들도 함께 보입니다).
-          매출액·총자산 조건에 모두 걸린 회사는 두 탭 양쪽에 나옵니다.
-        </Alert>
-      )}
-
-      {tab === 'STALE_DISCLOSURE' && (
+      {/* 탭별 안내 Alert 4종은 §4-13-C로 사라졌다 — 각 설명은 해당 컬럼 필터
+          팝오버의 항목 설명(hint)으로 옮겨 필요한 자리에서만 보이게 했다.
+          다만 "휴면·폐업 추정"을 목록에 **포함**시키는 것은 목록 전체의 의미를
+          바꾸는 선택이라, 그때만 화면에 한 줄로 남긴다. */}
+      {filters.stale.includes('STALE') && (
         <Alert color="yellow">
-          최근 1년 이내 DART 공시가 없는 회사입니다 — 폐업·휴면 상태일 가능성이 있어
-          <b> 다른 모든 탭(전체 포함)에서는 기본적으로 숨겨져 있습니다</b>. 실제 영업
-          여부는 이 목록만으로 단정할 수 없으니 필요 시 직접 확인하세요.
+          최근 1년 이내 DART 공시가 없는 회사(<b>휴면·폐업 추정</b>)가 목록에 포함돼 있습니다 —
+          폐업·휴면 상태일 가능성이 있어 기본적으로는 숨겨 둡니다. 실제 영업 여부는 이 목록만으로
+          단정할 수 없으니 필요 시 직접 확인하세요.
         </Alert>
       )}
 
@@ -664,7 +590,7 @@ function FinancialsResultsView({ jobId, viewerOnly = false }: { jobId: number; v
                 </Text>
               )}
               {/* "현재 필터 전체 선택"(2026-08-03) — 헤더 체크박스는 보이는 50건만 잡아
-                  1,000건대 결과를 다 고르려면 페이지를 수십 번 넘겨야 했다. 지금 탭·검색·정렬
+                  1,000건대 결과를 다 고르려면 페이지를 수십 번 넘겨야 했다. 지금 필터·검색·정렬
                   조건 그대로 서버에 id만 물어 한 번에 선택한다(기존 선택은 유지·합집합). */}
               {canSelectAll && (
                 <Button
@@ -691,8 +617,8 @@ function FinancialsResultsView({ jobId, viewerOnly = false }: { jobId: number; v
                 </Menu.Target>
                 <Menu.Dropdown>
                   <Menu.Label>
-                    선택한 {selectedIds.size.toLocaleString()}건만 내보내기 — 현재 필터·탭과
-                    무관하게 지금까지 체크한 전체 건이 대상입니다
+                    선택한 {selectedIds.size.toLocaleString()}건만 내보내기 — 지금 걸려 있는
+                    필터와 무관하게 지금까지 체크한 전체 건이 대상입니다
                   </Menu.Label>
                   <Menu.Item onClick={() => handleSelectionExport('xlsx', true)}>
                     Excel (기본정보 + 재무이력)
@@ -733,9 +659,13 @@ function FinancialsResultsView({ jobId, viewerOnly = false }: { jobId: number; v
         </Paper>
       )}
 
-      {loading && <Loader />}
+      {/* 첫 조회 때만 통짜 로더를 쓴다. **이미 목록이 있는 상태에서는 테이블을 절대
+          언마운트하지 않는다**(§4-13-C) — 컬럼 헤더의 필터 팝오버가 테이블 안에 있어서,
+          로딩마다 테이블을 걷어내면 최소값을 입력하는 순간 팝오버가 닫혀 최대값을 이어서
+          칠 수 없다(실측 재현). 대신 반투명 오버레이만 덮는다. */}
+      {loading && !data && <Loader />}
 
-      {!loading && data && (
+      {data && (
         <>
           <Text size="sm" c="dimmed">
             총 {data.total.toLocaleString()}건
@@ -755,150 +685,139 @@ function FinancialsResultsView({ jobId, viewerOnly = false }: { jobId: number; v
                 </UnstyledButton>
               </>
             )}
-            {activeParams.excluded_by_stale_disclosure === false && !!staleCount && (
-              <> · 휴면·폐업 추정 {staleCount.toLocaleString()}건 숨김 (
-              <UnstyledButton
-                component="span"
-                td="underline"
-                onClick={() => handleTabChange('STALE_DISCLOSURE')}
-              >
-                보기
-              </UnstyledButton>
-              )</>
+            {/* "…N건 숨김 (보기)" 안내 3종은 §4-13-C로 삭제됐다 — 무엇이 걸려 있는지는
+                헤더 아이콘 강조와 아래 요약이 대신한다. 다만 필터가 걸린 컬럼을 숨겨 둔
+                경우를 대비해 적용 중인 필터를 한 줄로 적어 준다. */}
+            {activeFilterLabels.length > 0 && (
+              <> · 필터 {activeFilterLabels.join(' / ')}</>
             )}
-            {/* 매출액/총자산 숨김 건수는 **전체 탭에서만** 알린다(2026-07-28 디자인
-                리뷰). 이 건수는 Job 전역 기준인데, `excluded_by_revenue=1`인 행은
-                정의상 원문을 열어 값을 파싱한 행이라 "파싱 실패"·"감사보고서 없음"
-                같은 세부 탭에서는 실제로 숨겨지는 행이 사실상 없다 — 그런 검수
-                화면에 이 숫자가 뜨면 "검수할 게 더 있나?"라는 오해만 만든다. */}
-            {tab === 'ALL' && activeParams.excluded_by_revenue === false && !!excludedRevenueCount && (
-              <> · 매출액 조건 제외 {excludedRevenueCount.toLocaleString()}건 숨김 (
-              <UnstyledButton
-                component="span"
-                td="underline"
-                onClick={() => handleTabChange('EXCLUDED_REVENUE')}
-              >
-                보기
-              </UnstyledButton>
-              )</>
-            )}
-            {tab === 'ALL' && activeParams.excluded_by_assets === false && !!excludedAssetsCount && (
-              <> · 총자산 조건 제외 {excludedAssetsCount.toLocaleString()}건 숨김 (
-              <UnstyledButton
-                component="span"
-                td="underline"
-                onClick={() => handleTabChange('EXCLUDED_ASSETS')}
-              >
-                보기
-              </UnstyledButton>
-              )</>
-            )}
-            {/* 두 건수는 서로 배타적이지 않다 — 매출액·총자산 조건에 동시에 걸린
-                회사가 양쪽에 들어간다. 백엔드에 OR 필터가 없어 정확한 합집합
-                건수를 낼 수 없으므로, 숫자를 나란히 보여줄 때만 문구로 명시해
-                "합이 안 맞는다"는 오해를 막는다(2026-07-28 디자인 리뷰). */}
-            {tab === 'ALL' &&
-              activeParams.excluded_by_revenue === false &&
-              activeParams.excluded_by_assets === false &&
-              !!excludedRevenueCount &&
-              !!excludedAssetsCount && <> (두 조건에 모두 걸린 회사는 두 건수에 중복 계상됩니다)</>}
           </Text>
-          <Table.ScrollContainer minWidth={800}>
-            <Table striped highlightOnHover withTableBorder>
-              <Table.Thead>
-                <Table.Tr>
-                  {/* §4-11 선택 열 — 헤더 체크박스는 현재 페이지 행만 전체선택/해제한다.
-                      가로 스크롤 중에도 왼쪽에 고정되도록 result-select-header가 sticky를 건다.
-                      뷰어 전용 빌드는 다운로드가 없어 선택 자체가 무의미하므로 열을 통째로 뺀다. */}
-                  {!viewerOnly && (
-                    <Table.Th w={40} className="result-select-header">
-                      <Checkbox
-                        size="sm"
-                        aria-label="현재 페이지 전체 선택"
-                        checked={allPageSelected}
-                        indeterminate={selectedOnPage > 0 && !allPageSelected}
-                        disabled={pageRows.length === 0}
-                        onChange={(event) => togglePageSelected(event.currentTarget.checked)}
-                      />
-                    </Table.Th>
-                  )}
-                  {visibleColumns.map((col) => {
-                    const key = sortKeyOf(col)
-                    const sortIndex = key === null ? -1 : sorts.findIndex((s) => s.key === key)
-                    const active = sortIndex >= 0
-                    const dir = active ? sorts[sortIndex].dir : null
-                    return (
-                      <Table.Th key={col.key}>
-                        {key === null ? (
-                          col.label
-                        ) : (
-                          <UnstyledButton
-                            onClick={(event) => handleSort(col, event.shiftKey)}
-                            style={{ fontWeight: 'inherit', fontSize: 'inherit' }}
-                            aria-label={`${col.label} 기준 정렬 (클릭 시 이 컬럼 단독 정렬로 초기화, Shift+클릭 시 보조 정렬 기준으로 추가)`}
-                          >
-                            <Group component="span" gap={4} wrap="nowrap" display="inline-flex">
-                              <span>{col.label}</span>
-                              <Text component="span" c={active ? undefined : 'dimmed'}>
-                                {active ? (dir === 'asc' ? '▲' : '▼') : '↕'}
-                              </Text>
-                              {/* 정렬 우선순위(1, 2, 3...) — 다중 정렬일 때만 뱃지로 표시해
-                                  몇 번째 기준인지 알 수 있게 한다. */}
-                              {active && sorts.length > 1 && (
-                                <Badge size="xs" circle variant="filled" color="blue">
-                                  {sortIndex + 1}
-                                </Badge>
-                              )}
-                            </Group>
-                          </UnstyledButton>
-                        )}
-                      </Table.Th>
-                    )
-                  })}
-                </Table.Tr>
-              </Table.Thead>
-              <Table.Tbody>
-                {data.items.map((row) => (
-                  <Table.Tr
-                    key={row.id}
-                    className={selectedIds.has(row.id) ? 'result-row-selected' : undefined}
-                    style={{ cursor: 'pointer' }}
-                    onClick={() => setSelected(row)}
-                  >
-                    {/* 체크박스 클릭이 행 클릭(상세 Drawer 열기)으로 번지지 않게 막는다. */}
+          {/* 금액 범위 필터의 NULL 통과 규칙(§4-13-B)은 "범위를 걸었는데 왜 빈 값이
+              보이지"라는 오해를 부르므로, 범위가 실제로 걸려 있을 때만 한 줄로 알린다. */}
+          {amountFilterActive && (
+            <Text size="xs" c="dimmed">
+              매출액·총자산 범위를 걸어도 <b>그 값을 얻지 못한 회사(파싱 실패·감사보고서 없음
+              등)는 목록에 계속 표시됩니다</b> — 검수해야 할 회사가 범위 입력만으로 조용히
+              사라지지 않게 한 것입니다.
+            </Text>
+          )}
+          <Box pos="relative">
+            <LoadingOverlay visible={loading} zIndex={100} overlayProps={{ blur: 1 }} />
+              <Table.ScrollContainer minWidth={800}>
+              <Table striped highlightOnHover withTableBorder>
+                <Table.Thead>
+                  <Table.Tr>
+                    {/* §4-11 선택 열 — 헤더 체크박스는 현재 페이지 행만 전체선택/해제한다.
+                        가로 스크롤 중에도 왼쪽에 고정되도록 result-select-header가 sticky를 건다.
+                        뷰어 전용 빌드는 다운로드가 없어 선택 자체가 무의미하므로 열을 통째로 뺀다. */}
                     {!viewerOnly && (
-                      <Table.Td className="result-select-cell" onClick={(event) => event.stopPropagation()}>
+                      <Table.Th w={40} className="result-select-header">
                         <Checkbox
                           size="sm"
-                          aria-label={`${row.corp_name ?? `결과 #${row.id}`} 선택`}
-                          checked={selectedIds.has(row.id)}
-                          onChange={(event) =>
-                            toggleRowSelected(row.id, event.currentTarget.checked)
-                          }
+                          aria-label="현재 페이지 전체 선택"
+                          checked={allPageSelected}
+                          indeterminate={selectedOnPage > 0 && !allPageSelected}
+                          disabled={pageRows.length === 0}
+                          onChange={(event) => togglePageSelected(event.currentTarget.checked)}
                         />
-                      </Table.Td>
+                      </Table.Th>
                     )}
-                    {visibleColumns.map((col) => (
-                      <Table.Td key={col.key}>
-                        {col.key === 'auditor_changed' ? (
-                          <AuditorChangedCell
-                            value={row.auditor_changed}
-                            label={formatCell(col, row)}
-                          />
-                        ) : col.key === 'parse_note' ? (
-                          <ParseNoteCell text={formatCell(col, row)} />
-                        ) : (
-                          formatCell(col, row)
-                        )}
-                      </Table.Td>
-                    ))}
+                    {visibleColumns.map((col) => {
+                      const key = sortKeyOf(col)
+                      const sortIndex = key === null ? -1 : sorts.findIndex((s) => s.key === key)
+                      const active = sortIndex >= 0
+                      const dir = active ? sorts[sortIndex].dir : null
+                      return (
+                        <Table.Th key={col.key}>
+                          {/* 정렬(라벨 클릭)과 필터(깔때기 아이콘)는 **별개 컨트롤**이다 —
+                              아이콘은 정렬 버튼 바깥에 두어 필터를 열려다 정렬이 바뀌는 일이
+                              없게 한다(§4-13-C). */}
+                          {/* 필터 아이콘이 옆에 붙으면서 `파싱상태`/`감사인변동` 같은
+                              3~4글자 헤더가 한 글자씩 세로로 접혔다 — 라벨에 nowrap을
+                              걸어 컬럼 폭이 라벨을 온전히 담게 한다. */}
+                          <Group gap={2} wrap="nowrap">
+                            {key === null ? (
+                              <span style={{ whiteSpace: 'nowrap' }}>{col.label}</span>
+                            ) : (
+                              <UnstyledButton
+                                onClick={(event) => handleSort(col, event.shiftKey)}
+                                style={{ fontWeight: 'inherit', fontSize: 'inherit' }}
+                                aria-label={`${col.label} 기준 정렬 (클릭 시 이 컬럼 단독 정렬로 초기화, Shift+클릭 시 보조 정렬 기준으로 추가)`}
+                              >
+                                <Group component="span" gap={4} wrap="nowrap" display="inline-flex">
+                                  <span style={{ whiteSpace: 'nowrap' }}>{col.label}</span>
+                                  <Text component="span" c={active ? undefined : 'dimmed'}>
+                                    {active ? (dir === 'asc' ? '▲' : '▼') : '↕'}
+                                  </Text>
+                                  {/* 정렬 우선순위(1, 2, 3...) — 다중 정렬일 때만 뱃지로 표시해
+                                      몇 번째 기준인지 알 수 있게 한다. */}
+                                  {active && sorts.length > 1 && (
+                                    <Badge size="xs" circle variant="filled" color="blue">
+                                      {sortIndex + 1}
+                                    </Badge>
+                                  )}
+                                </Group>
+                              </UnstyledButton>
+                            )}
+                            <ResultColumnFilterControl
+                              columnKey={col.key}
+                              filters={filters}
+                              onChange={updateFilters}
+                            />
+                          </Group>
+                        </Table.Th>
+                      )
+                    })}
                   </Table.Tr>
-                ))}
-              </Table.Tbody>
-            </Table>
-          </Table.ScrollContainer>
+                </Table.Thead>
+                <Table.Tbody>
+                  {data.items.map((row) => (
+                    <Table.Tr
+                      key={row.id}
+                      className={selectedIds.has(row.id) ? 'result-row-selected' : undefined}
+                      style={{ cursor: 'pointer' }}
+                      onClick={() => setSelected(row)}
+                    >
+                      {/* 체크박스 클릭이 행 클릭(상세 Drawer 열기)으로 번지지 않게 막는다. */}
+                      {!viewerOnly && (
+                        <Table.Td className="result-select-cell" onClick={(event) => event.stopPropagation()}>
+                          <Checkbox
+                            size="sm"
+                            aria-label={`${row.corp_name ?? `결과 #${row.id}`} 선택`}
+                            checked={selectedIds.has(row.id)}
+                            onChange={(event) =>
+                              toggleRowSelected(row.id, event.currentTarget.checked)
+                            }
+                          />
+                        </Table.Td>
+                      )}
+                      {visibleColumns.map((col) => (
+                        <Table.Td key={col.key}>
+                          {col.key === 'auditor_changed' ? (
+                            <AuditorChangedCell
+                              value={row.auditor_changed}
+                              label={formatCell(col, row)}
+                            />
+                          ) : col.key === 'parse_note' ? (
+                            <ParseNoteCell text={formatCell(col, row)} />
+                          ) : (
+                            formatCell(col, row)
+                          )}
+                        </Table.Td>
+                      ))}
+                    </Table.Tr>
+                  ))}
+                </Table.Tbody>
+              </Table>
+              </Table.ScrollContainer>
+          </Box>
 
-          {data.items.length === 0 && <Text c="dimmed">표시할 결과가 없습니다.</Text>}
+          {data.items.length === 0 && !loading && (
+            <Text c="dimmed">
+              표시할 결과가 없습니다.
+              {activeFilterLabels.length > 0 && ' 컬럼 헤더의 필터 조건을 넓혀 보세요.'}
+            </Text>
+          )}
 
           <Group justify="center">
             <Pagination value={page} onChange={setPage} total={totalPages} />

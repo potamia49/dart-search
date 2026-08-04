@@ -42,8 +42,12 @@ export type HistoryYears = 2 | 4 | 6 | 10
 export interface JobCreateRequest {
   name: string | null
   region: RegionCondition
-  revenue: RevenueCondition
-  total_assets: TotalAssetsCondition
+  /** §4-13-A(2026-08-05)로 **화면에서 입력을 받지 않는다** — SearchPage는 이 두 키를
+   * 아예 보내지 않고, 백엔드 `JobCreateRequest`의 `default_factory`가 무제한 조건
+   * (min/max 모두 null)을 채운다. 필드 자체는 기존 Job 조회(`JobResponse.cond_*`)와
+   * 하위호환을 위해 남겨 두되 optional이다. */
+  revenue?: RevenueCondition
+  total_assets?: TotalAssetsCondition
   industry: string[]
   // M6 재설계 이후 Phase 1(A2~A4)은 이 값을 쓰지 않는다 — 백엔드
   // JobCreateRequest.period도 optional로 정정됐으므로 아예 보내지 않는다

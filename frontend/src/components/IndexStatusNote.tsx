@@ -90,8 +90,8 @@ function FinancialStatLine({ status }: { status: FscFinancialStatus }) {
       <Alert color="yellow" variant="light">
         매출액·총자산 참고값(금융위 요약재무) 인덱스가 비어 있습니다. 검색과 결과
         정확도에는 영향이 없지만(최종 판정은 항상 DART 원문 기준입니다), 후보
-        목록에 참고용 매출액·총자산이 표시되지 않고 재무정보 수집 순서도 무작위가
-        됩니다.
+        목록에 참고용 매출액·총자산이 표시되지 않습니다 — 재무정보 수집 범위와
+        순서에는 영향이 없습니다.
       </Alert>
     )
   }

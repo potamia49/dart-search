@@ -42,7 +42,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import Select, func, or_, select
+from sqlalchemy import Select, and_, false, func, or_, select
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
@@ -120,6 +120,136 @@ SORTABLE_COLUMNS: tuple[str, ...] = (
 _SEARCH_COLUMNS = ("corp_name", "address", "ceo_name", "induty_name", "auditor_name")
 
 
+# ---------------------------------------------------------------------------
+# 결과화면 컬럼 필터(§4-13-B/C, 2026-08-05)용 다중 선택 파라미터
+#
+# 기존 `parse_status`(단일값) + `has_disclosure`(단일값) 조합으로는 화면의 체크박스
+# 4개를 **자유 조합**할 수 없다("검수 필요"만 켜고 "감사보고서 없음"은 끄기 등) —
+# 둘 다 `parse_status=FAILED`이고 `rcept_no` 유무로만 갈리기 때문이다. 그래서
+# 다중 정렬(`sort=field:dir,...`)과 같은 **콤마 구분 목록** 방식의 파생 enum
+# 파라미터를 새로 둔다. 기존 두 파라미터는 다른 소비자를 위해 그대로 살아 있고,
+# 함께 주면 AND로 결합된다(서로 모순되는 조합이면 0건이 나올 뿐이다).
+# ---------------------------------------------------------------------------
+
+# 파싱상태 4분류 — 화면 체크박스("파싱 성공/부분 성공/검수 필요/감사보고서 없음")와
+# 1:1이다. **네 값이 그 Job의 모든 행을 빠짐없이·겹침없이 나눈다**(상호배타 + 전수
+# 포괄): 넷을 다 켜면 필터를 안 건 것과 같은 집합이 나와야 한다는 뜻이다. 그래서
+# `FAILED_REVIEW`를 "`parse_status='FAILED'`"가 아니라 "원문은 있는데 OK/PARTIAL이
+# 아닌 것"이라는 **catch-all**로 정의했다 — 그렇게 하지 않으면 Phase 2 진행 중
+# (rcept_no는 찾았고 아직 파싱 전이라 `parse_status IS NULL`)인 행이 네 값 어디에도
+# 속하지 않아 **조용히 사라진다**(이 저장소가 가장 경계하는 실패 양식).
+PARSE_STATUS_EXT_VALUES: tuple[str, ...] = (
+    "OK",             # 원문 있음 + parse_status=OK
+    "PARTIAL",        # 원문 있음 + parse_status=PARTIAL
+    "FAILED_REVIEW",  # 원문 있음 + 그 외(FAILED/미파싱) = 검수 필요
+    "NO_DISCLOSURE",  # rcept_no IS NULL = 열어볼 원문 자체가 없음(검수 대상 아님)
+)
+
+# 감사인 변동 tri-state(`results.auditor_changed` 1/0/NULL)의 다중 선택판 —
+# 화면 체크박스 3종(변동 있음/변동 없음/판정 불가)과 1:1이다. 기존 불리언
+# `auditor_changed`는 "1만"/"0만"/"전체"(미지정) 3가지만 표현할 수 있어
+# "판정 불가만" · "변동 있음 + 판정 불가" 같은 조합이 안 된다.
+AUDITOR_CHANGED_EXT_VALUES: tuple[str, ...] = ("CHANGED", "UNCHANGED", "UNKNOWN")
+
+# SQLite INTEGER(부호 있는 64비트) 범위 — 금액 필터 경계값을 그대로 바인딩하면
+# 범위 밖 정수에서 `OverflowError`로 500이 되므로 400으로 막는다(`_parse_export_ids`와
+# 같은 이유). 매출액은 음수일 수 있어(실측 -5,409백만원) 하한을 0으로 두지 않는다.
+_SQLITE_INT_MIN = -(2**63)
+_SQLITE_INT_MAX = 2**63 - 1
+
+
+def _parse_enum_list(
+    raw: str | None, allowed: tuple[str, ...], param_name: str
+) -> list[str] | None:
+    """`?param=A,B` 콤마 구분 목록을 정규화한다(대소문자 무시, 중복 제거, 순서 보존).
+
+    - 파라미터 자체가 없으면 `None` = **필터하지 않음**(기존 동작 그대로).
+    - 값이 비어 있으면(`?param=` 또는 쉼표뿐) 빈 리스트 = **아무 것도 선택하지 않음**
+      → 호출부가 0건으로 처리한다(체크박스를 전부 끈 상태의 자연스러운 결과다).
+    - 목록에 없는 값은 **400**이다. 조용히 버리면 "체크했는데 목록에 없다"가 되어
+      더 위험하다(`ids` 파싱과 같은 방침).
+    """
+    if raw is None:
+        return None
+    values: list[str] = []
+    for token in (t.strip().upper() for t in raw.split(",")):
+        if not token:
+            continue
+        if token not in allowed:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{param_name}에 알 수 없는 값이 있습니다: {token!r} "
+                    f"(가능한 값: {', '.join(allowed)})"
+                ),
+            )
+        if token not in values:
+            values.append(token)
+    return values
+
+
+def _parse_status_ext_condition(value: str):
+    """파싱상태 4분류 중 한 값에 해당하는 SQL 조건 — 위 상수 주석의 정의 그대로."""
+    if value == "NO_DISCLOSURE":
+        return Result.rcept_no.is_(None)
+    if value == "OK":
+        return and_(Result.rcept_no.is_not(None), Result.parse_status == ParseStatus.OK)
+    if value == "PARTIAL":
+        return and_(
+            Result.rcept_no.is_not(None), Result.parse_status == ParseStatus.PARTIAL
+        )
+    # FAILED_REVIEW — 원문은 있는데 OK/PARTIAL이 아닌 전부(catch-all).
+    # `NOT IN (...)`은 NULL에 대해 NULL(=거짓 취급)이라 미파싱 행을 놓치므로
+    # `IS NULL` 분기를 명시적으로 함께 둔다.
+    return and_(
+        Result.rcept_no.is_not(None),
+        or_(
+            Result.parse_status.is_(None),
+            Result.parse_status.not_in((ParseStatus.OK, ParseStatus.PARTIAL)),
+        ),
+    )
+
+
+def _auditor_changed_ext_condition(value: str):
+    """감사인 변동 3분류 중 한 값에 해당하는 SQL 조건(1/0/NULL 그대로 매핑)."""
+    if value == "CHANGED":
+        return Result.auditor_changed == 1
+    if value == "UNCHANGED":
+        return Result.auditor_changed == 0
+    # UNKNOWN — 판정 불가. 이 컬럼 도입 이전 Job은 NULL이고, 1/0이 아닌 값이
+    # 들어갈 일은 없지만 "CHANGED/UNCHANGED가 아닌 나머지"로 두어 전수 포괄을 지킨다.
+    return or_(
+        Result.auditor_changed.is_(None), Result.auditor_changed.not_in((0, 1))
+    )
+
+
+def _check_amount_bound(value: int | None, param_name: str) -> None:
+    if value is not None and not _SQLITE_INT_MIN <= value <= _SQLITE_INT_MAX:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{param_name}이(가) 사용할 수 있는 금액 범위를 벗어났습니다: {value!r}",
+        )
+
+
+def _apply_amount_range(stmt: Select, column, min_value: int | None, max_value: int | None) -> Select:
+    """실측 금액 컬럼(`revenue_cur`/`total_assets_cur`)에 범위 조건을 건다(§4-13-B).
+
+    **값이 NULL인 행은 경계가 걸려 있어도 그대로 통과시킨다**(2026-08-05 사용자 확정,
+    §4-13-E-1의 문서 원안 "엑셀처럼 빈 셀은 숨김"을 뒤집은 결정) — 이 화면은 검수용이라
+    "매출액을 못 얻은 회사"(파싱 실패/부분 성공) 자체가 봐야 할 대상이고, 범위를 잡는
+    순간 그 회사들이 조용히 사라지면 검수 경로가 끊기기 때문이다. 즉 조건은
+    `컬럼 IS NULL OR (컬럼 >= min AND 컬럼 <= max)`이다.
+    """
+    bounds = []
+    if min_value is not None:
+        bounds.append(column >= min_value)
+    if max_value is not None:
+        bounds.append(column <= max_value)
+    if not bounds:
+        return stmt
+    return stmt.where(or_(column.is_(None), and_(*bounds)))
+
+
 def _build_results_query(
     job_id: int,
     parse_status: str | None = None,
@@ -129,8 +259,20 @@ def _build_results_query(
     has_disclosure: bool | None = None,
     q: str | None = None,
     auditor_changed: bool | None = None,
+    *,
+    parse_status_ext: str | None = None,
+    auditor_changed_ext: str | None = None,
+    revenue_min: int | None = None,
+    revenue_max: int | None = None,
+    assets_min: int | None = None,
+    assets_max: int | None = None,
 ) -> Select:
-    """`results` 조회 쿼리 빌더 — `/results`(페이징)와 `/export`(전체)가 공유한다."""
+    """`results` 조회 쿼리 빌더 — `/results`(페이징)와 `/export`(전체)가 공유한다.
+
+    2026-08-05(§4-13-B)에 결과화면 컬럼 필터용 파라미터 6개가 추가됐다
+    (`parse_status_ext`/`auditor_changed_ext` 다중 선택 + 금액 범위 4개).
+    기존 파라미터는 하나도 바뀌지 않았고, 새 것과 함께 주면 전부 **AND**로 묶인다.
+    """
     stmt = select(Result).where(Result.job_id == job_id)
     if q:
         keyword = f"%{q.strip()}%"
@@ -163,6 +305,35 @@ def _build_results_query(
         # 속하지 않으므로 두 경우 모두에서 빠진다. 값을 주지 않으면 필터하지
         # 않는다(excluded_by_* 와 동일한 tri-state 패턴).
         stmt = stmt.where(Result.auditor_changed == (1 if auditor_changed else 0))
+
+    # --- 결과화면 컬럼 필터(§4-13-B, 2026-08-05) ---------------------------
+    # 선택 목록이 비면(빈 문자열로 넘어온 경우) "아무 것도 체크하지 않음"이므로
+    # 0건이다 — 필터를 안 건 것(파라미터 미지정)과 명확히 구분한다.
+    status_values = _parse_enum_list(
+        parse_status_ext, PARSE_STATUS_EXT_VALUES, "parse_status_ext"
+    )
+    if status_values is not None:
+        stmt = stmt.where(
+            or_(*(_parse_status_ext_condition(v) for v in status_values))
+            if status_values
+            else false()
+        )
+    auditor_values = _parse_enum_list(
+        auditor_changed_ext, AUDITOR_CHANGED_EXT_VALUES, "auditor_changed_ext"
+    )
+    if auditor_values is not None:
+        stmt = stmt.where(
+            or_(*(_auditor_changed_ext_condition(v) for v in auditor_values))
+            if auditor_values
+            else false()
+        )
+
+    _check_amount_bound(revenue_min, "revenue_min")
+    _check_amount_bound(revenue_max, "revenue_max")
+    _check_amount_bound(assets_min, "assets_min")
+    _check_amount_bound(assets_max, "assets_max")
+    stmt = _apply_amount_range(stmt, Result.revenue_cur, revenue_min, revenue_max)
+    stmt = _apply_amount_range(stmt, Result.total_assets_cur, assets_min, assets_max)
     return stmt
 
 
@@ -339,6 +510,12 @@ async def list_results(
     has_disclosure: bool | None = None,
     q: str | None = None,
     auditor_changed: bool | None = None,
+    parse_status_ext: str | None = None,
+    auditor_changed_ext: str | None = None,
+    revenue_min: int | None = None,
+    revenue_max: int | None = None,
+    assets_min: int | None = None,
+    assets_max: int | None = None,
     sort: str | None = None,
     sort_by: str | None = None,
     sort_dir: str = "asc",
@@ -359,6 +536,30 @@ async def list_results(
     - `q`: 회사명/주소/대표자/업종/감사인명 부분일치 검색 (2026-07-20 추가).
     - `auditor_changed`: true/false — 연도별 감사인이 바뀐 건만/바뀌지 않은 건만
       (2026-07-26 추가). 판정 불가(null)인 건은 두 경우 모두에서 빠진다.
+
+    **결과화면 컬럼 필터(§4-13-B, 2026-08-05 추가)** — 화면의 탭을 대체하는
+    체크박스/범위 입력이 그대로 매핑되는 파라미터 6개다. 전부 선택이고, 기존
+    파라미터와 함께 주면 AND로 결합된다:
+
+    - `parse_status_ext`: 파싱상태 4분류를 **콤마 구분 목록**으로(예:
+      `?parse_status_ext=OK,PARTIAL`). 값은 `OK`/`PARTIAL`/`FAILED_REVIEW`/
+      `NO_DISCLOSURE`이며 대소문자를 가리지 않는다. 네 값은 그 Job의 행을
+      겹침없이·빠짐없이 나누므로 **넷을 다 주면 파라미터를 안 준 것과 같은 집합**
+      이다. 정의는 `PARSE_STATUS_EXT_VALUES` 주석 참고 — 특히 `FAILED_REVIEW`는
+      "원문(rcept_no)은 있는데 OK/PARTIAL이 아닌 전부"(미파싱 포함)라 화면의
+      "파싱 실패(검수 필요)" 탭보다 넓을 수 있다. 목록에 없는 값은 400,
+      빈 값(`?parse_status_ext=`)은 "아무 것도 선택 안 함" = **0건**이다.
+    - `auditor_changed_ext`: 감사인 변동 3분류 콤마 구분 목록 —
+      `CHANGED`(=1) / `UNCHANGED`(=0) / `UNKNOWN`(=NULL, 판정 불가).
+      기존 불리언 `auditor_changed`로는 "판정 불가만" 같은 조합을 표현할 수 없어
+      추가했다(기존 파라미터는 그대로 살아 있다).
+    - `revenue_min`/`revenue_max`: **실측 파싱값** `revenue_cur`(원 단위 정수)의
+      범위. Job 생성 시점 조건(`excluded_by_revenue`)과 전혀 다른 축이다.
+    - `assets_min`/`assets_max`: 같은 방식의 `total_assets_cur` 범위.
+    - **금액 범위 4개는 값이 NULL인 행을 걸러내지 않는다** — 매출액/총자산을 못
+      얻은 회사(파싱 실패·부분 성공)는 범위를 걸어도 계속 보인다(2026-08-05 사용자
+      확정, `_apply_amount_range()` 주석 참고). 조건은 `IS NULL OR BETWEEN`이다.
+
     - `sort`: 다중 컬럼 정렬 — 콤마 구분 `field:dir` 목록(예:
       `corp_name:asc,induty_name:desc`). 앞쪽이 1순위, 뒤쪽이 보조 정렬이다.
       화이트리스트(`SORTABLE_COLUMNS`) 밖 컬럼/형식 오류는 무시한다.
@@ -393,6 +594,12 @@ async def list_results(
         has_disclosure,
         q,
         auditor_changed,
+        parse_status_ext=parse_status_ext,
+        auditor_changed_ext=auditor_changed_ext,
+        revenue_min=revenue_min,
+        revenue_max=revenue_max,
+        assets_min=assets_min,
+        assets_max=assets_max,
     )
 
     sort_specs = _resolve_sort_specs(sort, sort_by, sort_dir)
@@ -531,6 +738,12 @@ async def export_job_results(
     has_disclosure: bool | None = None,
     q: str | None = None,
     auditor_changed: bool | None = None,
+    parse_status_ext: str | None = None,
+    auditor_changed_ext: str | None = None,
+    revenue_min: int | None = None,
+    revenue_max: int | None = None,
+    assets_min: int | None = None,
+    assets_max: int | None = None,
     sort: str | None = None,
     sort_by: str | None = None,
     sort_dir: str = "asc",
@@ -539,9 +752,11 @@ async def export_job_results(
     """결과 파일 다운로드 (xlsx/csv, 페이징 없이 필터를 통과한 전체 결과).
 
     `parse_status`/`excluded_by_revenue`/`excluded_by_assets`/
-    `excluded_by_stale_disclosure`/`has_disclosure`/`q`/`auditor_changed`/`sort`/
-    `sort_by`/`sort_dir`는 `/results`와 동일한 의미다(다중 정렬 `sort` 포함) —
-    화면에서 걸러 놓고 정렬한 그대로를 내려받게 된다. `format`이 xlsx/csv가 아니면 400.
+    `excluded_by_stale_disclosure`/`has_disclosure`/`q`/`auditor_changed`/
+    `parse_status_ext`/`auditor_changed_ext`/`revenue_min`/`revenue_max`/
+    `assets_min`/`assets_max`/`sort`/`sort_by`/`sort_dir`는 `/results`와 동일한
+    의미다(다중 정렬 `sort`와 §4-13-B 컬럼 필터 6개 포함) — 화면에서 걸러 놓고
+    정렬한 그대로를 내려받게 된다. `format`이 xlsx/csv가 아니면 400.
 
     **다중 선택 다운로드(§4-11, 2026-07-28)** — 위 "필터 전체" 내보내기와 별개로,
     화면에서 체크박스로 고른 회사만 받는 두 파라미터를 지원한다:
@@ -608,6 +823,12 @@ async def export_job_results(
             has_disclosure,
             q,
             auditor_changed,
+            parse_status_ext=parse_status_ext,
+            auditor_changed_ext=auditor_changed_ext,
+            revenue_min=revenue_min,
+            revenue_max=revenue_max,
+            assets_min=assets_min,
+            assets_max=assets_max,
         )
         sort_specs = _resolve_sort_specs(sort, sort_by, sort_dir)
         rows = db.execute(_apply_sort(stmt, sort_specs)).scalars().all()

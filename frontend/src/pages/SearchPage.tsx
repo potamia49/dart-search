@@ -4,7 +4,6 @@ import {
   Alert,
   Button,
   Group,
-  NumberInput,
   Paper,
   SimpleGrid,
   Stack,
@@ -33,9 +32,16 @@ import type {
   RegionMeta,
 } from '../types'
 
-const EOK = 100_000_000 // 1억원 = 100,000,000원
-const MAX_EOK = 1_000_000 // 최대 미입력 시 기본 상한: 1,000,000억원(=100조원)
-
+/**
+ * 검색 조건 = **지역 + 업종**뿐이다(§4-13-A, 2026-08-05).
+ *
+ * 매출액/총자산 입력은 여기서 제거했다 — 비상장 외감법인은 감사보고서 원문을 열기
+ * 전엔 그 값을 알 수 없어(§4-3) Job 생성 시점 조건으로는 후보 범위를 좁히지 못하고,
+ * 실제로는 (a) Phase 2 처리 순서와 (b) STEP 7 이력 수집 대상만 정하고 있었다.
+ * 지금은 결과 화면의 컬럼 필터에서 **실측 파싱값**(`revenue_cur`/`total_assets_cur`)
+ * 기준으로 거른다(§4-13-C). 백엔드 `JobCreateRequest.revenue`/`total_assets`는
+ * `default_factory`라 이 필드를 아예 안 보내면 무제한 조건으로 저장된다.
+ */
 export default function SearchPage() {
   const navigate = useNavigate()
 
@@ -48,10 +54,6 @@ export default function SearchPage() {
   const [name, setName] = useState('')
   const [sido, setSido] = useState<string[]>([])
   const [sigunguBySido, setSigunguBySido] = useState<Record<string, string[]>>({})
-  const [minRevenueEok, setMinRevenueEok] = useState<number | ''>('')
-  const [maxRevenueEok, setMaxRevenueEok] = useState<number | ''>('')
-  const [minAssetsEok, setMinAssetsEok] = useState<number | ''>('')
-  const [maxAssetsEok, setMaxAssetsEok] = useState<number | ''>('')
   const [industryCodes, setIndustryCodes] = useState<string[]>([])
 
   const [submitting, setSubmitting] = useState(false)
@@ -127,17 +129,11 @@ export default function SearchPage() {
   async function handleSubmit() {
     setSubmitting(true)
     try {
+      // revenue/total_assets는 **키 자체를 보내지 않는다**(§4-13-A) — 백엔드가
+      // default_factory로 무제한 조건을 채우므로 파이프라인은 그대로 동작한다.
       const job = await createJob({
         name: name.trim() ? name.trim() : null,
         region: { sido, sigungu_by_sido: sigunguBySido },
-        revenue: {
-          min_krw: minRevenueEok === '' ? 0 : Math.round(minRevenueEok * EOK),
-          max_krw: maxRevenueEok === '' ? MAX_EOK * EOK : Math.round(maxRevenueEok * EOK),
-        },
-        total_assets: {
-          min_krw: minAssetsEok === '' ? 0 : Math.round(minAssetsEok * EOK),
-          max_krw: maxAssetsEok === '' ? MAX_EOK * EOK : Math.round(maxAssetsEok * EOK),
-        },
         industry: industryCodes,
         history_years: 4,
       })
@@ -154,9 +150,13 @@ export default function SearchPage() {
     <Stack maw={960} mx="auto">
       <Title order={2}>검색 조건</Title>
       <Text size="sm" c="dimmed">
-        1단계: 먼저 지역·매출액·총자산·업종 조건으로 후보 회사를 찾습니다.
+        1단계: 먼저 지역·업종 조건으로 후보 회사를 찾습니다.
         <br />
         2단계: 후보 목록을 확인한 뒤, DART 재무제표(다년치)를 수집합니다.
+        <br />
+        매출액·총자산은 감사보고서 원문을 열기 전에는 알 수 없어 검색 조건에서 받지 않습니다 —
+        수집이 끝난 뒤 <b>결과 화면의 매출액·총자산 컬럼 필터</b>에서 실제 파싱된 값으로
+        범위를 지정하세요.
       </Text>
       {metaError && (
         <Alert color="red" title="목록 로딩 실패">
@@ -212,50 +212,6 @@ export default function SearchPage() {
             </Text>
           )}
         </Paper>
-
-        <Paper withBorder p="md">
-          <Title order={4} mb="sm">
-            매출액 범위 (억원)
-          </Title>
-          <Group grow>
-            <NumberInput
-              label="최소"
-              placeholder="예: 60"
-              min={0}
-              value={minRevenueEok}
-              onChange={(v) => setMinRevenueEok(v === '' ? '' : Number(v))}
-            />
-            <NumberInput
-              label="최대"
-              placeholder="예: 150"
-              min={0}
-              value={maxRevenueEok}
-              onChange={(v) => setMaxRevenueEok(v === '' ? '' : Number(v))}
-            />
-          </Group>
-        </Paper>
-
-        <Paper withBorder p="md">
-          <Title order={4} mb="sm">
-            총자산 범위 (억원)
-          </Title>
-          <Group grow>
-            <NumberInput
-              label="최소"
-              placeholder="예: 30"
-              min={0}
-              value={minAssetsEok}
-              onChange={(v) => setMinAssetsEok(v === '' ? '' : Number(v))}
-            />
-            <NumberInput
-              label="최대"
-              placeholder="예: 300"
-              min={0}
-              value={maxAssetsEok}
-              onChange={(v) => setMaxAssetsEok(v === '' ? '' : Number(v))}
-            />
-          </Group>
-        </Paper>
       </SimpleGrid>
 
       {/* 예상 규모 안내. 후보 확정(1단계) 자체는 로컬 DB 쿼리뿐이라 규모와
@@ -266,7 +222,7 @@ export default function SearchPage() {
         <Alert color={preview.exceeds_daily_quota ? 'yellow' : 'blue'} variant="light">
           예상 후보 수: 약 {preview.candidate_count.toLocaleString()}개사
           {preview.exceeds_daily_quota
-            ? ` — 후보 확정(1단계)은 바로 끝나지만, 이어지는 재무정보 수집(2단계)은 DART 일일 호출 한도(하루 약 ${preview.daily_quota_assumed.toLocaleString()}개사 분량)를 넘어 약 ${preview.estimated_days}일에 걸쳐 나눠 진행됩니다. 한도에 걸리면 작업이 자동으로 멈췄다가 다음 날 이어서 진행되며, 결과 정확도에는 영향이 없습니다. 조건에 가까운 회사부터 먼저 처리하므로 첫날에 대상 대부분이 확보됩니다. 더 빨리 끝내려면 시군구나 업종으로 범위를 좁히세요.`
+            ? ` — 후보 확정(1단계)은 바로 끝나지만, 이어지는 재무정보 수집(2단계)은 DART 일일 호출 한도(하루 약 ${preview.daily_quota_assumed.toLocaleString()}개사 분량)를 넘어 약 ${preview.estimated_days}일에 걸쳐 나눠 진행됩니다. 한도에 걸리면 작업이 자동으로 멈췄다가 다음 날 이어서 진행되며, 결과 정확도에는 영향이 없습니다. 수집이 끝난 회사부터 결과 화면에 쌓이고, 매출액·총자산은 결과 화면에서 실제 파싱값 기준으로 직접 좁혀 볼 수 있습니다. 더 빨리 끝내려면 시군구나 업종으로 범위를 좁히세요.`
             : ' — 재무정보 수집까지 하루 안에 끝낼 수 있는 규모입니다.'}
         </Alert>
       )}

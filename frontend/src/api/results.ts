@@ -28,8 +28,33 @@ export interface ListResultsParams {
   has_disclosure?: boolean
   /** 연도별 감사인이 바뀐 건만(true)/계속 같은 건만(false) (2026-07-26).
    * 판정 불가(auditor_changed IS NULL)인 건은 양쪽 모두에서 빠진다 —
-   * excluded_by_* 와 동일한 tri-state 패턴이다. */
+   * excluded_by_* 와 동일한 tri-state 패턴이다.
+   *
+   * 결과 화면은 이 단일값 대신 아래 `auditor_changed_ext`(다중 선택)를 쓴다 —
+   * 이 파라미터로는 "판정 불가만"·"변동 있음 + 판정 불가" 조합을 표현할 수 없다. */
   auditor_changed?: boolean
+
+  // --- §4-13-B 결과화면 컬럼 필터(2026-08-05) ---------------------------------
+  // 아래 6개는 기존 파라미터와 **AND**로 결합된다. 값 목록/의미는 백엔드
+  // `app/api/results.py`의 `PARSE_STATUS_EXT_VALUES`/`_apply_amount_range` 참고.
+
+  /** 파싱상태 4분류 다중 선택 — 콤마 구분(`OK`/`PARTIAL`/`FAILED_REVIEW`/`NO_DISCLOSURE`).
+   * 네 값은 상호배타 + 전수 포괄이라 **4개를 다 주는 것은 파라미터 생략과 같다**
+   * (그래서 프론트는 전부 선택이면 아예 보내지 않는다). 빈 문자열은 "아무 것도
+   * 선택 안 함" = 0건이고, 목록에 없는 값은 400이다. */
+  parse_status_ext?: string
+  /** 감사인 변동 3분류 다중 선택 — 콤마 구분(`CHANGED`/`UNCHANGED`/`UNKNOWN`).
+   * 규칙은 `parse_status_ext`와 동일하다. */
+  auditor_changed_ext?: string
+  /** **실측 파싱값** `revenue_cur`(원 단위 정수)의 하한/상한. 화면은 억원으로 입력받아
+   * 환산해 보낸다. **값이 NULL인 회사는 범위를 걸어도 그대로 통과한다**(검수 대상이
+   * 사라지지 않도록 한 백엔드 계약, §4-13-B). SQLite INTEGER 범위 밖이면 400. */
+  revenue_min?: number
+  revenue_max?: number
+  /** 같은 방식의 `total_assets_cur`(실측 총자산) 범위. */
+  assets_min?: number
+  assets_max?: number
+
   /** 회사명/주소/대표자/업종/감사인명 부분일치 검색. */
   q?: string
   /** 다중 컬럼 정렬 — 콤마 구분 `field:dir` 목록(예: `corp_name:asc,induty_name:desc`).
