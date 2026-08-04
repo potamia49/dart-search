@@ -468,6 +468,76 @@ async def test_run_financial_parsing_populates_result_from_real_fixture(db_sessi
 
 
 @pytest.mark.asyncio
+async def test_run_financial_parsing_populates_detail_account_columns(db_session_factory, tmp_path):
+    """세부계정 5항목(2026-08-05)이 파서 → results 컬럼까지 배선돼 있는지 확인한다.
+
+    best-effort라 결측이어도 parse_status에는 영향이 없다 — 배선이 빠지면 파서는
+    값을 뽑는데 DB에는 **에러 없이 조용히** NULL만 남는다. 한미프렉시블
+    20260424000057은 다섯 항목 중 넷이 실측으로 채워지는 문서다(test_parsers.py의
+    출처 고정 테스트와 같은 원문).
+    """
+    settings = Settings(document_cache_dir=str(tmp_path / "documents"))
+    job_id = _make_job(db_session_factory)
+    with db_session_factory() as db:
+        db.add(Result(job_id=job_id, corp_code="A1", rcept_no="20260424000057"))
+        db.commit()
+
+    _copy_fixture_to_cache(tmp_path / "documents", "20260424000057", "20260424000057")
+
+    await pipeline._run_financial_parsing(db_session_factory, settings, job_id)
+
+    with db_session_factory() as db:
+        result = db.execute(select(Result).where(Result.job_id == job_id)).scalar_one()
+
+    # 재무상태표 유래(매출채권은 대손충당금 차감 후 순액)
+    assert result.trade_receivables_cur == 9_871_514_894
+    # 손익계산서 유래(현금흐름표의 동명 조정 행 139,348,178이 아니다)
+    assert result.interest_expense_cur == 946_271_041
+    # 현금흐름표 유래(손익계산서 판관비 몫 196,267,673이 아니다)
+    assert result.depreciation_cur == 1_210_860_947
+    assert result.cash_and_equivalents_cur is not None
+    # 전기 열도 같은 경로로 채워진다.
+    assert result.trade_receivables_prv is not None
+
+
+@pytest.mark.asyncio
+async def test_collect_history_writes_detail_accounts_to_snapshot(db_session_factory, tmp_path):
+    """세부계정 5항목이 `financial_snapshots`(연도별 이력)에도 함께 적재된다.
+
+    `results`만 배선하고 스냅샷을 빠뜨리면 선택 다운로드 ② 시트(재무이력)에서만
+    조용히 빈다 — 두 적재 지점을 각각 잠근다.
+    """
+    values = {"trade_receivables": 111.0, "depreciation": 222.0, "interest_expense": 333.0}
+    with db_session_factory() as db:
+        result = Result(job_id=None, corp_code="A1")
+        db.add(result)
+        db.commit()
+        result_id = result.id
+
+    pipeline._upsert_financial_snapshot(
+        db_session_factory,
+        result_id,
+        "20260424000057",
+        "2025",
+        values,
+        ParseStatus.OK,
+        None,
+        from_current_period=True,
+    )
+
+    with db_session_factory() as db:
+        snapshot = db.execute(
+            select(FinancialSnapshot).where(FinancialSnapshot.result_id == result_id)
+        ).scalar_one()
+    assert snapshot.trade_receivables == 111
+    assert snapshot.depreciation == 222
+    assert snapshot.interest_expense == 333
+    # 넘어오지 않은 필드는 NULL이 정상이다(best-effort).
+    assert snapshot.cash_and_equivalents is None
+    assert snapshot.amortization is None
+
+
+@pytest.mark.asyncio
 async def test_run_financial_parsing_skips_already_parsed_results(db_session_factory, tmp_path):
     """parse_status가 이미 있는 results는 원문이 없어도 다시 열지 않는다(resume)."""
     settings = Settings(document_cache_dir=str(tmp_path / "documents"))

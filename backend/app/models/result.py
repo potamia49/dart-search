@@ -106,6 +106,28 @@ class Result(Base):
     non_operating_expense_cur: Mapped[int | None] = mapped_column(Integer, nullable=True)
     non_operating_expense_prv: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
+    # 세부계정 5항목 (2026-08-05, base.py DETAIL_FINANCIAL_FIELDS 참고) — CF 4항목/
+    # 영업외손익 2항목과 완전히 동형인 best-effort 컬럼이다. parse_status 판정에는
+    # 반영하지 않으며, 누락 시 parse_note에도 부기하지 않는다(NULL이 정상).
+    # 다른 재무 컬럼과 같이 Integer(원 단위)로 둔다 — 파서는 float를 주지만 SQLite의
+    # INTEGER 타입 친화성이 무손실 변환하므로 엑셀에 "12345.0"처럼 찍히지 않는다.
+    #
+    # **각 필드의 원천 재무제표는 하나로 고정돼 있다**(base.py 주석 참고) — 같은
+    # 라벨이 표마다 다른 뜻이라 폴백으로 섞지 않는다:
+    #   - trade_receivables: 재무상태표, **대손충당금 차감 후 순액**
+    #   - depreciation: **현금흐름표** 기준(제조원가 몫 포함 총액) — 손익계산서
+    #     판관비의 감가상각비와는 다른 숫자다(실측 75.4% 불일치).
+    cash_and_equivalents_cur: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cash_and_equivalents_prv: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    trade_receivables_cur: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    trade_receivables_prv: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    interest_expense_cur: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    interest_expense_prv: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    depreciation_cur: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    depreciation_prv: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    amortization_cur: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    amortization_prv: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
     # 상태
     parse_status: Mapped[str | None] = mapped_column(String, nullable=True)  # OK/PARTIAL/FAILED
     parse_note: Mapped[str | None] = mapped_column(String, nullable=True)

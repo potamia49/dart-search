@@ -85,6 +85,17 @@ class FinancialSnapshot(Base):
     non_operating_income: Mapped[int | None] = mapped_column(Integer, nullable=True)
     non_operating_expense: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
+    # 세부계정 5항목 (2026-08-05) — results의 cash_and_equivalents_cur/prv 등과 동일
+    # 필드셋, 접미어 없음(CF 4항목·영업외손익 2항목과 동일 패턴). best-effort라
+    # parse_status 판정에 관여하지 않고 결측(NULL)이 정상이다.
+    # trade_receivables는 대손충당금 차감 후 순액, depreciation은 현금흐름표 기준
+    # 총액이다(base.py DETAIL_FINANCIAL_FIELDS 주석 참고).
+    cash_and_equivalents: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    trade_receivables: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    interest_expense: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    depreciation: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    amortization: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
     # 그 연도 감사보고서의 감사인(회계법인/감사반) 이름 (2026-07-26 추가,
     # app/parsers/auditor.py `extract_auditor`). "연도별로 감사인이 바뀌었는지"를
     # 결과 목록에 표시하기 위한 원천 데이터다(results.auditor_changed 참고).

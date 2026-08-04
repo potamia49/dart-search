@@ -84,6 +84,13 @@ RESULT_COLUMN_LABELS: dict[str, str] = {
     "total_liab_prv": "부채총계(전기)",
     "total_equity_cur": "자본총계(당기)",
     "total_equity_prv": "자본총계(전기)",
+    # 재무상태표 세부계정 2항목 (2026-08-05, best-effort). **둘 다 contra 행을 차감한
+    # 순액**이라 라벨에 그 사실을 박아 총액과 혼동되지 않게 한다 — 매출채권은
+    # 대손충당금, 현금및현금성자산은 정부보조금·국고보조금 등을 뺀 값이다.
+    "cash_and_equivalents_cur": "현금및현금성자산(순액)(당기)",
+    "cash_and_equivalents_prv": "현금및현금성자산(순액)(전기)",
+    "trade_receivables_cur": "매출채권(순액)(당기)",
+    "trade_receivables_prv": "매출채권(순액)(전기)",
     "revenue_cur": "매출액(당기)",
     "revenue_prv": "매출액(전기)",
     "cogs_cur": "매출원가(당기)",
@@ -96,6 +103,14 @@ RESULT_COLUMN_LABELS: dict[str, str] = {
     "operating_income_prv": "영업이익(전기)",
     "net_income_cur": "당기순이익(당기)",
     "net_income_prv": "당기순이익(전기)",
+    # 손익계산서 세부계정 1항목 (2026-08-05, best-effort). 손익계산서의 발생주의
+    # 이자비용이며 현금흐름표의 간접법 가산 조정액과 섞지 않는다(실측 92.3% 불일치).
+    # 이 wide 포맷은 재무제표별로 묶지 않고 도입 시점 순으로 이어 붙이는 기존 관행이라
+    # `FINANCIAL_SNAPSHOT_ACCOUNTS_BY_STATEMENT`(재무제표별 그룹, 손익계산서 안에서
+    # 영업외수익/비용 뒤에 옴)와 이 항목의 상대 순서가 다르다 — 라벨·소속은 두 시트가
+    # 일치하고(드리프트 가드 테스트가 잠금), 순서만 다른 것은 의도된 차이다.
+    "interest_expense_cur": "이자비용(당기)",
+    "interest_expense_prv": "이자비용(전기)",
     # 현금흐름표 4항목 (§4-8, 2026-07-19)
     "cf_operating_cur": "영업활동현금흐름(당기)",
     "cf_operating_prv": "영업활동현금흐름(전기)",
@@ -105,6 +120,13 @@ RESULT_COLUMN_LABELS: dict[str, str] = {
     "cf_financing_prv": "재무활동현금흐름(전기)",
     "cf_ending_cash_cur": "기말의현금(당기)",
     "cf_ending_cash_prv": "기말의현금(전기)",
+    # 현금흐름표 세부계정 2항목 (2026-08-05, best-effort). 감가상각비는 **현금흐름표
+    # 기준 총액**(제조원가 몫 포함)이라 손익계산서 판관비의 감가상각비와 다른 숫자다
+    # (실측 75.4% 불일치, 제조업은 최대 18배) — 라벨에 출처를 박아 혼동을 막는다.
+    "depreciation_cur": "감가상각비(현금흐름표)(당기)",
+    "depreciation_prv": "감가상각비(현금흐름표)(전기)",
+    "amortization_cur": "무형자산상각비(당기)",
+    "amortization_prv": "무형자산상각비(전기)",
     # 영업외수익/영업외비용 2항목 (2026-07-22)
     "non_operating_income_cur": "영업외수익(당기)",
     "non_operating_income_prv": "영업외수익(전기)",
@@ -201,9 +223,11 @@ SELECTION_BASE_COLUMNS: list[str] = [
 # 위 기본정보 필드 중 "계정과목명/금액" **뒤**에 배치할 것(2026-07-28, 사용자 확정).
 SELECTION_TRAILING_COLUMNS: list[str] = ["parse_status"]
 
-# 세로로 풀 당기(`_cur`) 재무 항목 19개. 순서가 곧 한 회사 안의 행 순서다
-# (재무상태표 → 손익계산서 → 현금흐름표 → 영업외손익, `RESULT_COLUMN_LABELS`와
-# 동일한 배열 순서).
+# 세로로 풀 당기(`_cur`) 재무 항목 24개(2026-08-05 세부계정 5항목 추가로 19 → 24).
+# 순서가 곧 한 회사 안의 행 순서다(재무상태표 → 손익계산서 → 현금흐름표 →
+# 영업외손익, `RESULT_COLUMN_LABELS`와 동일한 배열 순서). 세부계정은 각자의 원천
+# 재무제표 블록 끝에 붙였다 — 값이 없어도 행은 남으므로(아래 함수 참고) 기존
+# 항목의 상대 순서는 그대로다.
 SELECTION_ACCOUNT_COLUMNS: list[str] = [
     "current_assets_cur",
     "noncurrent_assets_cur",
@@ -212,16 +236,21 @@ SELECTION_ACCOUNT_COLUMNS: list[str] = [
     "noncurrent_liab_cur",
     "total_liab_cur",
     "total_equity_cur",
+    "cash_and_equivalents_cur",
+    "trade_receivables_cur",
     "revenue_cur",
     "cogs_cur",
     "gross_profit_cur",
     "sga_cur",
     "operating_income_cur",
     "net_income_cur",
+    "interest_expense_cur",
     "cf_operating_cur",
     "cf_investing_cur",
     "cf_financing_cur",
     "cf_ending_cash_cur",
+    "depreciation_cur",
+    "amortization_cur",
     "non_operating_income_cur",
     "non_operating_expense_cur",
 ]
@@ -252,7 +281,7 @@ SELECTION_EXPORT_COLUMNS: list[str] = list(SELECTION_EXPORT_COLUMN_LABELS.keys()
 def results_to_selection_dataframe(results: Sequence[Result]) -> pd.DataFrame:
     """`results` 레코드를 "회사 × 계정과목" long 포맷 DataFrame으로 변환.
 
-    회사 1건이 `SELECTION_ACCOUNT_COLUMNS` 개수(19)만큼의 행이 되고, 기본정보
+    회사 1건이 `SELECTION_ACCOUNT_COLUMNS` 개수(24)만큼의 행이 되고, 기본정보
     컬럼(`SELECTION_BASE_COLUMNS`)은 그 행들에 그대로 반복된다. 입력 순서
     (호출부의 id 오름차순)를 보존한다. 컬럼 순서는 `SELECTION_EXPORT_COLUMNS`가
     정한다 — `parse_status`는 계정과목명/금액 뒤(맨 마지막)로 간다.
@@ -304,7 +333,8 @@ def export_selection_results(
 # ---------------------------------------------------------------------------
 
 # `financial_snapshots`(회사×회계연도) 시트는 2026-07-29부터 기본정보 시트와 같은
-# **long 포맷**이다 — 스냅샷 1건(회사×회계연도)이 재무 19항목만큼 19행으로 풀리고,
+# **long 포맷**이다 — 스냅샷 1건(회사×회계연도)이 재무 항목 수(2026-08-05 세부계정
+# 5항목 추가로 19 → 24)만큼의 행으로 풀리고,
 # 재무 항목마다 그 항목이 속한 재무제표 이름("재무상태표"/"손익계산서"/"현금흐름표")을
 # 함께 싣는다(사용자 확정). 감사인/파싱상태 컬럼은 이때 제거됐다.
 #
@@ -321,6 +351,11 @@ FINANCIAL_SNAPSHOT_ACCOUNTS_BY_STATEMENT: dict[str, dict[str, str]] = {
         "noncurrent_liab": "비유동부채",
         "total_liab": "부채총계",
         "total_equity": "자본총계",
+        # 세부계정 2항목 (2026-08-05). 라벨은 시트 ①(`SELECTION_ACCOUNT_LABELS`)과
+        # 글자까지 동일해야 한다 — 드리프트 가드 테스트가 이를 잠근다. 둘 다 contra
+        # 행 차감 후 순액이라 "(순액)"을 붙인다(위 `RESULT_COLUMN_LABELS` 주석 참고).
+        "cash_and_equivalents": "현금및현금성자산(순액)",
+        "trade_receivables": "매출채권(순액)",
     },
     "손익계산서": {
         "revenue": "매출액",
@@ -331,16 +366,21 @@ FINANCIAL_SNAPSHOT_ACCOUNTS_BY_STATEMENT: dict[str, dict[str, str]] = {
         "net_income": "당기순이익",
         "non_operating_income": "영업외수익",
         "non_operating_expense": "영업외비용",
+        "interest_expense": "이자비용",  # 세부계정 (2026-08-05)
     },
     "현금흐름표": {
         "cf_operating": "영업활동현금흐름",
         "cf_investing": "투자활동현금흐름",
         "cf_financing": "재무활동현금흐름",
         "cf_ending_cash": "기말의현금",
+        # 세부계정 2항목 (2026-08-05). 감가상각비는 손익계산서 판관비 몫이 아니라
+        # 현금흐름표 기준 총액이라 라벨에 출처를 남긴다(base.py 주석 참고).
+        "depreciation": "감가상각비(현금흐름표)",
+        "amortization": "무형자산상각비",
     },
 }
 
-# 세로로 풀 재무 항목 19개(위 정의 순서 = 행 순서)와 그 라벨/재무제표 소속.
+# 세로로 풀 재무 항목 24개(위 정의 순서 = 행 순서)와 그 라벨/재무제표 소속.
 FINANCIAL_SNAPSHOT_ACCOUNT_COLUMNS: list[str] = [
     col for accounts in FINANCIAL_SNAPSHOT_ACCOUNTS_BY_STATEMENT.values() for col in accounts
 ]
@@ -385,7 +425,7 @@ def snapshots_to_dataframe(
 ) -> pd.DataFrame:
     """`financial_snapshots`를 "회사 × 회계연도 × 계정과목" long 포맷으로 변환.
 
-    스냅샷 1건이 `FINANCIAL_SNAPSHOT_ACCOUNT_COLUMNS` 개수(19)만큼의 행이 되고,
+    스냅샷 1건이 `FINANCIAL_SNAPSHOT_ACCOUNT_COLUMNS` 개수(24)만큼의 행이 되고,
     식별 컬럼(결과ID/회사명/회계연도/접수번호)은 그 행들에 그대로 반복된다.
 
     스냅샷은 회사명을 직접 갖고 있지 않으므로(`result_id` FK만), 호출부가

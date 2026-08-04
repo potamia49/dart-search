@@ -595,8 +595,9 @@ def test_export_ids_selects_only_given_rows_and_ignores_other_filters(client_wit
 
 
 def test_export_ids_uses_long_account_format(client_with_db):
-    """선택 다운로드는 회사 1건이 당기 계정과목 19행으로 풀리는 long 포맷이다
-    (2026-07-28). 값이 없는 계정과목도 금액만 빈 채로 행이 남는다."""
+    """선택 다운로드는 회사 1건이 당기 계정과목 24행으로 풀리는 long 포맷이다
+    (2026-07-28, 2026-08-05 세부계정 5항목 추가로 19 → 24). 값이 없는 계정과목도
+    금액만 빈 채로 행이 남는다."""
     client, factory = client_with_db
     job_id = _seed_job_with_results(factory)
     ok_id = _get_result_id(factory, job_id, "00100001")
@@ -629,22 +630,22 @@ def test_export_ids_uses_long_account_format(client_with_db):
         "금액",
         "파싱상태",  # 계정과목명/금액보다도 뒤, 맨 마지막 컬럼(2026-07-28 사용자 확정)
     ]
-    assert ws.max_row == 20  # 헤더 + 계정과목 19행
+    assert ws.max_row == 25  # 헤더 + 계정과목 24행
 
     account_col, amount_col = header.index("계정과목명") + 1, header.index("금액") + 1
     amounts = {
         ws.cell(row=r, column=account_col).value: ws.cell(row=r, column=amount_col).value
-        for r in range(2, 21)
+        for r in range(2, 26)
     }
-    assert len(amounts) == 19
+    assert len(amounts) == 24
     assert amounts["매출액"] == 10_000_000_000
     assert amounts["자산총계"] is None  # 결측도 행은 남고 금액만 빈 값
     assert "매출액(전기)" not in amounts  # 전기 항목은 싣지 않는다
     # 기본정보는 모든 계정과목 행에 반복된다(파싱상태 포함).
     corp_col = header.index("회사명") + 1
     status_col = header.index("파싱상태") + 1
-    assert {ws.cell(row=r, column=corp_col).value for r in range(2, 21)} == {"㈜성공테스트"}
-    assert {ws.cell(row=r, column=status_col).value for r in range(2, 21)} == {"OK"}
+    assert {ws.cell(row=r, column=corp_col).value for r in range(2, 26)} == {"㈜성공테스트"}
+    assert {ws.cell(row=r, column=status_col).value for r in range(2, 26)} == {"OK"}
 
 
 def test_export_ids_csv_uses_long_account_format(client_with_db):
@@ -659,7 +660,7 @@ def test_export_ids_csv_uses_long_account_format(client_with_db):
     assert resp.status_code == 200
     lines = resp.content.decode("utf-8-sig").splitlines()
     assert lines[0].endswith("계정과목명,금액,파싱상태")
-    assert len(lines) == 20
+    assert len(lines) == 25
     assert any(line.endswith("매출액,10000000000,OK") for line in lines[1:])
 
 
@@ -822,8 +823,8 @@ def test_export_include_history_writes_two_sheets_with_joined_corp_name(client_w
     assert wb.sheetnames == ["results", "financial_history"]
 
     ws_results = wb["results"]
-    # 기본정보 시트는 long 포맷 — 헤더 + 선택한 1개사 × 계정과목 19행(2026-07-28).
-    assert ws_results.max_row == 20
+    # 기본정보 시트는 long 포맷 — 헤더 + 선택한 1개사 × 계정과목 24행(2026-07-28).
+    assert ws_results.max_row == 25
     results_header = [c.value for c in next(ws_results.iter_rows(min_row=1, max_row=1))]
     assert results_header[-3:] == ["계정과목명", "금액", "파싱상태"]
     corp_col = results_header.index("회사명") + 1
@@ -833,10 +834,10 @@ def test_export_include_history_writes_two_sheets_with_joined_corp_name(client_w
     header = [c.value for c in next(ws_history.iter_rows(min_row=1, max_row=1))]
     # 2026-07-29부터 재무이력 시트도 long 포맷(계정과목 세로) — 감사인/파싱상태 없음.
     assert header == ["결과ID", "회사명", "회계연도", "접수번호", "재무제표명", "계정과목", "금액"]
-    assert ws_history.max_row == 39  # 헤더 + 2개 연도 × 계정과목 19행
+    assert ws_history.max_row == 49  # 헤더 + 2개 연도 × 계정과목 24행
     rows = [
         [ws_history.cell(row=r, column=c + 1).value for c in range(len(header))]
-        for r in range(2, 40)
+        for r in range(2, 50)
     ]
     name_i, year_i, stmt_i, account_i, amount_i = (
         header.index("회사명"),
@@ -846,10 +847,11 @@ def test_export_include_history_writes_two_sheets_with_joined_corp_name(client_w
         header.index("금액"),
     )
     # result_id -> fiscal_year 오름차순으로 정렬되고, 회사명은 results에서 조인된다.
-    assert [str(r[year_i]) for r in rows] == ["2024"] * 19 + ["2025"] * 19
+    assert [str(r[year_i]) for r in rows] == ["2024"] * 24 + ["2025"] * 24
     assert {r[name_i] for r in rows} == {"㈜성공테스트"}
-    assert [r[stmt_i] for r in rows[:19]] == (
-        ["재무상태표"] * 7 + ["손익계산서"] * 8 + ["현금흐름표"] * 4
+    # 2026-08-05 세부계정 5항목이 각 표 끝에 붙어 7/8/4 → 9/9/6.
+    assert [r[stmt_i] for r in rows[:24]] == (
+        ["재무상태표"] * 9 + ["손익계산서"] * 9 + ["현금흐름표"] * 6
     )
     assets = [r[amount_i] for r in rows if r[account_i] == "자산총계"]
     assert assets == [5_000_000_000, 6_000_000_000]
@@ -887,7 +889,7 @@ def test_export_include_history_without_ids_covers_filtered_rows(client_with_db)
     header = [c.value for c in next(wb["results"].iter_rows(min_row=1, max_row=1))]
     assert header == list(RESULT_COLUMN_LABELS.values())
     assert "매출액(전기)" in header and "계정과목명" not in header
-    assert wb["financial_history"].max_row == 20  # 헤더 + 스냅샷 1건 × 계정과목 19행
+    assert wb["financial_history"].max_row == 25  # 헤더 + 스냅샷 1건 × 계정과목 24행
 
 
 def test_export_without_new_params_is_unchanged(client_with_db):

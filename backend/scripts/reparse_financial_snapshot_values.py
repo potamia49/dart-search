@@ -25,10 +25,11 @@
   `from_current_period` 플래그로 폴백(2순위). 원문 당기 연도와도 그 전년과도
   안 맞으면 안전하게 스킵한다(연도 오귀속 방지).
 - 갱신 대상 컬럼은 `_upsert_financial_snapshot`과 동일하게 표준 13항목 +
-  CF 4항목 + 영업외손익 2항목(cur/prv 접미어 없음) + parse_status +
-  parse_note로 한정한다. `rcept_no`/`fiscal_year`/`from_current_period`/
-  `auditor_name`은 건드리지 않는다(각각 별도 책임 — auditor_name은
-  `backfill_auditor_names.py`가 이미 채웠다).
+  CF 4항목 + 영업외손익 2항목 + 세부계정 5항목(2026-08-05 추가,
+  cur/prv 접미어 없음) + parse_status + parse_note로 한정한다.
+  `rcept_no`/`fiscal_year`/`from_current_period`/`auditor_name`은 건드리지
+  않는다(각각 별도 책임 — auditor_name은 `backfill_auditor_names.py`가
+  이미 채웠다).
 - `--dry-run` 지원, 재실행 멱등(값이 이미 파서 출력과 같으면 재기록 안 함),
   `--verify`로 회계 항등식 자체검증.
 
@@ -54,6 +55,7 @@ from app.core.db import get_session_factory  # noqa: E402
 from app.models.financial_snapshot import FinancialSnapshot  # noqa: E402
 from app.parsers.base import (  # noqa: E402
     CF_FINANCIAL_FIELDS,
+    DETAIL_FINANCIAL_FIELDS,
     NON_OPERATING_FINANCIAL_FIELDS,
     STANDARD_FINANCIAL_FIELDS,
     ParsedFinancials,
@@ -64,7 +66,12 @@ from app.parsers.xml_parser import parse_xml_financials  # noqa: E402
 # STEP7의 헬퍼를 그대로 재사용(로직 중복 금지)
 from app.core.pipeline import _extract_fiscal_date, _pick_document_file  # noqa: E402
 
-_ALL_VALUE_FIELDS = STANDARD_FINANCIAL_FIELDS + CF_FINANCIAL_FIELDS + NON_OPERATING_FINANCIAL_FIELDS
+_ALL_VALUE_FIELDS = (
+    STANDARD_FINANCIAL_FIELDS
+    + CF_FINANCIAL_FIELDS
+    + NON_OPERATING_FINANCIAL_FIELDS
+    + DETAIL_FINANCIAL_FIELDS
+)
 
 
 def _parse_doc(doc_path: Path) -> tuple[ParsedFinancials, str | None]:

@@ -19,10 +19,18 @@ from app.parsers.audit_opinion import extract_audit_opinion
 from app.parsers.document_sections import extract_section_html
 from app.parsers.base import (
     ACCOUNT_NAME_ALIASES,
+    BS_DETAIL_ACCOUNT_ALIASES,
+    CF_DETAIL_ACCOUNT_ALIASES,
+    CF_FINANCIAL_FIELDS,
+    CONTRA_ROW_SPECS,
+    DETAIL_ALIASES_BY_SECTION,
+    DETAIL_FINANCIAL_FIELDS,
     DIRECT_FINANCIAL_FIELDS,
+    IS_DETAIL_ACCOUNT_ALIASES,
     NON_OPERATING_FINANCIAL_FIELDS,
     STANDARD_FINANCIAL_FIELDS,
     determine_parse_status,
+    is_contra_row_label,
     normalize_account_label,
     parse_won_amount,
 )
@@ -1437,6 +1445,279 @@ def test_extract_audit_opinion_adverse_synthetic():
 
 def test_extract_audit_opinion_none_when_no_marker_found():
     assert extract_audit_opinion("<P>관련 없는 본문입니다.</P>") is None
+
+
+# ---------------------------------------------------------------------------
+# 세부계정 5항목 (DETAIL_FINANCIAL_FIELDS, best-effort — 2026-08-05 신설)
+#
+# 로컬 문서 캐시 8,748건 전수 스캔으로 라벨 표기·커버리지·부호를 실측한 뒤 설계했다.
+# 아래 테스트가 잠그는 핵심 규약은 세 가지다:
+#   ① 필드마다 **원천 재무제표가 하나로 고정**돼 있고 다른 재무제표로 폴백하지 않는다
+#      (같은 라벨이 재무제표마다 다른 뜻이라 섞으면 조용한 오류가 된다).
+#   ② 재무상태표 잔액 2종은 **인접 contra 행을 차감한 순액**으로 저장한다 — 매출채권은
+#      대손충당금(총액이면 최대 6.38배), 현금및현금성자산은 정부보조금(최대 89.2%).
+#   ③ 이 다섯 필드는 `determine_parse_status()` 판정에 관여하지 않는다(결측이어도 OK).
+# ---------------------------------------------------------------------------
+
+_DETAIL_FIXTURE_EXPECTED = {
+    # 실제 원문에서 눈으로 확인한 ground truth (당기 기준).
+    "20260424000057": {  # (주)한미프렉시블 — FINANCE 서식, 5항목 모두 존재
+        "cash_and_equivalents": 1_501_366_489.0,
+        "trade_receivables": 9_871_514_894.0,
+        "interest_expense": 946_271_041.0,
+        "depreciation": 1_210_860_947.0,
+        "amortization": 33_934_964.0,
+    },
+    "20260413003038": {  # FINANCE 서식(손실-primary 조합형 라벨을 쓰는 원문)
+        "cash_and_equivalents": 227_872_140.0,
+        "trade_receivables": 1_381_720_310.0,
+        "interest_expense": 658_106_225.0,
+        "depreciation": 444_073_163.0,
+        "amortization": 1_730_000.0,
+    },
+    "20260330001497": {  # 씨이케이 — IFRS "(첨부)재무제표" 서식
+        "cash_and_equivalents": 10_996_202_190.0,
+        "trade_receivables": 8_479_688_212.0,
+        "interest_expense": None,  # 첨부 서식 손익계산서는 "금융비용"만 있어 미매핑(아래 테스트 참고)
+        "depreciation": 9_284_534_560.0,
+        "amortization": 92_356_081.0,
+    },
+}
+
+
+@pytest.mark.parametrize("rcept_no", sorted(_DETAIL_FIXTURE_EXPECTED))
+def test_detail_fields_extracted_from_real_fixtures(rcept_no):
+    """FINANCE/IFRS 첨부 두 서식 모두에서 세부계정 5항목이 실제 원문 수치로 나온다."""
+    parsed = parse_xml_financials(_read_fixture(rcept_no))
+    for field, expected in _DETAIL_FIXTURE_EXPECTED[rcept_no].items():
+        assert parsed.values_cur.get(field) == expected, field
+    # 전기(_prv)도 함께 채워지는 구조인지 확인(당기만 채우는 회귀 방지).
+    assert parsed.values_prv.get("cash_and_equivalents") is not None
+
+
+def test_detail_fields_are_best_effort_and_never_change_parse_status():
+    """세부계정은 CF 4항목/영업외 2항목과 동형인 best-effort — 판정에 관여하지 않는다.
+
+    `determine_parse_status`는 DIRECT_FINANCIAL_FIELDS만 보므로, 세부계정이 전부
+    결측이어도 OK가 나와야 한다(이미 OK로 완료된 Job이 새 필드 때문에 PARTIAL로
+    재분류되면 검수 기준이 깨진다 — CF·영업외손익 때와 같은 확정 사항).
+    """
+    for field in DETAIL_FINANCIAL_FIELDS:
+        assert field not in STANDARD_FINANCIAL_FIELDS
+        assert field not in DIRECT_FINANCIAL_FIELDS
+        assert field not in CF_FINANCIAL_FIELDS
+        assert field not in NON_OPERATING_FINANCIAL_FIELDS
+    full = {f: 1.0 for f in DIRECT_FINANCIAL_FIELDS}
+    status, note = determine_parse_status(dict(full), dict(full), found_any_table=True)
+    assert (status, note) == ("OK", None)
+
+
+def test_detail_alias_tables_are_section_scoped_and_disjoint():
+    """세 alias 사전은 재무제표별로 분리돼 있고 서로 필드를 넘나들지 않는다."""
+    assert set(DETAIL_ALIASES_BY_SECTION) == {"bs", "is", "cf"}
+    assert DETAIL_ALIASES_BY_SECTION["bs"] is BS_DETAIL_ACCOUNT_ALIASES
+    assert DETAIL_ALIASES_BY_SECTION["is"] is IS_DETAIL_ACCOUNT_ALIASES
+    assert DETAIL_ALIASES_BY_SECTION["cf"] is CF_DETAIL_ACCOUNT_ALIASES
+    # 모든 alias 값이 DETAIL_FINANCIAL_FIELDS 안에 있어야 한다(오타 방지).
+    for aliases in DETAIL_ALIASES_BY_SECTION.values():
+        assert set(aliases.values()) <= set(DETAIL_FINANCIAL_FIELDS)
+    # 섹션끼리 같은 라벨을 공유하지 않는다 — 공유하면 "매출채권"/"이자비용"처럼
+    # 재무제표마다 뜻이 다른 라벨이 엉뚱한 필드로 샌다.
+    assert not set(BS_DETAIL_ACCOUNT_ALIASES) & set(CF_DETAIL_ACCOUNT_ALIASES)
+    assert not set(IS_DETAIL_ACCOUNT_ALIASES) & set(CF_DETAIL_ACCOUNT_ALIASES)
+    # "무형자산감가상각비"는 "감가상각비"를 부분문자열로 품지만 alias 조회가 완전
+    # 일치라 amortization으로 정확히 간다(부분 일치로 바꾸면 즉시 깨진다).
+    assert CF_DETAIL_ACCOUNT_ALIASES["무형자산감가상각비"] == "amortization"
+    assert CF_DETAIL_ACCOUNT_ALIASES["감가상각비"] == "depreciation"
+
+
+def test_trade_receivables_is_net_of_allowance_contra_row():
+    """매출채권은 **대손충당금 차감 후 순액**으로 저장한다(주식회사 태진 20220415000297).
+
+    원문 재무상태표: "매출채권 2,237,045,099" 바로 다음 행 "매출채권대손충당금
+    (1,886,435,870)". 차감하지 않으면 실제 장부금액의 **6.38배**가 저장돼, 사실상
+    회수 불가능한 채권을 정상 채권처럼 보이게 만든다.
+    """
+    parsed = parse_xml_financials(_read_fixture("20220415000297"))
+    assert parsed.values_cur["trade_receivables"] == 350_609_229.0  # = 2,237,045,099 - 1,886,435,870
+    # 유동자산을 넘지 않는다(총액이면 2,237,045,099 > 유동자산 1,450,098,065로 불가능한 값).
+    assert parsed.values_cur["trade_receivables"] < parsed.values_cur["current_assets"]
+
+
+def test_trade_receivables_bare_allowance_row_fully_provisioned_is_zero():
+    """이름 없는 "대손충당금" 인접 행(실측 5,395건으로 지배적인 서식) + 전액 대손 설정.
+
+    (주)명진기업 20220401000156: 매출채권 235,091,466 / 대손충당금 (235,091,466)
+    → 순액 0원. "값이 0"과 "값이 없음(None)"은 다르므로 0.0으로 저장돼야 한다.
+    """
+    parsed = parse_xml_financials(_read_fixture("20220401000156"))
+    assert parsed.values_cur["trade_receivables"] == 0.0
+    assert parsed.values_prv["trade_receivables"] == 152_439_126.0
+
+
+def test_trade_receivables_ignores_allowance_belonging_to_another_account():
+    """인접하지 않은 이름 없는 대손충당금은 **다른 계정 몫**이라 빼지 않는다.
+
+    흥한건설 20230404002046 재무상태표는 "매출채권 2,244,097,579 / 단기대여금 /
+    대손충당금 (18,892,793,483)" 순서다(실측 75건이 이 구조). 인접 여부를 보지 않고
+    빼면 매출채권이 -16,648,695,904원이라는 불가능한 값이 된다.
+    """
+    parsed = parse_xml_financials(_read_fixture("20230404002046"))
+    assert parsed.values_cur["trade_receivables"] == 2_244_097_579.0  # 총액 그대로(차감 없음)
+
+
+def test_is_contra_row_label_rules_for_trade_receivables():
+    """차감 대상 판정 규칙 — 인접 행에서만 이름 없는 "대손충당금"을 인정한다."""
+    spec = CONTRA_ROW_SPECS["trade_receivables"]
+    # 인접(바로 다음 행): 이름 없는 것도, 계정명이 붙은 것도 매출채권 몫으로 본다.
+    assert is_contra_row_label("대손충당금", spec, adjacent=True)
+    assert is_contra_row_label("매출채권대손충당금", spec, adjacent=True)
+    assert is_contra_row_label("대손충당금(매출채권)", spec, adjacent=True)
+    # 그 뒤 행: "매출채권"이 함께 적힌 것만 인정한다.
+    assert is_contra_row_label("매출채권대손충당금", spec, adjacent=False)
+    assert not is_contra_row_label("대손충당금", spec, adjacent=False)
+    # 애초에 대손충당금이 아닌 라벨은 어느 위치에서도 아니다.
+    assert not is_contra_row_label("단기대여금", spec, adjacent=True)
+    assert not is_contra_row_label("정부보조금", spec, adjacent=True)
+
+
+def test_is_contra_row_label_accepts_measured_allowance_label_variants():
+    """대손충당금 라벨의 실측 변형 3종도 contra로 인정한다(2026-08-05, dart-qa L1).
+
+    "대손충당부채"(3건) · 오타 "대손충담금"(2건) · 끝 글자 누락 "대손충당"(1건). 이들은
+    "대손충당금" 완전포함 판정에 걸리지 않아 약 1%씩 조용히 과대계상되고 있었다.
+    """
+    spec = CONTRA_ROW_SPECS["trade_receivables"]
+    for label in ("대손충당부채", "대손충담금", "대손충당", "매출채권대손충당부채"):
+        assert is_contra_row_label(label, spec, adjacent=True), label
+
+
+def test_is_contra_row_label_rules_for_cash():
+    """현금의 contra는 정부보조금 계열이고, 대손충당금과 마커가 섞이지 않는다."""
+    spec = CONTRA_ROW_SPECS["cash_and_equivalents"]
+    for label in ("정부보조금", "국고보조금", "(-)정부보조금", "정부조보금", "국고보고조금"):
+        assert is_contra_row_label(label, spec, adjacent=True), label
+    # 인접하지 않으면 "현금"이 라벨에 함께 적힌 것만 인정한다(다른 자산의 보조금 차단).
+    assert is_contra_row_label("현금및현금성자산_국고보조금", spec, adjacent=False)
+    assert not is_contra_row_label("정부보조금", spec, adjacent=False)
+    # 보조금이 아닌 차감 표기는 등록하지 않았다(사용제한 예금은 별개 개념 — 과잉 일반화 금지).
+    assert not is_contra_row_label("특정예금차감", spec, adjacent=True)
+    assert not is_contra_row_label("대손충당금", spec, adjacent=True)
+
+
+def test_cash_and_equivalents_is_net_of_government_grant_contra_row():
+    """현금및현금성자산도 **인접 정부보조금 contra 행을 차감한 순액**으로 저장한다.
+
+    영화여객자동차 20230404001968: "현금및현금성자산 2,952,261,667" 다음 행
+    "정부보조금 (1,720,000,000)". 차감하지 않으면 현금이 **유동자산 2,530,940,076을
+    넘는** 불가능한 값이 된다(실측 112건 중 유일하게 회계 항등식으로 검증되는 사례).
+    """
+    parsed = parse_xml_financials(_read_fixture("20230404001968"))
+    assert parsed.values_cur["cash_and_equivalents"] == 1_232_261_667.0
+    assert parsed.values_cur["cash_and_equivalents"] < parsed.values_cur["current_assets"]
+
+
+def test_cash_and_equivalents_grant_contra_worst_case_overstatement():
+    """정부보조금 차감의 과대계상 최대 사례(우성포마 20230412000095, 89.2%).
+
+    현금 총액 22,415,189 / 정부보조금 (20,000,000) → 순액 2,415,189.
+    """
+    parsed = parse_xml_financials(_read_fixture("20230412000095"))
+    assert parsed.values_cur["cash_and_equivalents"] == 2_415_189.0
+    assert parsed.values_prv["cash_and_equivalents"] == 23_756_554.0
+
+
+def test_trade_receivables_nets_allowance_label_variant_from_real_fixture():
+    """대손충당금 변형 표기("대손충당부채")도 실제 원문에서 차감된다(한신기업 20230410000109).
+
+    매출채권 1,956,182,102 / 대손충당부채 (19,561,821) → 순액 1,936,620,281.
+    """
+    parsed = parse_xml_financials(_read_fixture("20230410000109"))
+    assert parsed.values_cur["trade_receivables"] == 1_936_620_281.0
+
+
+def test_depreciation_comes_from_cash_flow_not_income_statement():
+    """감가상각비는 **현금흐름표**(제조원가 몫 포함 총액)에서만 가져온다.
+
+    손익계산서 본문의 "감가상각비"는 판매비와관리비에 속한 몫뿐이라 두 값이 다르다 —
+    로컬 캐시 실측 7,355건 중 **75.4%가 불일치**했고 제조업은 최대 18배까지 벌어진다.
+    한미프렉시블 20260424000057은 손익계산서 196,267,673 / 현금흐름표 1,210,860,947로
+    6.2배 차이가 나는데, 저장값은 현금흐름표 쪽이어야 한다.
+    """
+    parsed = parse_xml_financials(_read_fixture("20260424000057"))
+    assert parsed.values_cur["depreciation"] == 1_210_860_947.0
+    assert parsed.values_cur["depreciation"] != 196_267_673.0  # 손익계산서 값이 아니다
+    # 흥한건설도 같은 규약(손익계산서 31,010,839 / 현금흐름표 48,907,665).
+    other = parse_xml_financials(_read_fixture("20230404002046"))
+    assert other.values_cur["depreciation"] == 48_907_665.0
+
+
+def test_interest_expense_comes_from_income_statement_not_cash_flow():
+    """이자비용은 **손익계산서**(발생주의 비용)에서만 가져온다.
+
+    현금흐름표에도 같은 이름의 간접법 조정 행이 있지만 실측상 **92.3% 불일치**하고
+    (299건 중 276건) 0으로 적힌 경우도 흔하다. 한미프렉시블 20260424000057은
+    손익계산서 946,271,041 / 현금흐름표 139,348,178로, 저장값은 손익계산서 쪽이다.
+    """
+    parsed = parse_xml_financials(_read_fixture("20260424000057"))
+    assert parsed.values_cur["interest_expense"] == 946_271_041.0
+    assert parsed.values_cur["interest_expense"] != 139_348_178.0  # 현금흐름표 값이 아니다
+
+
+def test_interest_expense_does_not_fall_back_to_cash_flow_when_absent():
+    """손익계산서에 이자비용이 없으면 현금흐름표로 **폴백하지 않고** 결측으로 둔다.
+
+    IFRS "(첨부)재무제표" 서식의 포괄손익계산서는 이자비용 대신 "금융비용"(외환차손 등이
+    합쳐진 다른 집계)만 적는다 — 롯데미쓰이화학 20230322000842는 현금흐름표에
+    "이자비용 15,766,098,122"가 있지만 손익계산서에는 없으므로 None이어야 한다.
+    폴백하면 뜻이 다른 값이 조용히 섞이고, 검수 화면에서 결측으로 드러나지도 않는다.
+    """
+    parsed = parse_xml_financials(_read_fixture("20230322000842"))
+    # 미매핑 필드는 다른 best-effort 항목과 같은 규약으로 **키 자체가 없다**
+    # (파이프라인 `_apply_parsed_result`가 `.get(f)`로 읽어 컬럼에 NULL을 넣는다).
+    assert parsed.values_cur.get("interest_expense") is None
+    # 같은 문서의 현금흐름표 유래 항목(감가상각비)은 정상적으로 채워진다.
+    assert parsed.values_cur["depreciation"] == 27_342_599_978.0
+
+
+def test_trade_receivables_not_polluted_by_cash_flow_working_capital_row():
+    """현금흐름표의 "매출채권의 감소(증가)"(운전자본 증감액)가 매출채권 잔액을 덮지 않는다.
+
+    한미프렉시블 20260424000057의 현금흐름표에는 매출채권 관련 행이 2,186,544,542로
+    있지만, 저장되는 매출채권은 재무상태표 잔액 9,871,514,894여야 한다(섹션별 alias
+    분리의 실증 — 사전을 하나로 합치면 이 테스트가 먼저 깨진다).
+    """
+    parsed = parse_xml_financials(_read_fixture("20260424000057"))
+    assert parsed.values_cur["trade_receivables"] == 9_871_514_894.0
+
+
+def test_detail_fields_do_not_disturb_standard_fields_on_ifrs_attach_format():
+    """IFRS 첨부 서식에서 세부계정 채움이 표준 13항목 추출을 건드리지 않는다.
+
+    첨부 경로는 "이 표에서 표준 항목이 하나라도 매칭됐는가"로 표를 소비할지 정하는데,
+    세부계정을 먼저 채우면 캡션/각주 표까지 소비된 것으로 오판해 진짜 데이터 표를
+    놓친다. 표준 항목(회계 항등식 포함)이 그대로인지로 확인한다.
+    """
+    parsed = parse_xml_financials(_read_fixture("20260330001497"))
+    assert parsed.parse_status == "OK"
+    assert parsed.values_cur["total_assets"] == pytest.approx(
+        parsed.values_cur["total_liab"] + parsed.values_cur["total_equity"]
+    )
+    assert parsed.values_cur["cash_and_equivalents"] == 10_996_202_190.0
+
+
+def test_detail_values_are_never_negative_in_fixtures():
+    """다섯 항목은 실측상 항상 양수(또는 0)다 — 부호를 뒤집는 로직이 끼면 안 된다.
+
+    라벨에 "이익"/"손실"이 없어 `_apply_sign`이 항등이고 첨부 경로의 abs 정규화 대상
+    (cogs/sga)도 아니므로, 원문 부호가 그대로 나와야 한다.
+    """
+    for rcept_no in _DETAIL_FIXTURE_EXPECTED:
+        parsed = parse_xml_financials(_read_fixture(rcept_no))
+        for field in DETAIL_FINANCIAL_FIELDS:
+            for values in (parsed.values_cur, parsed.values_prv):
+                value = values.get(field)
+                assert value is None or value >= 0, (rcept_no, field, value)
 
 
 # ---------------------------------------------------------------------------

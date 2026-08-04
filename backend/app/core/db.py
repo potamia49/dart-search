@@ -99,6 +99,19 @@ _RESULTS_NEW_COLUMNS: dict[str, str] = {
     # 기본값을 주지 않아 기존 행은 NULL(=판정 불가)로 남는다 — 0(변동 없음)으로
     # 단정하지 않기 위함이다.
     "auditor_changed": "INTEGER",
+    # 세부계정 5항목 (2026-08-05, app/models/result.py 주석 참고) — CF 4항목과 동형인
+    # best-effort 컬럼. "컬럼 추가만, 소급 재파싱 없음" 관행대로 기존 행은 NULL로
+    # 남고 신규 Phase 2 실행분부터만 채워진다.
+    "cash_and_equivalents_cur": "INTEGER",
+    "cash_and_equivalents_prv": "INTEGER",
+    "trade_receivables_cur": "INTEGER",
+    "trade_receivables_prv": "INTEGER",
+    "interest_expense_cur": "INTEGER",
+    "interest_expense_prv": "INTEGER",
+    "depreciation_cur": "INTEGER",
+    "depreciation_prv": "INTEGER",
+    "amortization_cur": "INTEGER",
+    "amortization_prv": "INTEGER",
 }
 # financial_snapshots(2026-07-15 STEP7 신설)에도 §4-8 CF 4컬럼을 추가한다.
 # 이 테이블은 이미 실 데이터가 있어 create_all이 컬럼을 못 붙이므로 ALTER 필요.
@@ -119,6 +132,12 @@ _FINANCIAL_SNAPSHOTS_NEW_COLUMNS: dict[str, str] = {
     # 그 연도를 당기로 감사한 감사인 이름 (2026-07-26) — results.auditor_changed
     # 판정의 원천 데이터다(app/models/financial_snapshot.py 주석 참고).
     "auditor_name": "TEXT",
+    # 세부계정 5항목 (2026-08-05) — results의 *_cur/_prv와 동일한 취지(접미어 없음).
+    "cash_and_equivalents": "INTEGER",
+    "trade_receivables": "INTEGER",
+    "interest_expense": "INTEGER",
+    "depreciation": "INTEGER",
+    "amortization": "INTEGER",
 }
 
 

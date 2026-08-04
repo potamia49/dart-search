@@ -28,8 +28,12 @@ from app.parsers.base import (
     ACCOUNT_NAME_ALIASES,
     CF_ACCOUNT_NAME_ALIASES,
     CF_FINANCIAL_FIELDS,
+    CONTRA_ROW_SPECS,
+    DETAIL_ALIASES_BY_SECTION,
+    ContraRowSpec,
     ParsedFinancials,
     determine_parse_status,
+    is_contra_row_label,
     normalize_account_label,
     parse_won_amount,
 )
@@ -518,6 +522,126 @@ def _extract_attach_section(
         values_prv[field] = prv_val
 
 
+# ---------------------------------------------------------------------------
+# 세부계정 5항목 (best-effort, 2026-08-05 신설 — base.py DETAIL_FINANCIAL_FIELDS 참고)
+#
+# 표준 13항목/CF 4항목 추출 경로(`_extract_section`/`_extract_attach_section`)는 **전혀
+# 건드리지 않고**, 이미 소비하기로 결정된 같은 표를 한 번 더 훑는 별도 경로로 붙인다.
+# 두 서식(FINANCE / IFRS "(첨부)재무제표")의 표를 `(정규화라벨, 당기, 전기)` 한 가지
+# 모양으로 평탄화한 뒤 같은 채움 로직을 태우는 구조라, 서식이 늘어도 평탄화 함수만
+# 추가하면 된다.
+#
+# 부호는 **원문 그대로** 쓴다(_apply_sign/_apply_sign_ifrs를 태우지 않는다). 다섯 라벨
+# 어디에도 "이익"/"손실"이 없어 `_apply_sign`이 어차피 항등이고, 첨부 경로의 abs 정규화
+# 대상(cogs/sga)도 아니기 때문이다. 로컬 캐시 전수 실측에서도 다섯 항목 모두 음수 표기는
+# 0건이었다(양수 또는 0). 혹시 음수로 적은 원문이 나오면 그대로 음수로 저장해 검수에
+# 드러나게 둔다 — abs로 조용히 덮지 않는다.
+# ---------------------------------------------------------------------------
+
+
+def _finance_detail_rows(table: etree._Element) -> list[tuple[str, float | None, float | None]]:
+    """FINANCE 표를 (정규화라벨, 당기, 전기) 목록으로 평탄화."""
+    cur_span, prv_span = _period_spans(table)
+    rows: list[tuple[str, float | None, float | None]] = []
+    for _raw_label, norm_label, value_texts in _row_values(table):
+        cur = _first_amount(value_texts[:cur_span])
+        prv = _first_amount(value_texts[cur_span : cur_span + prv_span])
+        rows.append((norm_label, cur, prv))
+    return rows
+
+
+def _attach_detail_rows(table: etree._Element) -> list[tuple[str, float | None, float | None]]:
+    """"(첨부)재무제표" 표를 (정규화라벨, 당기, 전기) 목록으로 평탄화.
+
+    열 계획(주석 열 건너뛰기)은 표준 항목 경로와 **같은** `attach_period_plan`을 쓴다.
+    """
+    planned = attach_period_plan(table)
+    if planned is None:
+        return []
+    (cur_cols, prv_cols), data_rows = planned
+    rows: list[tuple[str, float | None, float | None]] = []
+    for tr in data_rows:
+        cells = list(tr)
+        if not cells:
+            continue
+        label = _text_of(cells[0])
+        if not label:
+            continue
+        cur = _first_amount([_text_of(cells[c]) for c in cur_cols if c < len(cells)])
+        prv = _first_amount([_text_of(cells[c]) for c in prv_cols if c < len(cells)])
+        rows.append((normalize_account_label(label), cur, prv))
+    return rows
+
+
+def _net_of_contra_rows(
+    rows: list[tuple[str, float | None, float | None]],
+    index: int,
+    spec: ContraRowSpec,
+    gross_cur: float | None,
+    gross_prv: float | None,
+) -> tuple[float | None, float | None]:
+    """총액 행 뒤에 이어지는 contra(차감) 행들을 빼서 **순액**을 만든다.
+
+    어떤 행을 그 계정의 contra로 볼지는 계정별 규칙(`base.CONTRA_ROW_SPECS`)이 정한다 —
+    매출채권은 대손충당금, 현금및현금성자산은 정부보조금이다. 판정 근거와 실측 수치는
+    `base.is_contra_row_label` / `CONTRA_ROW_SPECS` 주석 참고.
+
+    차감은 부호를 그대로 더하는 대신 **`- abs(값)`** 으로 한다. 로컬 캐시 실측상 두 계정의
+    contra 행은 전부 괄호 표기(음수)이거나 0이고 부호 없는 양수 크기로 적은 원문은 **0건**
+    이었지만, contra는 정의상 자산의 **차감** 항목이라 방향이 미리 정해져 있다 — 표기 관행이
+    다른 원문이 나중에 나와도 총액이 두 배로 부풀지 않도록 방향을 코드로 고정해 둔다(값
+    자체를 조용히 바꾸는 abs 정규화가 아니라, 차감 방향만 고정하는 것이다).
+
+    총액이 아예 없으면(None) 차감하지 않는다 — 차감액만으로 음수 잔액을 지어내지 않기
+    위해서다. 당기/전기는 각각 독립적으로 판단한다. 캐시 8,748건 전수 검증에서 이 규칙이
+    만든 순액이 음수가 된 사례는 두 계정 모두, 당기·전기 모두 0건이고, "매출채권 > 유동자산"
+    (총액 39건)과 "현금 > 유동자산"(총액 1건)이라는 불가능한 값이 **전부 0건**이 된다.
+
+    **알려진 한계(2026-08-05 dart-qa 2차 재검증, 캐시 전수 기준 실 피해 0건)**: 만약 어떤
+    원문이 contra 행의 당기/전기 칸을 비우고 "합계" 칸에만 순액을 적는 서식이면, 총액에서
+    그 순액을 다시 빼는 이중 차감이 될 수 있다 — 이 함수는 그 경우를 별도로 방어하지
+    않는다(값이 뒤집혀도 `parse_status`는 그대로 OK). 지금 캐시에는 그런 서식이 없어(적용된
+    contra 값 전수가 음수 또는 0뿐이고 채택 셀은 전부 상세 열) 실제로 발생하지 않는다.
+    """
+    if gross_cur is None and gross_prv is None:
+        return gross_cur, gross_prv
+    net_cur, net_prv = gross_cur, gross_prv
+    for offset, j in enumerate(range(index + 1, len(rows))):
+        norm, contra_cur, contra_prv = rows[j]
+        if not is_contra_row_label(norm, spec, adjacent=offset == 0):
+            break
+        if net_cur is not None and contra_cur is not None:
+            net_cur -= abs(contra_cur)
+        if net_prv is not None and contra_prv is not None:
+            net_prv -= abs(contra_prv)
+    return net_cur, net_prv
+
+
+def _fill_detail_fields(
+    rows: list[tuple[str, float | None, float | None]],
+    values_cur: dict,
+    values_prv: dict,
+    aliases: dict[str, str],
+) -> None:
+    """평탄화된 행 목록에서 세부계정 필드를 채운다(첫 매칭 우선, best-effort).
+
+    `aliases`는 **재무제표 섹션 전용** 사전이어야 한다(`DETAIL_ALIASES_BY_SECTION`) —
+    "매출채권"/"이자비용"/"감가상각비"는 재무제표마다 뜻이 다르므로 사전을 섞으면
+    현금흐름표의 운전자본 증감액이 재무상태표 잔액 자리에 들어간다.
+    """
+    for index, (norm_label, cur, prv) in enumerate(rows):
+        field = aliases.get(norm_label)
+        if field is None or values_cur.get(field) is not None:
+            continue  # 미매핑이거나 이미 값이 채워진 필드(첫 매칭 우선)
+        contra_spec = CONTRA_ROW_SPECS.get(field)
+        if contra_spec is not None:
+            cur, prv = _net_of_contra_rows(rows, index, contra_spec, cur, prv)
+        if cur is None and prv is None:
+            continue  # 값 없는 헤더 행이 필드를 None으로 잠그지 않게 한다
+        values_cur[field] = cur
+        values_prv[field] = prv
+
+
 def walk_statement_tables(
     root: etree._Element,
     visit: Callable[[str, str, etree._Element], bool],
@@ -656,6 +780,7 @@ def parse_xml_financials(raw_xml: bytes) -> ParsedFinancials:
     def visit(fmt: str, sec: str, table: etree._Element) -> bool:
         """워커가 넘긴 표 1개를 추출한다(반환값=소비 여부, 워커 독스트링 참고)."""
         nonlocal found_any_table
+        detail_aliases = DETAIL_ALIASES_BY_SECTION.get(sec, {})
         if fmt == "finance":
             if sec in ("bs", "is"):
                 found_any_table = True
@@ -664,6 +789,11 @@ def parse_xml_financials(raw_xml: bytes) -> ParsedFinancials:
                 # 현금흐름표 4항목(best-effort). found_any_table에는 반영하지 않아
                 # parse_status 판정에 영향을 주지 않는다(§4-8 확정).
                 _extract_section(table, values_cur, values_prv, CF_ACCOUNT_NAME_ALIASES)
+            # 세부계정 5항목(best-effort). 표준 항목 추출을 마친 **뒤** 같은 표를 한 번
+            # 더 훑는다 — 위 경로의 동작과 parse_status 판정에는 영향이 없다.
+            _fill_detail_fields(
+                _finance_detail_rows(table), values_cur, values_prv, detail_aliases
+            )
             return True  # 구간당 첫 FINANCE 테이블만 사용
 
         attach_aliases = CF_ACCOUNT_NAME_ALIASES if sec == "cf" else ACCOUNT_NAME_ALIASES
@@ -671,7 +801,12 @@ def parse_xml_financials(raw_xml: bytes) -> ParsedFinancials:
         _extract_attach_section(table, values_cur, values_prv, attach_aliases)
         if len(values_cur) == before:
             # 캡션/기간/각주 표는 매칭이 0이라 소비하지 않고 대기 섹션을 유지한다.
+            # **세부계정 채움은 이 판정 뒤에만** 실행한다 — 먼저 채우면 values_cur가
+            # 늘어나 캡션/각주 표까지 "소비됨"으로 오판돼 진짜 데이터 표를 놓친다.
             return False
+        _fill_detail_fields(
+            _attach_detail_rows(table), values_cur, values_prv, detail_aliases
+        )
         # CF는 §4-8 규칙대로 found_any_table에 반영하지 않는다.
         if sec in ("bs", "is"):
             found_any_table = True
