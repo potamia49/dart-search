@@ -205,10 +205,17 @@ Job은 `phase` 컬럼(`CANDIDATES`/`FINANCIALS`)으로 2단계로 나뉜다 —
     사용자 확정 — dart-qa 2차 재검증에서 "스크립트만 부분적으로 최신"이라는 함정을
     지적해 즉시 반영). `scripts/reparse_local_cache.py`의 `_ALL_VALUE_FIELDS`/갱신
     루프와 `scripts/reparse_financial_snapshot_values.py`의 `_ALL_VALUE_FIELDS`에
-    `DETAIL_FINANCIAL_FIELDS`를 추가했다. **코드만 반영했고 실제 소급 재파싱은
-    아직 실행하지 않았다** — 이 저장소의 "컬럼 추가만, 소급 재파싱은 사용자가
-    승인할 때 별도 실행" 관행대로, 두 스크립트를 실제로 돌리는 것은 이후 사용자
-    승인 시점의 별도 작업이다.
+    `DETAIL_FINANCIAL_FIELDS`를 추가했다.
+  - **위 두 스크립트의 실제 소급 재파싱을 사용자 승인 하에 실행 완료**(2026-08-05).
+    개발 DB(`backend/dart_search.db`) 대상, 실행 전 `dart_search.db.bak_20260805_003318`로
+    백업. `--dry-run` 결과와 실제 실행 결과가 일치(대상 2,990건 중 2,792건 값 변경,
+    `parse_status` 전환 0건·`excluded_by_*` 재계산 0건 — 순수 값 백필). 반영 후 실측:
+    `results`(5,204행 중, `_cur` 기준) 현금 2,776 / 매출채권 2,297 / 이자비용 2,432 /
+    감가상각비 2,506 / 무형자산상각비 1,170건 채워짐. `financial_snapshots`(6,201행)는
+    현금 5,654 / 매출채권 4,765 / 이자비용 5,062 / 감가상각비 5,213 / 무형자산상각비
+    2,372건. best-effort 필드라 항목별 채움 비율이 다른 것은 정상(무형자산상각비가
+    가장 낮은 것도 기존 CF 4항목·영업외손익 반영 때와 같은 패턴). 재파싱 후 pytest
+    497 passed 무영향(테스트는 fixtures 기반이라 개발 DB 상태와 무관).
 - **연도별 감사인 추출 + "감사인 변동" tri-state 플래그**(`financial_snapshots.
   auditor_name` / `results.auditor_changed` 1/0/**NULL**, 2026-07-26)가
   백엔드·프론트 모두 구현 완료. 비교는 `_auditor_key()`(pipeline.py)로 표기
