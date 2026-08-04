@@ -35,7 +35,9 @@ STEP 5(파싱, M3)가 채워져 `parse_status`/재무 항목이 실제 값을 �
 
 from __future__ import annotations
 
+from collections import defaultdict
 from collections.abc import Sequence
+from functools import partial
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Response
@@ -56,8 +58,10 @@ from app.models.financial_snapshot import FinancialSnapshot
 from app.models.job import Job, JobPhase
 from app.models.result import ParseStatus, Result
 from app.reports.audit_proposal import (
+    PeerPool,
     ReportGenerationError,
     ReportInput,
+    build_peer_pool,
     generate_reports,
 )
 from app.parsers.account_detail import parse_account_detail
@@ -713,6 +717,56 @@ def _assert_ids_belong_to_job(
         )
 
 
+def _load_job_peer_pool(db: Session, job_id: int) -> PeerPool:
+    """보고서 비교군(peers/industryAverage/regionGroup)의 후보 풀을 **한 번에** 만든다.
+
+    후보는 "같은 Job에서 수집한 다른 회사들"이라 선택 건수와 무관하게 Job 전체를
+    봐야 한다 — 선택 회사마다 조회하면 수백 건 선택 시 그대로 N+1이 되므로,
+    **요청당 쿼리 2건**(결과 목록 + 그 Job의 스냅샷 전체)으로 끝낸다.
+
+    - 결과는 회사명/업종/의견만 있으면 되므로 필요한 5컬럼만 SELECT한다
+      (`ResultResponse` 63필드를 수천 행 적재하지 않기 위함).
+    - 휴면·폐업 추정(`excluded_by_stale_disclosure=1`)은 SQL에서 미리 뺀다.
+      `excluded_by_revenue`/`excluded_by_assets`는 **빼지 않는다**(정상 영업 회사라
+      비교군으로는 유효하다 — audit_proposal.py "비교군" 주석 참고).
+    - 스냅샷은 result_id별로 묶어 넘기기만 하고, 실을 연도 선별/비율 계산은
+      `build_peer_pool()`(순수 함수)이 한다.
+    """
+    rows = db.execute(
+        select(
+            Result.id,
+            Result.corp_name,
+            Result.induty_code,
+            Result.induty_name,
+            Result.audit_opinion,
+        ).where(
+            Result.job_id == job_id,
+            func.coalesce(Result.excluded_by_stale_disclosure, 0) != 1,
+        )
+    ).all()
+    if not rows:
+        return PeerPool()
+
+    snapshots_by_result: dict[int, list[FinancialSnapshot]] = defaultdict(list)
+    for snapshot in (
+        db.execute(
+            select(FinancialSnapshot)
+            .join(Result, FinancialSnapshot.result_id == Result.id)
+            .where(Result.job_id == job_id)
+            .order_by(FinancialSnapshot.result_id.asc(), FinancialSnapshot.fiscal_year.asc())
+        )
+        .scalars()
+        .all()
+    ):
+        snapshots_by_result[snapshot.result_id].append(snapshot)
+
+    return build_peer_pool(
+        ReportInput(result=row, snapshots=snapshots_by_result.get(row.id, ()))
+        for row in rows
+        if snapshots_by_result.get(row.id)
+    )
+
+
 @router.post("/{job_id}/generate-report", response_model=GenerateReportResponse)
 async def generate_selection_report(
     job_id: int,
@@ -746,6 +800,9 @@ async def generate_selection_report(
       사용자에게 보여야 한다.
     - 파일 저장 실패(권한/디스크 공간 등)는 500 스택트레이스 대신 사용자가 읽을 수
       있는 한국어 메시지와 함께 **507**로 응답한다.
+    - 동종업종/지역 비교군(`peers`/`industryAverage`/`regionGroup`, 2026-08-04)은
+      **같은 Job에서 이미 수집한 다른 회사들**로 채운다 — 외부 API 호출도 새 스키마도
+      없고, 후보 풀은 `_load_job_peer_pool()`이 요청당 한 번만 조회한다.
     """
     job = db.get(Job, job_id)
     if job is None:
@@ -770,9 +827,11 @@ async def generate_selection_report(
         ReportInput(result=row, snapshots=await get_result_history(job_id, row.id, db))
         for row in rows
     ]
+    # 비교군 후보 풀은 선택 회사가 아니라 **Job 전체**로 만든다(요청당 1회).
+    peer_pool = _load_job_peer_pool(db, job_id)
 
     try:
-        outcome = await run_in_threadpool(generate_reports, items)
+        outcome = await run_in_threadpool(partial(generate_reports, items, peer_pool=peer_pool))
     except ReportGenerationError as exc:
         raise HTTPException(status_code=507, detail=str(exc)) from exc
 

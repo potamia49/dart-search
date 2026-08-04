@@ -46,9 +46,13 @@ HTML/CSS/차트 렌더 로직은 **원칙적으로** 건드리지 않는다(템�
                   조회(`app/api/results.py::get_result_history`)를 재사용해 넘긴다.
                   여기서는 DB 쿼리를 하지 않는다.
   - `firm`     : `app/reports/firm_profile.py`의 `FIRM_PROFILE` 상수
-  - `peers`/`industryAverage`/`regionGroup`/`opinionSummary`: **현재 데이터 소스가
-    없어 빈 값**(`[]`/`null`/`[]`/`""`)으로 채운다. 나중에 소스가 생기면 이
-    모듈의 `build_report_payload()`만 고치면 된다.
+  - `peers`/`industryAverage`/`regionGroup`: **같은 Job에서 이미 수집한 다른
+    회사들**(`results` + 그 `financial_snapshots`)로 채운다(2026-08-04). 외부 API
+    호출도, 새 DB 스키마도 없다 — 호출부가 Job 전체를 **요청당 한 번만** 벌크
+    조회해 `PeerPool`로 만들어 넘기고(`build_peer_pool()`), 회사별 선별은 순수
+    함수(`select_peers()`/`select_region_group()`)가 한다. 자세한 규칙은 아래
+    "비교군" 섹션 주석 참고.
+  - `opinionSummary`: 자유 서술 문단이라 자동 생성 대상이 아니다 — 계속 `""`.
 
 **`financials`에는 "비율 계산에 필요한 항목이 모두 있는 연도"만 싣는다**
 (2026-08-03, dart-qa 리뷰 반영). 이유는 템플릿의 렌더 로직 자체에 있다:
@@ -75,7 +79,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -170,6 +174,70 @@ RATIO_DENOMINATOR_KEYS: frozenset[str] = frozenset(
 RATIO_POSITIVE_DENOMINATOR_KEYS: frozenset[str] = frozenset(
     {"매출액", "자산총계", "유동부채"}
 )
+
+# ---------------------------------------------------------------------------
+# 비교군(peers / industryAverage / regionGroup) 파라미터 — 2026-08-04
+# ---------------------------------------------------------------------------
+#
+# 비교군 후보는 **같은 Job에서 이미 수집한 다른 회사들**뿐이다(신규 API 호출 0건).
+# 회사 1건이 비교군에 실을 수 있는 재무값은 그 회사 자신의 `select_financial_rows()`
+# 결과 중 **가장 최근 연도 1개**(= 대상 회사가 KPI/차트에 쓰는 것과 같은 "최근 연도")다.
+
+# 업종 매칭에 쓰는 `results.induty_code` prefix 길이 — 소분류(3자리) 우선, 표본이
+# 모자라면 중분류(2자리)로 넓힌다. **더 넓히지 않는다**(대분류까지 가면 "동종업종"
+# 이라는 말이 무의미해진다 — CLAUDE.md의 세분류 prefix 매칭 누락 경험과 같은 맥락).
+INDUSTRY_PREFIX_LENGTHS: tuple[int, ...] = (3, 2)
+
+# 자기 자신을 제외하고 이만큼도 안 모이면 비교군을 **아예 싣지 않는다**(빈 값).
+# 1개사만 놓고 "동종업종 비교"라 부르면 대외 문서로서 오해를 준다.
+MIN_COMPARISON_SAMPLE = 2
+
+# 우편 발송용 3페이지 문서에 표/차트로 들어가므로 개수를 자른다. 자르는 기준은
+# **대상 회사와 매출액 차이(절대값)가 작은 순** — 규모가 비슷한 회사가 먼저 남는다.
+MAX_PEERS = 8
+MAX_REGION_GROUP = 16  # 대상 회사 1건 포함(= 다른 회사 최대 15건)
+
+# 재무데이터 신뢰성이 낮다고 보는 감사의견(2026-08-04, dart-qa 리뷰 M3, 사용자 확정).
+#
+# **`한정`은 일부러 넣지 않는다** — 실무상 흔한 의견이라 뺐다가는 표본만 크게 줄고,
+# 한정의견의 재무수치는 "특정 사유를 제외하고는 공정하게 표시"라 비교군으로 쓸 수 있다.
+# 반면 의견거절/부적정은 재무제표 전체의 신뢰성이 부정된 것이라 비교 대상이 못 된다
+# (템플릿 250-252행의 자체 규약과 같은 취지).
+#
+# 두 비교군에서 **적용 방식이 다르다** — 템플릿의 null 처리 수준이 다르기 때문이다:
+#   - `regionGroup`: 템플릿이 `regionGroup.filter(r=>r.매출총이익률!=null)`로 실제
+#     걸러내므로 `_region_row()`에서 금액/비율을 `None`으로 두면 순위 차트에서 빠지고
+#     표에는 "-"로 인쇄된다(= 회사는 목록에 남되 수치만 감춘다).
+#   - `peers`: 템플릿 `chartPeer` 렌더가 **null 체크 없이** `p.매출총이익률*100`을
+#     곱한다 — JS에서 `null*100`은 `0`이라 "0.0%"라는 **틀린 값이 조용히** 찍힌다
+#     (제외가 아니라 왜곡). 그래서 필드 null이 아니라 `select_peers()`에서 후보를
+#     통째로 뺀다(상한 절단보다 먼저 → `industryAverage` 가중평균에도 안 섞인다).
+UNRELIABLE_OPINIONS: frozenset[str] = frozenset({"의견거절", "부적정"})
+
+# 비교군 후보로 받아들일 비율의 절대값 상한(2026-08-04, dart-qa 리뷰 M2, 사용자 확정).
+#
+# 매출총이익률/영업이익률이 ±100%를 벗어난 회사는 **후보 풀 단계에서 통째로 뺀다**.
+# 파싱은 맞는데(실측 `근하하이테크산업`: 매출 155백만 / 매출원가 3,035백만,
+# `parse_status=OK`) 비율이 **-1857.9%** 라 지역 순위 차트(`renderHBarChart`)의 축이
+# 그 한 건에 맞춰 늘어나면서 **대상 회사 막대가 7px로 뭉개지고 나머지는 전부 100%
+# 동률처럼** 보였다. 정렬 기준(peers/regionGroup)마다 따로 거르지 않고 후보 풀에서
+# 한 번만 거르는 이유는 두 비교군에 같은 기준이 적용돼야 하기 때문이다.
+#
+# **대상 회사 자신에게는 적용하지 않는다** — 대상 회사는 있는 그대로 보고서에 실린다
+# (`build_peer_candidate()`는 풀을 거치지 않고 `build_report_payload()`가 직접 만든다).
+# 경계값(정확히 ±100%)은 포함한다.
+MAX_COMPARISON_ABS_RATIO = 1.0
+MAX_COMPARISON_ABS_RATIO_KEYS: tuple[str, ...] = ("매출총이익률", "영업이익률")
+
+# 감사의견을 확보하지 못한 회사가 지역 비교군 표에 실릴 때 쓰는 표기(2026-08-04, L5).
+# 템플릿이 `<span class="opinion-tag ${r.opinion}">${r.opinion}</span>`로 찍어 빈
+# 문자열이면 **빈 태그**만 남는다(실측 76개 대상 문서에 영향). 대상 회사에도 같은
+# 규칙을 적용한다 — 이 표의 셀 값만 보정하는 것이고 `company.opinion`은 무변경이다.
+UNKNOWN_OPINION_LABEL = "미상"
+
+# 비교군 PARTIAL 경고에 이름을 몇 개까지 나열할지(2026-08-04, L2). 나머지는 "외 N곳".
+# 경고 한 줄이 화면(모달)을 넘치게 만들면 정작 회사별 다른 경고가 묻힌다.
+MAX_WARNING_NAME_SAMPLES = 3
 
 # Windows 파일명에 쓸 수 없는 문자 + 제어문자.
 _INVALID_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
@@ -522,6 +590,410 @@ def select_financial_rows(snapshots: Sequence[Any]) -> FinancialSelection:
     return selection
 
 
+# ---------------------------------------------------------------------------
+# 비교군 (peers / industryAverage / regionGroup) — 2026-08-04
+# ---------------------------------------------------------------------------
+#
+# 소스는 **같은 Job의 다른 `results` 행**뿐이다. 후보가 되려면
+#
+#   1. `excluded_by_stale_disclosure != 1` — 휴면·폐업 추정 회사는 화면에서도 기본
+#      숨김이라 비교군으로 쓰면 "동종업계 평균"이 죽은 회사로 오염된다.
+#      (`excluded_by_revenue`/`excluded_by_assets`는 **제외하지 않는다** — 검색 조건인
+#      규모 범위를 벗어났을 뿐 정상 영업 중인 회사라 비교군으로는 오히려 유효하다.)
+#   2. `select_financial_rows()` 결과가 1개년 이상 — 대상 회사가 "쓸 수 있는 연도
+#      0건이면 생성 스킵"인 것과 **같은 판단 기준**을 후보에도 그대로 적용한다.
+#      결측/0·음수 분모 연도가 비교군 비율에 섞이면 NaN/부호 반전이 표에 인쇄된다.
+#   3. 매출총이익률·영업이익률이 **±100% 이내**(2026-08-04) — 파싱은 맞지만 비율이
+#      비현실적으로 극단적인 회사 한 건이 순위 차트의 축을 통째로 끌고 간다
+#      (`MAX_COMPARISON_ABS_RATIO` 주석의 실측 사례 참고).
+#
+# 를 만족해야 한다. 여기에 더해 **감사의견이 의견거절/부적정인 회사**는 비교 수치로
+# 쓰지 않는다 — 다만 적용 지점이 비교군마다 다르다(`UNRELIABLE_OPINIONS` 주석):
+# peers는 후보에서 통째로 빼고(`select_peers()`), regionGroup은 행은 남기되 금액/비율만
+# `None`으로 둔다(`_region_row()`). 한정의견은 제외 대상이 아니다.
+#
+# 비율 계산식은 템플릿 `calcRatios()`와 **반드시 동일**해야 한다 —
+# 같은 문서 안에서 대상 회사(템플릿이 계산)와 비교군(여기서 계산)의 수치가 다른 식으로
+# 나오면 순위 차트가 조용히 어긋난다.
+
+
+@dataclass(frozen=True)
+class PeerCandidate:
+    """비교군 후보 1건 = 회사 1곳의 **최근 연도** 요약(순수 값 객체).
+
+    `year`는 그 회사 자신의 최근 사용 가능 연도라 **대상 회사와 다를 수 있다**
+    (실측: peer 짝의 9.2%가 다르고 최대 4년 차) — 그래서 각주 문구에 기준 연도를
+    명시한다(`build_comparison_year_note()`).
+
+    `partial`은 그 연도 스냅샷이 `parse_status=PARTIAL`이었는지다(2026-08-04, L2).
+    대상 회사 자신의 PARTIAL 연도는 `collect_warnings()`가 경고로 남기는데 비교군
+    후보의 PARTIAL은 조용히 쓰이고 있었다 — `collect_comparison_warnings()`가 이
+    플래그로 회사당 한 줄 경고를 남긴다(후보를 빼지는 않는다. 검수 대상일 뿐
+    값 자체가 없는 것은 아니고, 빼면 표본이 더 줄어든다).
+    """
+
+    result_id: int | None
+    name: str
+    industry_code: str
+    industry_name: str
+    opinion: str
+    year: Any
+    revenue: float
+    gross_profit: float
+    ratios: dict[str, float]
+    partial: bool = False
+
+
+@dataclass(frozen=True)
+class PeerPool:
+    """한 Job 전체의 비교군 후보 목록.
+
+    **요청당 한 번만** 만든다(`app/api/results.py`가 Job 전체를 벌크 조회해 생성) —
+    선택 회사마다 후보를 다시 모으면 N+1 쿼리가 된다.
+    """
+
+    candidates: tuple[PeerCandidate, ...] = ()
+
+
+EMPTY_PEER_POOL = PeerPool()
+
+
+def compute_report_ratios(row: dict[str, Any]) -> dict[str, float] | None:
+    """템플릿 `calcRatios()`와 **같은 식**으로 비교군에 쓸 비율 4종을 계산한다.
+
+        매출총이익률 = 매출총이익 / 매출액
+        영업이익률   = 영업이익  / 매출액
+        부채비율     = 부채총계  / 자본총계
+        자기자본비율 = 자본총계  / 자산총계
+
+    분모 가드는 `select_financial_rows()`의 `RATIO_POSITIVE_DENOMINATOR_KEYS`와
+    **같은 비대칭 규칙**이다(2026-08-04, dart-qa 리뷰 L3에서 강화):
+
+      - `매출액`/`자산총계`: 결측·0 **및 음수**면 `None`. 분모가 음수면 비율의 부호가
+        통째로 뒤집혀 "매출액이 마이너스인데 수익성 A"가 나온다.
+      - `자본총계`: 결측·0이면 `None`이지만 **음수는 그대로 계산한다** — 완전자본잠식은
+        실재하는 정상 파싱 결과이고, 그 연도를 버리면 자본잠식 회사가 보고서 자체를
+        못 받는다(모듈 docstring 예외 ①~③의 방침).
+
+    이전 구현은 `not revenue or not equity or not assets`(truthy 검사)라 **음수가
+    그대로 통과**했다. 지금은 `select_financial_rows()`를 거친 행에만 쓰여 실 피해가
+    없었지만, 이 함수를 다른 경로에서 부르면 그대로 재발하는 유형이라(이 프로젝트가
+    자본잠식으로 세 번 겪은 바로 그 버그) 여기서도 명시적으로 막는다.
+    """
+    revenue = row.get("매출액")
+    equity = row.get("자본총계")
+    assets = row.get("자산총계")
+    values = (
+        revenue,
+        equity,
+        assets,
+        row.get("매출총이익"),
+        row.get("영업이익"),
+        row.get("부채총계"),
+    )
+    if any(v is None for v in values):
+        return None
+    if revenue <= 0 or assets <= 0 or equity == 0:
+        return None
+    return {
+        "매출총이익률": row["매출총이익"] / revenue,
+        "영업이익률": row["영업이익"] / revenue,
+        "부채비율": row["부채총계"] / equity,
+        "자기자본비율": equity / assets,
+    }
+
+
+def _is_stale_disclosure(result: Any) -> bool:
+    """휴면·폐업 추정(`excluded_by_stale_disclosure=1`) 여부. NULL/없음은 False."""
+    value = getattr(result, "excluded_by_stale_disclosure", None)
+    try:
+        return int(value or 0) == 1
+    except (TypeError, ValueError):
+        return False
+
+
+def is_unreliable_opinion(opinion: Any) -> bool:
+    """감사의견이 의견거절/부적정인가(= 비교 수치로 쓰지 않는다).
+
+    `한정`은 **포함하지 않는다**(`UNRELIABLE_OPINIONS` 주석 참고). 값 자체는
+    `app/parsers/audit_opinion.py`의 `AUDIT_OPINION_VALUES`로 정규화돼 저장되지만,
+    구 Job 행에 접미어("의견거절의견" 등)가 붙어 있을 수 있어 부분 문자열로 본다
+    (`부적정`은 `적정`의 부분 문자열이 아니므로 이 방식이 안전하다).
+    """
+    text = _text(opinion).strip()
+    if not text:
+        return False
+    return any(marker in text for marker in UNRELIABLE_OPINIONS)
+
+
+def has_extreme_ratios(ratios: dict[str, float]) -> bool:
+    """비율이 ±`MAX_COMPARISON_ABS_RATIO`(100%)를 **넘는가**(경계값은 정상으로 본다).
+
+    비교군 후보 자격 판정 전용이다 — 대상 회사에는 쓰지 않는다.
+    """
+    return any(
+        abs(ratios[key]) > MAX_COMPARISON_ABS_RATIO
+        for key in MAX_COMPARISON_ABS_RATIO_KEYS
+        if ratios.get(key) is not None
+    )
+
+
+def build_peer_candidate(result: Any, selection: FinancialSelection) -> PeerCandidate | None:
+    """결과 1건 + 그 회사의 연도 선별 결과 -> 비교군 후보(못 쓰면 `None`).
+
+    쓰는 연도는 **선별된 연도 중 가장 최근 1개**뿐이다 — 회사마다 최근 연도가 다를 수
+    있어(파싱 실패/결측 연도를 걸러낸 뒤라 더욱 그렇다) 대상 회사와 시점이 어긋날 수
+    있고, 그 사실은 각주(`build_comparison_year_note()`)로 문서에 남긴다.
+
+    그 연도가 PARTIAL 파싱이었으면 `partial=True`로 표시해 둔다 — 후보에서 빼지는
+    않고 경고(`collect_comparison_warnings()`)로만 알린다.
+    """
+    if not selection.rows:
+        return None
+    row = selection.rows[-1]
+    ratios = compute_report_ratios(row)
+    if ratios is None:
+        return None
+    return PeerCandidate(
+        result_id=getattr(result, "id", None),
+        name=_text(getattr(result, "corp_name", None)),
+        industry_code=_text(getattr(result, "induty_code", None)).strip(),
+        industry_name=_text(getattr(result, "induty_name", None)),
+        opinion=_text(getattr(result, "audit_opinion", None)),
+        year=row.get("year"),
+        revenue=row["매출액"],
+        gross_profit=row["매출총이익"],
+        ratios=ratios,
+        partial=str(row.get("year")) in set(selection.partial_years),
+    )
+
+
+def build_peer_pool(items: Iterable[ReportInput]) -> PeerPool:
+    """Job 전체(또는 임의의 후보 집합)를 비교군 후보 풀로 만든다.
+
+    호출부는 **선택된 회사가 아니라 Job 전체**를 넘겨야 한다 — 비교군은 사용자가
+    체크한 회사가 아니라 "그 Job에서 수집한 회사들"이기 때문이다.
+    """
+    candidates: list[PeerCandidate] = []
+    for item in items:
+        if _is_stale_disclosure(item.result):
+            continue
+        candidate = build_peer_candidate(item.result, select_financial_rows(item.snapshots))
+        if candidate is None:
+            continue
+        # 비율이 ±100%를 벗어난 후보는 peers/regionGroup **양쪽에서** 뺀다
+        # (`MAX_COMPARISON_ABS_RATIO` 주석 — 차트 축이 한 건에 끌려가는 문제).
+        if has_extreme_ratios(candidate.ratios):
+            continue
+        candidates.append(candidate)
+    return PeerPool(candidates=tuple(candidates))
+
+
+def _exclude_self(
+    candidates: Iterable[PeerCandidate], target: PeerCandidate
+) -> list[PeerCandidate]:
+    """대상 회사 자신을 후보에서 뺀다(id가 없는 스텁은 객체 동일성으로도 본다)."""
+    return [
+        c
+        for c in candidates
+        if c is not target
+        and not (target.result_id is not None and c.result_id == target.result_id)
+    ]
+
+
+def _closest_by_revenue(
+    candidates: Sequence[PeerCandidate], revenue: float, limit: int
+) -> list[PeerCandidate]:
+    """대상 회사와 매출 규모가 가까운 순으로 `limit`건만 남긴다(동률은 id 오름차순)."""
+    ordered = sorted(
+        candidates,
+        key=lambda c: (abs(c.revenue - revenue), c.result_id if c.result_id is not None else 0),
+    )
+    return ordered[: max(limit, 0)]
+
+
+def select_peers(pool: PeerPool, target: PeerCandidate) -> list[PeerCandidate]:
+    """동종업종 비교사 — `induty_code` prefix 매칭(소분류 → 중분류 폴백).
+
+    소분류(앞 3자리)로 자기 자신을 뺀 매칭이 `MIN_COMPARISON_SAMPLE`건 미만이면
+    중분류(앞 2자리)로 한 번 넓히고, 그래도 모자라면 **빈 목록**을 준다(에러가 아니라
+    정상 케이스다 — 템플릿이 "동종업종 비교사 데이터 없음"으로 렌더한다).
+
+    **의견거절/부적정 회사는 여기서 통째로 뺀다** — regionGroup처럼 값을 null로 두는
+    방식이 peers에서는 통하지 않는다(`UNRELIABLE_OPINIONS` 주석 참고: 템플릿이
+    `null*100 == 0`을 "0.0%"로 인쇄한다). 상한 절단(`_closest_by_revenue`)보다 먼저
+    걸러야 `build_industry_average()`의 가중평균에도 섞이지 않고, 최소 표본(2건) 판정도
+    "쓸 수 있는 후보" 기준으로 이뤄진다(부족하면 중분류 폴백이 정상 작동).
+
+    **[알려진 제약, 2026-08-04 L4] `induty_code` 자릿수가 회사마다 2~5자리로 제각각이라
+    이 prefix 매칭은 비대칭이다** — 2자리 회사는 소분류 매칭을 건너뛰고 곧장 중분류
+    전체와 매칭되고(A는 B를 동종으로 보는데 B는 A를 안 보는 경우가 생긴다), 그래서
+    "동종업종"의 해상도가 회사마다 다르다. CLAUDE.md의 "세분류 prefix 조용한 누락"과
+    같은 성질의 구조적 제약이라 별도 업종 트리 재설계 없이는 해소되지 않는다 —
+    자릿수를 임의로 맞추거나 대분류까지 넓히는 식으로 "고치지 말 것"(표본만 늘고
+    동종업종이라는 말이 무의미해진다).
+    """
+    code = target.industry_code
+    if not code:
+        return []
+    others = [
+        c for c in _exclude_self(pool.candidates, target) if not is_unreliable_opinion(c.opinion)
+    ]
+    for length in INDUSTRY_PREFIX_LENGTHS:
+        if len(code) < length:
+            continue
+        prefix = code[:length]
+        matched = [c for c in others if c.industry_code.startswith(prefix)]
+        if len(matched) >= MIN_COMPARISON_SAMPLE:
+            return _closest_by_revenue(matched, target.revenue, MAX_PEERS)
+    return []
+
+
+def build_peer_rows(peers: Sequence[PeerCandidate]) -> list[dict[str, Any]]:
+    """템플릿 `peers[]` 형태로 변환(회사명은 DART 공시 기반 공개 정보라 실명 그대로)."""
+    return [
+        {
+            "name": peer.name,
+            "매출액": peer.revenue,
+            "매출총이익률": peer.ratios["매출총이익률"],
+            "영업이익률": peer.ratios["영업이익률"],
+            "부채비율": peer.ratios["부채비율"],
+            "자기자본비율": peer.ratios["자기자본비율"],
+        }
+        for peer in peers
+    ]
+
+
+def build_comparison_year_note(
+    peers: Sequence[PeerCandidate], target: PeerCandidate
+) -> str:
+    """peers 각주에 붙일 **기준 연도** 문구(2026-08-04, dart-qa 리뷰 L1).
+
+    비교군 후보의 재무값은 각 회사 자신의 "쓸 수 있는 최근 연도" 1개인데, 파싱 실패/
+    결측 연도를 걸러낸 뒤라 회사마다 연도가 다를 수 있다 — 실측으로 peer 짝의 9.2%가
+    대상 회사와 다른 회계연도였고 최대 4년까지 벌어졌다. 각주에 아무 표기가 없으면
+    독자가 **같은 시점의 비교**로 읽는다.
+
+    문구는 **템플릿을 고치지 않고** `industryAverage.설명`에 실어 보낸다 — 템플릿
+    733행(`peerFootnote`)이 백엔드가 준 `설명` 문자열을 그대로 이어 붙여 찍기 때문이다
+    (peer 이름 자체에 연도를 붙이면 차트 축 라벨까지 길어져 3페이지 문서가 깨진다).
+    regionGroup 표에는 연도 컬럼이 없고 템플릿을 고쳐야만 넣을 수 있어 손대지 않았다.
+    """
+    labels = sorted({str(peer.year) for peer in peers if peer.year not in (None, "")})
+    target_label = "" if target.year in (None, "") else str(target.year)
+    if not labels:
+        return "각 사 최근 결산연도 기준"
+    span = labels[0] if len(labels) == 1 else f"{labels[0]}~{labels[-1]}"
+    if target_label and set(labels) == {target_label}:
+        return f"{target_label}년 기준"
+    if not target_label:
+        return f"비교사 최근 결산연도 {span}년 기준"
+    return f"각 사 최근 결산연도 기준 · 대상 {target_label}년 / 비교사 {span}년"
+
+
+def build_industry_average(
+    peers: Sequence[PeerCandidate], target: PeerCandidate
+) -> dict[str, Any] | None:
+    """`peers` **만으로** 계산한 업종 평균 매출총이익률(대상 회사는 제외).
+
+    비율끼리 단순 평균하지 않고 **매출액가중평균**(= 매출총이익 합 / 매출액 합)으로
+    낸다 — 표본별 매출 규모 차이가 큰 비상장 외감법인 특성상 산술평균은 영세 회사
+    한 곳의 극단적 비율에 통째로 끌려간다.
+
+    이 값은 템플릿 `scoreProfitability()`의 가점/감점에도 쓰이므로, peers가 비면
+    반드시 `None`이어야 한다(0으로 두면 "업종 평균이 0%"라는 잘못된 기준이 된다).
+
+    `설명` 문구는 이 표본이 **업종 전체가 아니라 매출 규모가 비슷한 일부**임을 밝힌다
+    (2026-08-04, dart-qa 리뷰 M1). peers는 `MAX_PEERS`(8건) 절단을 이미 거친 뒤라
+    "동일 업종 8개사"라고만 쓰면 읽는 사람이 "그 업종에 8개사뿐"으로 오독한다.
+    뒤에는 **기준 연도**(`build_comparison_year_note()`, L1)를 괄호로 덧붙인다 —
+    회사마다 최근 연도가 달라 "동일 시점 비교"로 오독될 수 있기 때문이다.
+    **계산 로직(가중평균 값)은 무변경이고 문구만 바꿨다.**
+
+    `peers`가 비면 반드시 `None`이므로, 각주에 연도 표기가 필요한 경우
+    (=peers가 실린 경우)는 항상 이 `설명`을 거친다.
+    """
+    if not peers:
+        return None
+    revenue_sum = sum(peer.revenue for peer in peers)
+    if not revenue_sum:
+        return None
+    gross_sum = sum(peer.gross_profit for peer in peers)
+    label = target.industry_name.strip() if target.industry_name else ""
+    prefix = f"{label} 등 " if label else ""
+    year_note = build_comparison_year_note(peers, target)
+    description = (
+        f"{prefix}매출 규모가 유사한 동종업종 {len(peers)}개사 매출액가중평균({year_note})"
+    )
+    return {"매출총이익률": gross_sum / revenue_sum, "설명": description}
+
+
+def _region_row(candidate: PeerCandidate, *, is_target: bool) -> dict[str, Any]:
+    """지역 비교군 1행. 의견거절/부적정 회사는 **금액/비율만 `None`** 으로 둔다.
+
+    템플릿의 자체 규약이다(250-252행) — `regionGroup`은 렌더 시
+    `filter(r=>r.매출총이익률!=null)`로 순위 차트에서 빠지고, 표에는 `fmtM`/`pct`가
+    `null`을 `-`로 찍는다. 회사는 목록에 남되 신뢰할 수 없는 수치만 감추는 셈이다
+    (peers는 이 방식이 통하지 않아 후보에서 통째로 뺀다 — `select_peers()` 참고).
+
+    **대상 회사(`is_target`)에는 적용하지 않는다.** 대상 회사의 재무수치는 같은 문서의
+    KPI·추이 차트·등급에 이미 그대로 인쇄되므로, 지역 표에서만 "-"로 가리면 한 장 안에서
+    서술이 어긋나고(자본잠식 3건과 같은 유형의 모순) 순위 차트에서 대상 막대 강조가
+    통째로 사라진다. M2의 비율 상하한 필터가 "대상 회사에는 적용하지 않는다"와 같은
+    원칙이다 — 걸러내는 것은 **비교 상대**뿐이다.
+
+    **감사의견이 비어 있으면 `UNKNOWN_OPINION_LABEL`("미상")로 채운다**(2026-08-04, L5)
+    — 템플릿(751행)이 `<span class="opinion-tag ${r.opinion}">${r.opinion}</span>`로
+    찍기 때문에 빈 문자열이면 **아무 글자도 없는 빈 태그**가 표에 남아 "데이터 없음"인지
+    "의견 없음"인지 알 수 없다. 대상 회사(`is_target`)에도 같은 규칙을 적용한다 —
+    이 표에 들어가는 값만 보정하는 것이고, `build_company_payload()`가 만드는
+    `company.opinion`(문서 상단 회사 정보)은 **무변경**이다.
+    """
+    hide_values = not is_target and is_unreliable_opinion(candidate.opinion)
+    return {
+        "name": candidate.name,
+        "industry": candidate.industry_name,
+        "매출액": None if hide_values else candidate.revenue,
+        "매출총이익률": None if hide_values else candidate.ratios["매출총이익률"],
+        "opinion": _text(candidate.opinion).strip() or UNKNOWN_OPINION_LABEL,
+        "isTarget": is_target,
+    }
+
+
+def select_region_candidates(pool: PeerPool, target: PeerCandidate) -> list[PeerCandidate]:
+    """지역 비교군에 실을 **다른 회사들**(대상 회사 제외)을 고른다.
+
+    `select_region_group()`이 표 행으로 변환하기 전 단계이며, 경고 집계
+    (`collect_comparison_warnings()`)도 같은 목록을 봐야 하므로 함수로 분리해 뒀다 —
+    두 곳이 각자 고르면 "경고에는 있는데 표에는 없는 회사"가 생긴다.
+    """
+    others = _exclude_self(pool.candidates, target)
+    if len(others) < MIN_COMPARISON_SAMPLE:
+        return []
+    return _closest_by_revenue(others, target.revenue, MAX_REGION_GROUP - 1)
+
+
+def select_region_group(pool: PeerPool, target: PeerCandidate) -> list[dict[str, Any]]:
+    """지역 비교군 — 별도 시도/시군구 세분화 없이 **같은 Job 전체**를 후보 풀로 본다.
+
+    Job의 검색 조건 자체가 지역이라(§4-9) Job 전체가 곧 "같은 지역"이다. 대상 회사는
+    업종·규모와 무관하게 **항상 `isTarget: true`로 배열 첫머리**에 들어가고(템플릿이
+    순위 차트에서 이 항목을 강조 색으로 칠한다), 나머지는 매출 규모가 가까운 순이다.
+    다른 회사가 `MIN_COMPARISON_SAMPLE`건 미만이면 빈 목록을 준다.
+
+    표에 **회계연도 컬럼이 없다** — 후보마다 기준 연도가 다를 수 있지만(L1) 컬럼을
+    추가하려면 템플릿 `<thead>`와 행 렌더를 고쳐야 해 손대지 않았다. 연도 표기는
+    peers 각주에만 있다.
+    """
+    chosen = select_region_candidates(pool, target)
+    if not chosen:
+        return []
+    return [
+        _region_row(target, is_target=True),
+        *(_region_row(c, is_target=False) for c in chosen),
+    ]
+
+
 def build_company_payload(result: Any) -> dict[str, Any]:
     """`results` 1행을 템플릿 `company` 객체로 매핑."""
     return {
@@ -536,24 +1008,41 @@ def build_company_payload(result: Any) -> dict[str, Any]:
 
 
 def build_report_payload(
-    item: ReportInput, selection: FinancialSelection | None = None
+    item: ReportInput,
+    selection: FinancialSelection | None = None,
+    peer_pool: PeerPool | None = None,
 ) -> dict[str, Any]:
     """회사 1건의 `EMBEDDED_DATA` 전체를 만든다.
 
     `financials`에는 `select_financial_rows()`가 고른 **완전한 연도만** 실린다
     (모듈 docstring 참고). `selection`을 넘기지 않으면 여기서 계산한다.
 
-    `peers`/`industryAverage`/`regionGroup`/`opinionSummary`는 현재 데이터 소스가
-    없어 빈 값으로 둔다 — 템플릿이 빈 값을 "데이터 없음"으로 안전하게 렌더한다.
+    `peer_pool`(같은 Job 전체의 비교군 후보)을 넘기면 `peers`/`industryAverage`/
+    `regionGroup`을 채운다 — **넘기지 않으면 예전과 똑같이 빈 값**이다(풀을 여기서
+    새로 만들지 않는다. 선택 회사들만으로 만든 풀은 "같은 Job의 다른 회사"라는
+    비교군 정의와 다르기 때문). 표본이 모자라면 빈 값으로 남는 것도 정상이다.
+
+    `opinionSummary`는 자유 서술 문단이라 자동 생성 대상이 아니다(계속 `""`).
     """
     chosen = selection if selection is not None else select_financial_rows(item.snapshots)
+    pool = peer_pool if peer_pool is not None else EMPTY_PEER_POOL
+    target = build_peer_candidate(item.result, chosen)
+
+    peers: list[PeerCandidate] = []
+    industry_average: dict[str, Any] | None = None
+    region_group: list[dict[str, Any]] = []
+    if target is not None:
+        peers = select_peers(pool, target)
+        industry_average = build_industry_average(peers, target)
+        region_group = select_region_group(pool, target)
+
     return {
         "firm": dict(FIRM_PROFILE),
         "company": build_company_payload(item.result),
         "financials": chosen.rows,
-        "peers": [],
-        "industryAverage": None,
-        "regionGroup": [],
+        "peers": build_peer_rows(peers),
+        "industryAverage": industry_average,
+        "regionGroup": region_group,
         "opinionSummary": "",
     }
 
@@ -625,6 +1114,66 @@ def collect_warnings(item: ReportInput, selection: FinancialSelection) -> list[R
     if not _text(getattr(item.result, "corp_name", None)).strip():
         add("회사명이 비어 있어 파일명이 임시 이름으로 저장됐습니다.")
     return warnings
+
+
+def collect_comparison_warnings(
+    item: ReportInput,
+    selection: FinancialSelection,
+    peer_pool: PeerPool | None,
+) -> list[ReportWarning]:
+    """비교군에 **부분 파싱(PARTIAL) 연도**가 섞였음을 회사당 한 줄로 알린다(L2).
+
+    대상 회사 자신의 PARTIAL 연도는 `collect_warnings()`가 이미 경고로 남기는데,
+    비교군(peers/regionGroup) 후보의 PARTIAL 최근 연도는 그동안 조용히 쓰였다
+    (실측 8건). 검수 상태가 대외 문서 단계에서 끊기지 않아야 한다는 원칙
+    (CLAUDE.md)은 비교 수치에도 똑같이 적용된다.
+
+    **후보를 빼지는 않는다** — PARTIAL은 "값이 없다"가 아니라 "검수가 덜 됐다"이고,
+    빼면 가뜩이나 좁은 표본이 더 줄어든다. 대신 회사 이름을 몇 개만 보여 주고
+    나머지는 "외 N곳"으로 줄인다(`MAX_WARNING_NAME_SAMPLES`).
+
+    선별은 `build_report_payload()`와 **같은 순수 함수**(`select_peers()` /
+    `select_region_candidates()`)를 다시 호출해 얻는다 — 결과를 주고받으려면
+    공개 시그니처를 바꿔야 하는데, 두 호출 모두 DB/IO 없는 목록 필터라 그 대가가
+    구조 변경보다 싸다. 여기서 고른 목록은 실제로 문서에 실리는 목록과 동일하다.
+    """
+    if peer_pool is None or not selection.rows:
+        return []
+    target = build_peer_candidate(item.result, selection)
+    if target is None:
+        return []
+
+    partial_candidates: list[PeerCandidate] = []
+    seen: set[Any] = set()
+    for candidate in (
+        *select_peers(peer_pool, target),
+        *select_region_candidates(peer_pool, target),
+    ):
+        if not candidate.partial:
+            continue
+        key = candidate.result_id if candidate.result_id is not None else id(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        partial_candidates.append(candidate)
+
+    if not partial_candidates:
+        return []
+
+    names = [f"{c.name}({c.year}년)" for c in partial_candidates]
+    shown = ", ".join(names[:MAX_WARNING_NAME_SAMPLES])
+    rest = len(names) - MAX_WARNING_NAME_SAMPLES
+    suffix = f" 외 {rest}곳" if rest > 0 else ""
+    return [
+        ReportWarning(
+            result_id=getattr(item.result, "id", None),
+            corp_name=getattr(item.result, "corp_name", None),
+            message=(
+                f"비교군에 부분 파싱(PARTIAL) 연도 데이터가 포함된 회사가"
+                f" {len(names)}곳 있습니다: {shown}{suffix}"
+            ),
+        )
+    ]
 
 
 def collect_firm_profile_warnings() -> list[ReportWarning]:
@@ -768,11 +1317,14 @@ def generate_reports(
     base_dir: Path | None = None,
     template_text: str | None = None,
     today: date | None = None,
+    peer_pool: PeerPool | None = None,
 ) -> ReportGenerationOutcome:
     """선택된 회사들의 보고서 HTML + 발송처 엑셀을 새 폴더에 생성한다.
 
     - `base_dir`: 기본값은 `Settings.report_output_dir`(= `BACKEND_DIR/report`).
     - `template_text`: 기본값은 템플릿 파일에서 읽은 원문(테스트용 주입 지점).
+    - `peer_pool`: 같은 Job 전체로 만든 비교군 후보 풀(`build_peer_pool()`).
+      호출부가 **요청당 한 번만** 만들어 넘긴다 — 넘기지 않으면 비교군은 빈 값이다.
     - 반환값의 `warnings`는 "생성은 했지만 검수가 필요한 회사" + "생성하지 않은
       회사" 목록이다 — 한 회사 때문에 전체 요청을 실패시키지 않는다.
     - **쓸 수 있는 재무연도가 0건인 회사는 생성하지 않는다**(`skipped`). 템플릿이
@@ -806,7 +1358,11 @@ def generate_reports(
             )
             continue
 
-        payload = build_report_payload(item, selection)
+        # 비교군 경고는 **실제로 문서를 만드는 회사에 대해서만** 남긴다(생성하지 않은
+        # 회사에는 비교군 자체가 인쇄되지 않으므로 알릴 이유가 없다).
+        outcome.warnings.extend(collect_comparison_warnings(item, selection, peer_pool))
+
+        payload = build_report_payload(item, selection, peer_pool)
         html = render_report_html(template, payload)
         stem = sanitize_filename_stem(getattr(item.result, "corp_name", None))
         filename = unique_filename(stem, ".html", taken)

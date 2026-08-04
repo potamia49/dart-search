@@ -22,11 +22,12 @@ from types import SimpleNamespace
 import openpyxl
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app import main as app_main
+from app.api.results import _load_job_peer_pool
 from app.core.db import get_db
 from app.exporters.excel import FINANCIAL_SNAPSHOT_ACCOUNT_LABELS
 from app.models import Base
@@ -36,14 +37,32 @@ from app.models.result import ParseStatus, Result
 from app.reports import audit_proposal, firm_profile
 from app.reports.audit_proposal import (
     LABEL_FILENAME,
+    MAX_COMPARISON_ABS_RATIO,
+    MAX_PEERS,
+    MAX_REGION_GROUP,
+    MAX_WARNING_NAME_SAMPLES,
+    MIN_COMPARISON_SAMPLE,
+    UNKNOWN_OPINION_LABEL,
+    UNRELIABLE_OPINIONS,
     RATIO_REQUIRED_KEYS,
     SNAPSHOT_FIELD_TO_REPORT_KEY,
+    PeerPool,
     ReportGenerationError,
     ReportInput,
     allocate_output_dir,
+    build_company_payload,
+    build_comparison_year_note,
     build_financial_rows,
+    build_industry_average,
+    build_peer_candidate,
+    build_peer_pool,
+    build_peer_rows,
     build_report_payload,
+    collect_comparison_warnings,
     collect_warnings,
+    compute_report_ratios,
+    select_peers,
+    select_region_group,
     excel_safe_text,
     find_embedded_data_block,
     generate_reports,
@@ -385,19 +404,27 @@ def test_allocate_output_dir_never_overwrites(tmp_path):
 
 
 def _result_stub(
-    result_id: int, name: str, address: str, parse_status: str = ParseStatus.OK
+    result_id: int,
+    name: str,
+    address: str,
+    parse_status: str = ParseStatus.OK,
+    **overrides,
 ) -> SimpleNamespace:
-    return SimpleNamespace(
-        id=result_id,
-        corp_name=name,
-        induty_name="금속가공제품 제조업",
-        address=address,
-        ceo_name="홍길동",
-        fiscal_date="20251231",
-        audit_opinion="적정",
-        auditor_name="안경회계법인",
-        parse_status=parse_status,
-    )
+    fields = {
+        "id": result_id,
+        "corp_name": name,
+        "induty_code": "25110",
+        "induty_name": "금속가공제품 제조업",
+        "address": address,
+        "ceo_name": "홍길동",
+        "fiscal_date": "20251231",
+        "audit_opinion": "적정",
+        "auditor_name": "안경회계법인",
+        "parse_status": parse_status,
+        "excluded_by_stale_disclosure": 0,
+    }
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
 
 
 def _snapshot_stub(year: str, revenue: int | None = 100, **overrides) -> SimpleNamespace:
@@ -678,12 +705,15 @@ for(const file of fs.readdirSync(dir).filter(f => f.endsWith('.html'))){
       return out;
     };
     const charts = {};
-    for(const id of ['chartStability', 'chartStructure', 'chartRevenue']){
+    for(const id of ['chartStability', 'chartStructure', 'chartRevenue',
+                     'chartPeer', 'chartRegionRank']){
       const el = els.get(id);
       charts[id] = el ? { nodes: collect(el, []), html: el._html } : null;
     }
     const kpi = (els.get('kpiRow') || {})._html || '';
-    result[file] = { grades, risks, kpi, charts };
+    const footnote = (els.get('peerFootnote') || {})._text || '';
+    const regionTable = (els.get('#regionTable tbody') || {})._html || '';
+    result[file] = { grades, risks, kpi, charts, footnote, regionTable };
     if(Object.keys(result).length === fs.readdirSync(dir).filter(f => f.endsWith('.html')).length){
       console.log(JSON.stringify(result));
     }
@@ -1060,6 +1090,810 @@ def test_rendered_report_does_not_invert_profitability_on_negative_revenue(
 
 
 # ---------------------------------------------------------------------------
+# 비교군 (peers / industryAverage / regionGroup) — 2026-08-04
+# ---------------------------------------------------------------------------
+#
+# 소스는 **같은 Job의 다른 results 행**뿐이다(신규 API 호출 0건). 아래 테스트는
+#   ① 업종 매칭(소분류 → 중분류 폴백 → 표본 부족 시 빈 값),
+#   ② 매출액가중평균(비율끼리 산술평균이 아니다),
+#   ③ 대상 회사가 regionGroup에 isTarget으로 들어가는지,
+#   ④ 휴면·폐업 추정/재무이력 없는 회사가 후보에서 빠지는지,
+#   ⑤ 개수 상한(8 / 대상 포함 16),
+#   ⑥ 비율 계산식이 템플릿 `calcRatios()`와 같은지(드리프트 가드)
+# 를 잠근다.
+
+
+def _peer_item(
+    result_id: int,
+    name: str,
+    induty_code: str,
+    revenue: int,
+    *,
+    gross_profit: int = 40,
+    years: tuple[str, ...] = ("2023", "2024"),
+    snapshots: list | None = None,
+    **result_overrides,
+) -> ReportInput:
+    """비교군 후보 1건(결과 + 최근 연도까지의 스냅샷)을 만든다."""
+    if snapshots is None:
+        snapshots = [
+            _snapshot_stub(year, revenue=revenue, gross_profit=gross_profit) for year in years
+        ]
+    return ReportInput(
+        result=_result_stub(
+            result_id, name, f"경남 김해시 {result_id}", induty_code=induty_code,
+            **result_overrides,
+        ),
+        snapshots=snapshots,
+    )
+
+
+def _pool_and_target(items: list[ReportInput], target_index: int = 0):
+    """`items` 전체로 풀을 만들고, 그 중 한 건을 대상 회사 후보로 돌려준다."""
+    pool = build_peer_pool(items)
+    target_item = items[target_index]
+    target = build_peer_candidate(
+        target_item.result, select_financial_rows(target_item.snapshots)
+    )
+    assert target is not None
+    return pool, target
+
+
+def test_compute_report_ratios_matches_template_formula(template_text):
+    """[드리프트 가드] 비교군 비율식이 템플릿 `calcRatios()`와 글자 그대로 같아야 한다.
+
+    대상 회사의 수치는 템플릿이, 비교군의 수치는 백엔드가 계산하므로 식이 갈리면
+    **같은 표 안에서 기준이 다른 숫자**가 나란히 인쇄된다.
+    """
+    body = _extract_js_function_body(template_text, "calcRatios")
+    formulas = {
+        "매출총이익률": ("매출총이익", "매출액"),
+        "영업이익률": ("영업이익", "매출액"),
+        "부채비율": ("부채총계", "자본총계"),
+        "자기자본비율": ("자본총계", "자산총계"),
+    }
+    for name, (numerator, denominator) in formulas.items():
+        assert f"{name}: f.{numerator}/f.{denominator}" in body, f"{name} 식이 템플릿과 다릅니다"
+
+    row = {"매출액": 1000, "매출총이익": 250, "영업이익": 100, "부채총계": 300,
+           "자본총계": 500, "자산총계": 800}
+    assert compute_report_ratios(row) == {
+        "매출총이익률": 0.25,
+        "영업이익률": 0.1,
+        "부채비율": 0.6,
+        "자기자본비율": 0.625,
+    }
+    # 분모가 0이거나 결측이면 계산하지 않는다(ZeroDivisionError로 500이 되면 안 된다).
+    assert compute_report_ratios(dict(row, 매출액=0)) is None
+    assert compute_report_ratios(dict(row, 자본총계=None)) is None
+
+
+def test_select_peers_prefers_minor_industry_prefix():
+    """소분류(앞 3자리)로 표본이 충분하면 중분류로 넓히지 않는다."""
+    items = [
+        _peer_item(1, "㈜대상", "25110", 1000),
+        _peer_item(2, "㈜같은소분류A", "25119", 1100),
+        _peer_item(3, "㈜같은소분류B", "25120", 900),
+        _peer_item(4, "㈜같은중분류", "25900", 1000),  # 251이 아니라 259 → 제외돼야 한다
+        _peer_item(5, "㈜다른업종", "31000", 1000),
+    ]
+    pool, target = _pool_and_target(items)
+
+    peers = select_peers(pool, target)
+    assert [p.name for p in peers] == ["㈜같은소분류A", "㈜같은소분류B"]
+    # 대상 회사 자신은 절대 비교군에 들어가지 않는다.
+    assert target.result_id not in [p.result_id for p in peers]
+
+
+def test_select_peers_falls_back_to_major_industry_prefix():
+    """소분류 매칭이 최소 표본(2건) 미만이면 중분류(앞 2자리)로 한 번 넓힌다."""
+    items = [
+        _peer_item(1, "㈜대상", "25110", 1000),
+        _peer_item(2, "㈜같은소분류", "25130", 1000),  # 251 매칭 1건뿐 → 부족
+        _peer_item(3, "㈜같은중분류A", "25900", 1000),
+        _peer_item(4, "㈜같은중분류B", "25200", 1000),
+        _peer_item(5, "㈜다른업종", "31000", 1000),
+    ]
+    pool, target = _pool_and_target(items)
+
+    peers = select_peers(pool, target)
+    assert MIN_COMPARISON_SAMPLE == 2
+    # 폴백하면 소분류 매칭 건도 함께 포함된다(중분류가 상위 집합이므로).
+    assert sorted(p.name for p in peers) == ["㈜같은소분류", "㈜같은중분류A", "㈜같은중분류B"]
+    assert "㈜다른업종" not in [p.name for p in peers]
+
+
+def test_select_peers_returns_empty_when_both_prefixes_are_short_of_sample():
+    """소분류·중분류 모두 표본이 모자라면 빈 값 — 에러가 아니라 정상 케이스다."""
+    items = [
+        _peer_item(1, "㈜대상", "25110", 1000),
+        _peer_item(2, "㈜다른업종A", "31000", 1000),
+        _peer_item(3, "㈜다른업종B", "46000", 1000),
+    ]
+    pool, target = _pool_and_target(items)
+
+    peers = select_peers(pool, target)
+    assert peers == []
+    assert build_industry_average(peers, target) is None
+    # 업종이 달라도 지역 비교군(같은 Job 전체)에는 남는다 — 두 축은 독립이다.
+    assert len(select_region_group(pool, target)) == 3
+
+    # 업종코드 자체가 비어 있으면(구 Job 등) 매칭을 시도하지 않는다.
+    blank = build_peer_candidate(
+        _result_stub(9, "㈜업종없음", "주소", induty_code=None),
+        select_financial_rows([_snapshot_stub("2024")]),
+    )
+    assert select_peers(pool, blank) == []
+
+
+def test_build_industry_average_is_revenue_weighted():
+    """비율끼리 산술평균이 아니라 원 금액을 합산해 나눈 매출액가중평균이어야 한다."""
+    items = [
+        _peer_item(1, "㈜대상", "25110", 500, gross_profit=100),
+        _peer_item(2, "㈜소형", "25110", 100, gross_profit=40),   # 40%
+        _peer_item(3, "㈜대형", "25110", 900, gross_profit=90),   # 10%
+    ]
+    pool, target = _pool_and_target(items)
+    peers = select_peers(pool, target)
+    average = build_industry_average(peers, target)
+
+    assert {p.name for p in peers} == {"㈜소형", "㈜대형"}
+    # 가중평균 = (40+90)/(100+900) = 0.13. 산술평균이었다면 0.25다.
+    assert average["매출총이익률"] == pytest.approx(0.13)
+    assert average["매출총이익률"] != pytest.approx(0.25)
+    # 대상 회사(100/500 = 20%)는 평균 계산에 들어가지 않는다.
+    assert average["매출총이익률"] == pytest.approx(130 / 1000)
+    assert "금속가공제품 제조업" in average["설명"]
+    assert "2개사" in average["설명"] and "매출액가중평균" in average["설명"]
+    # [M1] 이 표본은 매출 근접순 상한(MAX_PEERS) 절단 **후**의 일부다 — "그 업종에
+    # 2개사뿐"으로 읽히지 않게 규모 유사 표본임을 문구에 남긴다(계산값은 무변경).
+    assert "매출 규모가 유사한" in average["설명"]
+    assert "동일 업종" not in average["설명"]
+
+
+def test_region_group_includes_target_first_with_is_target_flag():
+    items = [
+        _peer_item(1, "㈜대상", "25110", 1000),
+        _peer_item(2, "㈜이웃A", "31000", 1010),
+        _peer_item(3, "㈜이웃B", "46000", 990),
+    ]
+    pool, target = _pool_and_target(items)
+
+    region = select_region_group(pool, target)
+    assert [r["name"] for r in region] == ["㈜대상", "㈜이웃A", "㈜이웃B"]
+    assert region[0]["isTarget"] is True
+    assert all(r["isTarget"] is False for r in region[1:])
+    assert set(region[0]) == {"name", "industry", "매출액", "매출총이익률", "opinion", "isTarget"}
+    assert region[0]["industry"] == "금속가공제품 제조업"
+    assert region[0]["opinion"] == "적정"
+    assert region[0]["매출총이익률"] == pytest.approx(40 / 1000)
+
+
+def test_region_group_is_empty_when_only_one_other_company():
+    items = [
+        _peer_item(1, "㈜대상", "25110", 1000),
+        _peer_item(2, "㈜유일한이웃", "25110", 1000),
+    ]
+    pool, target = _pool_and_target(items)
+
+    assert select_region_group(pool, target) == []
+    # peers도 같은 최소 표본 기준을 **독립적으로** 적용한다.
+    assert select_peers(pool, target) == []
+
+
+def test_peer_pool_excludes_stale_disclosure_and_companies_without_usable_years():
+    items = [
+        _peer_item(1, "㈜대상", "25110", 1000),
+        _peer_item(2, "㈜휴면추정", "25110", 1000, excluded_by_stale_disclosure=1),
+        _peer_item(3, "㈜이력없음", "25110", 1000, snapshots=[]),
+        _peer_item(4, "㈜매출결측", "25110", 1000, snapshots=[_snapshot_stub("2024", revenue=None)]),
+        _peer_item(5, "㈜정상이웃", "25110", 1000),
+        _peer_item(6, "㈜정상이웃2", "25110", 1000),
+        # 매출액/총자산 조건 제외 건은 **정상 영업 회사**라 후보로 남는다.
+        _peer_item(7, "㈜매출조건제외", "25110", 1000, excluded_by_revenue=1),
+    ]
+    pool, target = _pool_and_target(items)
+
+    names = {c.name for c in pool.candidates}
+    assert names == {"㈜대상", "㈜정상이웃", "㈜정상이웃2", "㈜매출조건제외"}
+    assert "㈜휴면추정" not in names
+    assert "㈜이력없음" not in names
+    assert "㈜매출결측" not in names
+    assert "㈜매출조건제외" in {p.name for p in select_peers(pool, target)}
+
+
+def test_unreliable_opinion_companies_are_excluded_from_peers(template_text):
+    """[M3] 의견거절/부적정 회사는 peers 후보에서 통째로 빠진다(한정은 남는다).
+
+    `regionGroup`처럼 값을 null로 두는 방식이 peers에서는 통하지 않기 때문이다 —
+    템플릿 `chartPeer` 렌더가 null 체크 없이 `p.매출총이익률*100`을 곱해 JS에서
+    `null*100 == 0`, 즉 "0.0%"라는 **틀린 값이 조용히** 인쇄된다(제외가 아니라 왜곡).
+    """
+    # [드리프트 가드] 템플릿이 여전히 null 체크 없이 곱하고 있음을 확인 — 만약 템플릿이
+    # null-safe해지면 이 회피책(후보 제외)을 재검토해야 한다.
+    assert "peers.map(p=>+(p.매출총이익률*100).toFixed(1))" in template_text
+    assert UNRELIABLE_OPINIONS == {"의견거절", "부적정"}
+
+    items = [
+        _peer_item(1, "㈜대상", "25110", 1000),
+        _peer_item(2, "㈜의견거절", "25110", 1010, audit_opinion="의견거절"),
+        _peer_item(3, "㈜부적정", "25110", 1020, audit_opinion="부적정"),
+        _peer_item(4, "㈜한정", "25110", 1030, audit_opinion="한정"),
+        _peer_item(5, "㈜적정", "25110", 1040),
+    ]
+    pool, target = _pool_and_target(items)
+
+    # 후보 풀에는 남는다(regionGroup이 "행은 남기고 값만 감추는" 방식이라 필요하다).
+    assert {c.name for c in pool.candidates} == {
+        "㈜대상", "㈜의견거절", "㈜부적정", "㈜한정", "㈜적정"
+    }
+
+    peers = select_peers(pool, target)
+    assert [p.name for p in peers] == ["㈜한정", "㈜적정"]
+
+    # 상한 절단보다 **먼저** 걸러지므로 업종평균 가중평균에도 섞이지 않는다.
+    average = build_industry_average(peers, target)
+    assert average["매출총이익률"] == pytest.approx((40 + 40) / (1030 + 1040))
+    assert "2개사" in average["설명"]
+
+
+def test_region_group_hides_values_of_unreliable_opinion_companies():
+    """[M3] regionGroup은 의견거절/부적정 회사의 **금액/비율만** null로 둔다.
+
+    템플릿 규약(250-252행)대로 순위 차트(`filter(r=>r.매출총이익률!=null)`)에서 빠지고
+    표에는 `fmtM`/`pct`가 "-"로 찍는다. 회사명·감사의견은 그대로 남는다.
+    """
+    items = [
+        _peer_item(1, "㈜대상", "25110", 1000),
+        _peer_item(2, "㈜의견거절", "25110", 1010, audit_opinion="의견거절"),
+        _peer_item(3, "㈜부적정", "25110", 1020, audit_opinion="부적정"),
+        _peer_item(4, "㈜한정", "25110", 1030, audit_opinion="한정"),
+    ]
+    pool, target = _pool_and_target(items)
+
+    region = {row["name"]: row for row in select_region_group(pool, target)}
+    assert set(region) == {"㈜대상", "㈜의견거절", "㈜부적정", "㈜한정"}
+    for name in ("㈜의견거절", "㈜부적정"):
+        assert region[name]["매출액"] is None
+        assert region[name]["매출총이익률"] is None
+        # 회사명/업종/감사의견은 표에 그대로 인쇄된다(수치만 감춘다).
+        assert region[name]["opinion"] in UNRELIABLE_OPINIONS
+        assert region[name]["industry"] == "금속가공제품 제조업"
+    # 한정의견은 실무상 흔한 의견이라 제외 대상이 아니다 — 정상 값으로 남는다.
+    assert region["㈜한정"]["매출액"] == 1030
+    assert region["㈜한정"]["매출총이익률"] == pytest.approx(40 / 1030)
+
+    # 대상 회사 자신은 의견거절이어도 감추지 않는다 — 같은 문서의 KPI/차트/등급이
+    # 이미 그 수치를 인쇄하므로 지역 표에서만 "-"로 가리면 서술이 어긋나고, 순위
+    # 차트에서 대상 막대 강조(targetIdx)까지 사라진다.
+    _, disclaimed_target = _pool_and_target(items, target_index=1)
+    own_row = select_region_group(pool, disclaimed_target)[0]
+    assert own_row["name"] == "㈜의견거절" and own_row["isTarget"] is True
+    assert own_row["매출액"] == 1010
+    assert own_row["매출총이익률"] == pytest.approx(40 / 1010)
+
+
+def test_extreme_ratio_candidates_are_excluded_from_comparison_pool():
+    """[M2] 비율이 ±100%를 벗어난 후보는 peers/regionGroup **양쪽에서** 빠진다.
+
+    실측 사례(`근하하이테크산업`: 매출 155백만 / 매출원가 3,035백만 → 매출총이익률
+    -1857.9%, `parse_status=OK`)가 지역 순위 차트의 축을 통째로 끌고 가 대상 회사
+    막대가 7px로 뭉개졌다. 경계값(정확히 ±100%)은 정상으로 본다.
+    """
+    assert MAX_COMPARISON_ABS_RATIO == 1.0
+    items = [
+        _peer_item(1, "㈜대상", "25110", 1000),
+        # 매출총이익률 -1857.9%(실측 재현) — 155 - 3035 = -2880
+        _peer_item(2, "㈜근하하이테크산업", "25110", 155, gross_profit=-2880),
+        # 영업이익률 -200%(영업이익만 극단) — 매출총이익률은 정상 범위다.
+        _peer_item(
+            3, "㈜영업이익극단", "25110", 1000,
+            snapshots=[_snapshot_stub("2024", revenue=1000, gross_profit=400,
+                                      operating_income=-2000)],
+        ),
+        # 경계값: 매출총이익률 정확히 +100% / 영업이익률 정확히 -100% → 포함한다.
+        _peer_item(
+            4, "㈜경계값", "25110", 1000,
+            snapshots=[_snapshot_stub("2024", revenue=1000, gross_profit=1000,
+                                      operating_income=-1000)],
+        ),
+        _peer_item(5, "㈜정상이웃", "25110", 1050),
+        _peer_item(6, "㈜정상이웃2", "25110", 1060),
+    ]
+    pool, target = _pool_and_target(items)
+
+    names = {c.name for c in pool.candidates}
+    assert "㈜근하하이테크산업" not in names
+    assert "㈜영업이익극단" not in names
+    assert names == {"㈜대상", "㈜경계값", "㈜정상이웃", "㈜정상이웃2"}
+
+    assert [p.name for p in select_peers(pool, target)] == [
+        "㈜경계값", "㈜정상이웃", "㈜정상이웃2"
+    ]
+    assert [r["name"] for r in select_region_group(pool, target)] == [
+        "㈜대상", "㈜경계값", "㈜정상이웃", "㈜정상이웃2"
+    ]
+
+    # **대상 회사 자신에게는 적용하지 않는다** — 비교 상대에서만 뺀다.
+    _, extreme_target = _pool_and_target(items, target_index=1)
+    assert extreme_target.ratios["매출총이익률"] == pytest.approx(-2880 / 155)
+    payload = build_report_payload(items[1], peer_pool=pool)
+    assert payload["regionGroup"][0]["name"] == "㈜근하하이테크산업"
+    assert payload["regionGroup"][0]["isTarget"] is True
+    assert payload["regionGroup"][0]["매출총이익률"] == pytest.approx(-2880 / 155)
+    # 비교 상대에는 여전히 극단값 후보가 없다(자기 자신도 풀에서 빠져 있다).
+    assert {p["name"] for p in payload["peers"]} == {
+        "㈜대상", "㈜경계값", "㈜정상이웃", "㈜정상이웃2"
+    }
+
+
+def test_peer_candidate_uses_latest_selected_year_only():
+    """후보의 재무값은 그 회사의 `select_financial_rows()` 결과 중 최근 연도 1개다."""
+    item = _peer_item(
+        1,
+        "㈜연도선별",
+        "25110",
+        0,
+        snapshots=[
+            _snapshot_stub("2022", revenue=100, gross_profit=10),
+            _snapshot_stub("2023", revenue=200, gross_profit=50),
+            # 최신 연도지만 파싱 실패라 선별에서 빠진다 → 2023이 최근 연도가 된다.
+            _snapshot_stub("2024", revenue=999, gross_profit=999, parse_status=ParseStatus.FAILED),
+        ],
+    )
+    candidate = build_peer_pool([item]).candidates[0]
+
+    assert candidate.year == 2023
+    assert candidate.revenue == 200
+    assert candidate.ratios["매출총이익률"] == pytest.approx(0.25)
+
+
+def test_comparison_groups_apply_size_caps_by_revenue_proximity():
+    """상한(peers 8 / regionGroup 대상 포함 16)과 "매출 규모가 가까운 순" 정렬."""
+    items = [_peer_item(1, "㈜대상", "25110", 1000)]
+    # 매출액 1100, 1200, ... 3900 (29개사) — 대상과 가까운 순서가 곧 id 순서다.
+    items += [_peer_item(i, f"㈜이웃{i:02d}", "25110", 1000 + 100 * (i - 1)) for i in range(2, 31)]
+    pool, target = _pool_and_target(items)
+
+    peers = select_peers(pool, target)
+    assert MAX_PEERS == 8
+    assert len(peers) == MAX_PEERS
+    assert [p.name for p in peers] == [f"㈜이웃{i:02d}" for i in range(2, 10)]
+
+    region = select_region_group(pool, target)
+    assert MAX_REGION_GROUP == 16
+    assert len(region) == MAX_REGION_GROUP
+    assert region[0]["name"] == "㈜대상"
+    assert [r["name"] for r in region[1:]] == [f"㈜이웃{i:02d}" for i in range(2, 17)]
+
+
+def test_build_report_payload_fills_comparison_groups_from_pool():
+    """`build_report_payload()`가 풀을 받으면 세 필드를 채우고, 안 받으면 빈 값이다."""
+    items = [
+        _peer_item(1, "㈜대상", "25110", 1000),
+        _peer_item(2, "㈜이웃A", "25110", 1100),
+        _peer_item(3, "㈜이웃B", "25110", 900),
+    ]
+    pool = build_peer_pool(items)
+
+    filled = build_report_payload(items[0], peer_pool=pool)
+    assert [p["name"] for p in filled["peers"]] == ["㈜이웃A", "㈜이웃B"]
+    assert set(filled["peers"][0]) == {
+        "name", "매출액", "매출총이익률", "영업이익률", "부채비율", "자기자본비율"
+    }
+    assert filled["industryAverage"]["매출총이익률"] == pytest.approx(80 / 2000)
+    assert [r["name"] for r in filled["regionGroup"]] == ["㈜대상", "㈜이웃A", "㈜이웃B"]
+    # 자유 서술 필드는 이번 범위가 아니다.
+    assert filled["opinionSummary"] == ""
+
+    # 풀을 넘기지 않으면 예전과 동일하게 빈 값(구 호출부 호환).
+    empty = build_report_payload(items[0])
+    assert empty["peers"] == []
+    assert empty["industryAverage"] is None
+    assert empty["regionGroup"] == []
+    assert build_report_payload(items[0], peer_pool=PeerPool())["regionGroup"] == []
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js가 없어 템플릿 렌더 검증 생략")
+def test_rendered_report_draws_comparison_charts(report_settings, tmp_path):
+    """비교군을 실제로 렌더해 순위 차트/각주/표가 제대로 그려지는지 확인한다.
+
+    템플릿은 손대지 않았으므로(peers 관련 JS는 이미 null-safe) 검증 대상은
+    "우리가 넣은 데이터가 템플릿 계약에 맞는가"다 — 비교군을 채운 뒤에도 렌더가
+    중단되지 않고, 대상 회사가 순위 차트에서 강조되는지를 본다.
+    """
+    pool_items = [
+        _peer_item(1, "㈜대상", "25110", 1000, gross_profit=200),
+        _peer_item(2, "㈜동종A", "25119", 1100, gross_profit=110),
+        _peer_item(3, "㈜동종B", "25120", 900, gross_profit=90),
+        _peer_item(4, "㈜타업종", "46000", 1000, gross_profit=500),
+    ]
+    outcome = generate_reports(
+        [pool_items[0]], peer_pool=build_peer_pool(pool_items), today=date(2026, 8, 4)
+    )
+    rendered = _render_reports_with_node(outcome.output_dir, tmp_path)["㈜대상.html"]
+
+    # 동종업종 그룹 막대: (대상 + 동종 2개사 + 업종평균) 4묶음, 영업이익률은 업종평균만 없다.
+    peer_rects = [n for n in _chart_nodes(rendered, "chartPeer") if n["tag"] == "rect"]
+    assert len(peer_rects) == 4 + 3
+    assert "㈜동종A, ㈜동종B" in rendered["footnote"]
+    assert "업종평균" in rendered["footnote"]
+
+    # 지역 순위 가로막대: 4개사 중 대상 회사 1건만 강조색(#b8892b)으로 칠해진다.
+    region_rects = [n for n in _chart_nodes(rendered, "chartRegionRank") if n["tag"] == "rect"]
+    assert len(region_rects) == 4
+    assert len([r for r in region_rects if r["attrs"]["fill"] == "#b8892b"]) == 1
+
+    # 표에도 4행이 들어가고 대상 회사 행에만 target 클래스가 붙는다.
+    assert rendered["regionTable"].count("<tr") == 4
+    assert rendered["regionTable"].count('class="target"') == 1
+
+
+def test_generate_reports_embeds_comparison_groups(report_settings):
+    """생성된 HTML의 EMBEDDED_DATA에 비교군이 실제로 실린다."""
+    pool_items = [
+        _peer_item(1, "㈜대상", "25110", 1000),
+        _peer_item(2, "㈜이웃A", "25110", 1100),
+        _peer_item(3, "㈜이웃B", "25110", 900),
+    ]
+    outcome = generate_reports(
+        [pool_items[0]], peer_pool=build_peer_pool(pool_items), today=date(2026, 8, 4)
+    )
+    data = _extract_embedded_json(
+        (outcome.output_dir / "㈜대상.html").read_text(encoding="utf-8")
+    )
+
+    assert [p["name"] for p in data["peers"]] == ["㈜이웃A", "㈜이웃B"]
+    assert data["industryAverage"] is not None
+    assert [r["name"] for r in data["regionGroup"]] == ["㈜대상", "㈜이웃A", "㈜이웃B"]
+
+
+# ---------------------------------------------------------------------------
+# [L1~L5] 비교군 후속 보완 (2026-08-04, dart-qa 1차 리뷰 잔여 지적)
+# ---------------------------------------------------------------------------
+#
+#   L1 비교 연도가 회사마다 달라도 문서에 표기가 없었다 → peers 각주에 기준 연도
+#   L2 비교군 후보의 PARTIAL 연도가 조용히 쓰였다 → 회사당 한 줄 경고
+#   L3 `compute_report_ratios()` 분모 가드가 음수를 통과시켰다 → 명시적 가드
+#   L5 감사의견이 없으면 지역 표에 빈 태그가 찍혔다 → "미상"
+#
+# (L4 업종코드 자릿수 비대칭은 구조적 제약이라 문서화만 하고 로직은 그대로 뒀다.)
+
+
+def test_industry_average_description_states_reference_years(template_text):
+    """[L1] 각주 문구에 기준 연도가 들어간다 — 템플릿은 손대지 않는다.
+
+    비교군 후보의 재무값은 각 회사 자신의 "쓸 수 있는 최근 연도"라 대상 회사와 시점이
+    다를 수 있다(실측 9.2%). 템플릿 `peerFootnote`가 백엔드가 만든
+    `industryAverage.설명`을 그대로 이어 붙여 찍으므로 문자열 조립만으로 해결된다.
+    """
+    # [드리프트 가드] 템플릿이 여전히 `설명`을 각주에 그대로 찍고 있어야 한다.
+    assert "peerFootnote" in template_text
+    assert "industryAverage.설명" in template_text
+
+    mixed = [
+        _peer_item(1, "㈜대상", "25110", 1000, years=("2023", "2024")),
+        _peer_item(2, "㈜동종A", "25110", 1100, years=("2021", "2022")),
+        _peer_item(3, "㈜동종B", "25110", 900, years=("2020",)),
+    ]
+    pool, target = _pool_and_target(mixed)
+    peers = select_peers(pool, target)
+    description = build_industry_average(peers, target)["설명"]
+
+    assert build_comparison_year_note(peers, target) in description
+    assert "대상 2024년" in description
+    assert "비교사 2020~2022년" in description
+    # 기존 M1 문구(표본 성격 안내)는 그대로 유지된다.
+    assert "매출 규모가 유사한" in description and "2개사" in description
+
+    # 연도가 전부 같으면 굳이 대상/비교사를 나눠 쓰지 않는다(각주가 길어지지 않게).
+    same = [
+        _peer_item(1, "㈜대상", "25110", 1000, years=("2024",)),
+        _peer_item(2, "㈜동종A", "25110", 1100, years=("2024",)),
+        _peer_item(3, "㈜동종B", "25110", 900, years=("2024",)),
+    ]
+    same_pool, same_target = _pool_and_target(same)
+    same_description = build_industry_average(
+        select_peers(same_pool, same_target), same_target
+    )["설명"]
+    assert same_description.endswith("(2024년 기준)")
+    assert "대상" not in same_description
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js가 없어 템플릿 렌더 검증 생략")
+def test_rendered_peer_footnote_and_region_table_carry_year_and_opinion(
+    report_settings, tmp_path
+):
+    """[L1/L5] 실제 렌더 결과에서 각주의 기준 연도와 표의 "미상" 표기를 확인한다."""
+    pool_items = [
+        _peer_item(1, "㈜대상", "25110", 1000, gross_profit=200, years=("2023", "2024")),
+        _peer_item(2, "㈜동종A", "25119", 1100, gross_profit=110, years=("2021",)),
+        _peer_item(
+            3, "㈜의견없음", "25120", 900, gross_profit=90, years=("2022",),
+            audit_opinion=None,
+        ),
+    ]
+    outcome = generate_reports(
+        [pool_items[0]], peer_pool=build_peer_pool(pool_items), today=date(2026, 8, 4)
+    )
+    rendered = _render_reports_with_node(outcome.output_dir, tmp_path)["㈜대상.html"]
+
+    assert "대상 2024년" in rendered["footnote"]
+    assert "비교사 2021~2022년" in rendered["footnote"]
+
+    # 감사의견이 없는 회사도 표에 "미상"으로 찍힌다 — 빈 태그(`opinion-tag "></span>`)가
+    # 남으면 데이터 없음인지 의견 없음인지 문서만 봐서는 알 수 없다.
+    assert ">미상<" in rendered["regionTable"]
+    assert 'class="opinion-tag "></span>' not in rendered["regionTable"]
+
+
+# ---------------------------------------------------------------------------
+# [F1] 감사의견 태그 배경색 fallback — 템플릿 무수정 관행의 예외 ④ (2026-08-04)
+# ---------------------------------------------------------------------------
+#
+# `.opinion-tag`는 `color:#fff`만 두고 배경색은 `적정`/`한정`/`의견거절` 3개 클래스
+# 규칙에만 있었다. 그 밖의 값 — 기존부터 있던 `부적정`과 위 L5로 새로 채워지는
+# `미상` — 은 어느 규칙에도 안 걸려 **배경 없이 흰 글자만** 남았고, 흰색 행이나
+# 베이지색 대상 행(`tr.target`) 위에서 인쇄물상 사실상 보이지 않았다(개발 DB 실측
+# 143건, 4.7%). `.opinion-tag` 기본 규칙에 회색 fallback 배경 한 줄만 추가해 고쳤다
+# (3개 클래스 규칙이 specificity로 그대로 덮어쓰므로 기존 색은 무변경).
+
+_OPINION_TAG_PALETTE = {"적정": "#1e8a5f", "한정": "#c98a10", "의견거절": "#c0392b"}
+_OPINION_TAG_MIN_CONTRAST = 3.0  # 흰 글자가 배경 위에서 읽히는 최소 대비
+_TARGET_ROW_BACKGROUND = "#f4e6c9"  # tr.target(var(--gold-l)) — 대상 회사 행
+
+
+def _css_variables(template_text: str) -> dict[str, str]:
+    root = re.search(r":root\s*\{(.*?)\}", template_text, re.S)
+    assert root, ":root 변수 블록을 찾지 못했습니다"
+    return {
+        name: value.strip()
+        for name, value in re.findall(r"(--[\w-]+)\s*:\s*([^;]+);", root.group(1))
+    }
+
+
+def _resolve_opinion_tag_background(template_text: str, class_attr: str) -> str:
+    """`class="opinion-tag X"` 요소에 실제로 적용되는 background를 CSS 규칙에서 푼다.
+
+    브라우저 규칙과 동일하게 (①선택자에 적힌 클래스를 전부 가진 규칙만 적용,
+    ②클래스 개수가 많은 쪽(specificity)이 우선, ③같으면 나중에 선언된 쪽이 우선)으로
+    고른 뒤 `var(--x)`를 `:root` 값으로 치환한다. 못 찾으면 빈 문자열(= 배경 없음).
+    """
+    classes = set(class_attr.split())
+    variables = _css_variables(template_text)
+    best_specificity, background = -1, ""
+    for extra, body in re.findall(r"\.opinion-tag([^{,]*)\{([^}]*)\}", template_text):
+        required = set(re.findall(r"\.([^.\s]+)", extra))
+        if extra.strip() and not required:  # 자손/기타 선택자는 다루지 않는다
+            continue
+        if not required <= classes:
+            continue
+        declared = re.search(r"(?:^|;)\s*background\s*:\s*([^;]+)", body)
+        if not declared:
+            continue
+        specificity = 1 + len(required)
+        if specificity >= best_specificity:
+            best_specificity = specificity
+            background = declared.group(1).strip()
+    var_ref = re.fullmatch(r"var\((--[\w-]+)\)", background)
+    if var_ref:
+        assert var_ref.group(1) in variables, f"정의되지 않은 CSS 변수: {background}"
+        return variables[var_ref.group(1)]
+    return background
+
+
+def _relative_luminance(hex_color: str) -> float:
+    raw = hex_color.lstrip("#")
+    channels = [int(raw[i : i + 2], 16) / 255 for i in (0, 2, 4)]
+    linear = [c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in channels]
+    return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+
+def _contrast_ratio(a: str, b: str) -> float:
+    first, second = sorted((_relative_luminance(a), _relative_luminance(b)))
+    return (second + 0.05) / (first + 0.05)
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js가 없어 템플릿 렌더 검증 생략")
+def test_rendered_opinion_tag_has_visible_background_for_unknown_opinions(
+    report_settings, tmp_path, template_text
+):
+    """[F1] 지역 비교표의 감사의견 태그가 어떤 값이든 배경색을 갖는지 확인한다.
+
+    실제 렌더 결과에서 태그의 class를 뽑아 템플릿 CSS로 배경색을 풀어 본다 —
+    `미상`/`부적정`처럼 전용 클래스 규칙이 없는 값도 기본 규칙의 fallback 배경을
+    받아야 하고(흰 글자가 흰 종이에 찍히면 안 된다), 기존 3종은 색이 그대로여야 한다.
+    """
+    pool_items = [
+        _peer_item(1, "㈜대상", "25110", 1000, gross_profit=200),  # 적정(기본값)
+        _peer_item(2, "㈜한정", "25110", 1010, audit_opinion="한정"),
+        _peer_item(3, "㈜의견거절", "25110", 1020, audit_opinion="의견거절"),
+        _peer_item(4, "㈜부적정", "25110", 1030, audit_opinion="부적정"),
+        _peer_item(5, "㈜의견없음", "25110", 1040, audit_opinion=None),
+    ]
+    outcome = generate_reports(
+        [pool_items[0]], peer_pool=build_peer_pool(pool_items), today=date(2026, 8, 4)
+    )
+    rendered = _render_reports_with_node(outcome.output_dir, tmp_path)["㈜대상.html"]
+
+    tags = dict(
+        (label, class_attr)
+        for class_attr, label in re.findall(
+            r'<span class="(opinion-tag[^"]*)">([^<]*)</span>', rendered["regionTable"]
+        )
+    )
+    assert set(tags) == {"적정", "한정", "의견거절", "부적정", UNKNOWN_OPINION_LABEL}
+
+    # ① 기존 3종은 팔레트 색 그대로여야 한다(fallback이 덮어쓰면 회귀다).
+    for label, expected in _OPINION_TAG_PALETTE.items():
+        assert _resolve_opinion_tag_background(template_text, tags[label]) == expected
+
+    # ② 전용 규칙이 없는 값도 배경이 있어야 하고, 흰 글자가 읽히는 대비여야 한다.
+    #    대상 회사 행은 베이지(`tr.target`)라 그 위에서도 태그가 보여야 한다.
+    for label in ("부적정", UNKNOWN_OPINION_LABEL):
+        background = _resolve_opinion_tag_background(template_text, tags[label])
+        assert background, f"'{label}' 태그에 배경색이 없습니다(흰 글자만 남습니다)"
+        assert background.lower() not in {"#fff", "#ffffff", "transparent", "none"}
+        assert _contrast_ratio(background, "#ffffff") >= _OPINION_TAG_MIN_CONTRAST
+        assert _contrast_ratio(background, _TARGET_ROW_BACKGROUND) >= _OPINION_TAG_MIN_CONTRAST
+
+
+def _partial_peer_item(result_id: int, name: str, revenue: int, year: str = "2024"):
+    """최근 연도 스냅샷이 PARTIAL인 비교군 후보."""
+    return _peer_item(
+        result_id,
+        name,
+        "25110",
+        revenue,
+        snapshots=[
+            _snapshot_stub(year, revenue=revenue, parse_status=ParseStatus.PARTIAL)
+        ],
+    )
+
+
+def test_comparison_warning_lists_partial_parsed_peers():
+    """[L2] 비교군 후보의 PARTIAL 연도를 회사당 한 줄 경고로 알린다(후보는 뺀다 X)."""
+    items = [
+        _peer_item(1, "㈜대상", "25110", 1000),
+        _partial_peer_item(2, "㈜부분A", 1010),
+        _partial_peer_item(3, "㈜부분B", 1020),
+        _peer_item(4, "㈜정상이웃", "25110", 1030),
+    ]
+    pool, _ = _pool_and_target(items)
+    # PARTIAL이어도 후보 풀에는 남는다(값이 없는 게 아니라 검수가 덜 된 것이다).
+    assert {c.name for c in pool.candidates if c.partial} == {"㈜부분A", "㈜부분B"}
+
+    selection = select_financial_rows(items[0].snapshots)
+    warnings = collect_comparison_warnings(items[0], selection, pool)
+    assert len(warnings) == 1
+    message = warnings[0].message
+    assert warnings[0].result_id == 1 and warnings[0].corp_name == "㈜대상"
+    assert "비교군에 부분 파싱(PARTIAL)" in message
+    # peers와 regionGroup에 같은 회사가 중복으로 들어가도 회사 단위로 한 번만 센다.
+    assert "2곳 있습니다" in message
+    assert "㈜부분A(2024년)" in message and "㈜부분B(2024년)" in message
+    assert "외 " not in message
+    assert "㈜정상이웃" not in message
+
+    # 비교군에 PARTIAL이 없으면 경고 자체가 없다.
+    clean = [
+        _peer_item(1, "㈜대상", "25110", 1000),
+        _peer_item(2, "㈜정상A", "25110", 1010),
+        _peer_item(3, "㈜정상B", "25110", 1020),
+    ]
+    clean_pool, _ = _pool_and_target(clean)
+    assert (
+        collect_comparison_warnings(
+            clean[0], select_financial_rows(clean[0].snapshots), clean_pool
+        )
+        == []
+    )
+    # 풀을 넘기지 않는 구 호출부에서는 아무 일도 하지 않는다.
+    assert collect_comparison_warnings(items[0], selection, None) == []
+
+
+def test_generate_reports_warns_about_partial_peers_and_truncates_the_list(report_settings):
+    """[L2] 생성 경로에도 붙고, 이름이 많으면 "외 N곳"으로 줄인다."""
+    items = [_peer_item(1, "㈜대상", "25110", 1000)]
+    items += [_partial_peer_item(i, f"㈜부분{i:02d}", 1000 + i) for i in range(2, 8)]  # 6곳
+
+    outcome = generate_reports(
+        [items[0]], peer_pool=build_peer_pool(items), today=date(2026, 8, 4)
+    )
+    messages = [w.message for w in outcome.warnings if "비교군에 부분 파싱" in w.message]
+    assert len(messages) == 1
+    assert "6곳 있습니다" in messages[0]
+    assert messages[0].count("(2024년)") == MAX_WARNING_NAME_SAMPLES
+    assert f"외 {6 - MAX_WARNING_NAME_SAMPLES}곳" in messages[0]
+    # 경고일 뿐 생성은 막지 않는다.
+    assert [f.corp_name for f in outcome.files] == ["㈜대상"]
+
+
+def test_compute_report_ratios_rejects_negative_denominators_but_allows_capital_impairment():
+    """[L3] truthy 검사(`not x`)로는 음수가 통과한다 — 명시적으로 막는다.
+
+    비대칭은 `RATIO_POSITIVE_DENOMINATOR_KEYS`와 같다: 매출액/자산총계는 음수도 제외,
+    자본총계는 0만 제외(완전자본잠식은 실재하는 정상 파싱 결과라 계산해야 한다).
+    """
+    row = {"매출액": 1000, "매출총이익": 250, "영업이익": 100, "부채총계": 300,
+           "자본총계": 500, "자산총계": 800}
+
+    assert compute_report_ratios(dict(row, 매출액=-1000)) is None
+    assert compute_report_ratios(dict(row, 자산총계=-800)) is None
+    assert compute_report_ratios(dict(row, 매출액=0)) is None
+    assert compute_report_ratios(dict(row, 자산총계=0)) is None
+    assert compute_report_ratios(dict(row, 자본총계=0)) is None
+
+    impaired = compute_report_ratios(dict(row, 자본총계=-500, 부채총계=1300))
+    assert impaired is not None
+    assert impaired["부채비율"] == pytest.approx(-2.6)
+    assert impaired["자기자본비율"] == pytest.approx(-0.625)
+
+
+def test_region_group_labels_missing_opinion_as_unknown(template_text):
+    """[L5] 감사의견이 없으면 지역 표에 "미상"을 넣는다(빈 태그 방지, 템플릿 무수정)."""
+    # [드리프트 가드] 템플릿이 opinion 문자열을 클래스와 본문에 그대로 쓴다.
+    assert 'class="opinion-tag ${r.opinion}">${r.opinion}</span>' in template_text
+
+    items = [
+        _peer_item(1, "㈜대상", "25110", 1000, audit_opinion=None),
+        _peer_item(2, "㈜의견없음", "25110", 1010, audit_opinion=""),
+        _peer_item(3, "㈜적정", "25110", 1020),
+    ]
+    pool, target = _pool_and_target(items)
+    region = {row["name"]: row for row in select_region_group(pool, target)}
+
+    # 대상 회사에도 같은 규칙을 적용한다(표 안에서 표기가 갈리지 않게).
+    assert region["㈜대상"]["opinion"] == UNKNOWN_OPINION_LABEL
+    assert region["㈜의견없음"]["opinion"] == UNKNOWN_OPINION_LABEL
+    assert region["㈜적정"]["opinion"] == "적정"
+    # "미상"은 의견거절/부적정과 달리 신뢰성 문제가 아니므로 수치를 감추지 않는다.
+    assert region["㈜의견없음"]["매출액"] == 1010
+
+    # 문서 상단 회사 정보(`company.opinion`)는 무변경 — 보정 범위는 이 표뿐이다.
+    assert build_company_payload(items[0].result)["opinion"] == ""
+
+
+def test_capital_impaired_peer_keeps_explicit_negative_ratios(template_text):
+    """[커버리지] 자본총계가 음수인 비교군 후보의 비율 2종이 무엇이 되는지 잠근다.
+
+    지금은 템플릿이 peers의 `부채비율`/`자기자본비율`을 쓰지 않아 무해하지만, 값 자체는
+    **음수 그대로**(None이 아니다) 실린다 — 나중에 템플릿이 이 필드를 쓰기 시작하면
+    자본잠식 3건과 **같은 유형의 버그**가 조용히 재발한다. 마지막 두 어서션이 그
+    카나리아다(템플릿이 이 필드를 쓰기 시작하면 이 테스트가 먼저 깨진다).
+    """
+    items = [
+        _peer_item(1, "㈜대상", "25110", 1000),
+        _peer_item(
+            2, "㈜자본잠식", "25110", 1010,
+            snapshots=[
+                _snapshot_stub(
+                    "2024", revenue=1010, total_equity=-40, total_liab=60, total_assets=20
+                )
+            ],
+        ),
+        _peer_item(3, "㈜정상이웃", "25110", 1020),
+    ]
+    pool, target = _pool_and_target(items)
+
+    # 자본잠식은 후보에서 빠지지 않는다(`has_extreme_ratios`는 손익 비율만 본다).
+    candidate = next(c for c in pool.candidates if c.name == "㈜자본잠식")
+    assert candidate.ratios["부채비율"] == pytest.approx(60 / -40)
+    assert candidate.ratios["자기자본비율"] == pytest.approx(-40 / 20)
+
+    rows = {row["name"]: row for row in build_peer_rows(select_peers(pool, target))}
+    assert rows["㈜자본잠식"]["부채비율"] == pytest.approx(-1.5)
+    assert rows["㈜자본잠식"]["자기자본비율"] == pytest.approx(-2.0)
+    # 지역 표에 실리는 값(매출액/매출총이익률)은 자본잠식과 무관하게 정상이다.
+    assert select_region_group(pool, target)[0]["매출총이익률"] is not None
+
+    # [카나리아] 템플릿은 peers의 이 두 필드를 아직 쓰지 않는다 — 쓰기 시작하면
+    # 음수 부채비율이 차트/등급에 어떻게 들어가는지 먼저 검토해야 한다.
+    assert "p.부채비율" not in template_text
+    assert "p.자기자본비율" not in template_text
+
+
+# ---------------------------------------------------------------------------
 # [M2] 라벨 엑셀 — 제어문자 방어
 # ---------------------------------------------------------------------------
 
@@ -1274,6 +2108,235 @@ def test_generate_report_endpoint_rejects_foreign_and_invalid_ids(
 
     missing_job = client.post("/api/jobs/999999/generate-report", json={"ids": [id_with]})
     assert missing_job.status_code == 404
+
+
+def _seed_peer_job(factory) -> tuple[int, dict[str, int]]:
+    """비교군 검증용 Job — 같은 업종/다른 업종/휴면 추정/이력 없음을 섞어 넣는다.
+
+    반환값은 (job_id, {회사명: results.id}).
+    """
+    db = factory()
+    try:
+        job = Job(
+            created_at="2026-08-04T00:00:00",
+            name="비교군 테스트 Job",
+            cond_region="{}",
+            cond_revenue="{}",
+            cond_industry="[]",
+            cond_period="{}",
+            status=JobStatus.DONE,
+            current_step=6,
+            progress_done=5,
+            progress_total=5,
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+
+        # (회사명, 업종코드, 매출액, 매출총이익, 휴면추정, 이력유무)
+        spec = [
+            ("(주)대상", "25110", 1000, 200, 0, True),
+            ("(주)동종A", "25119", 1100, 110, 0, True),
+            ("(주)동종B", "25120", 900, 90, 0, True),
+            ("(주)타업종", "46000", 1000, 500, 0, True),
+            ("(주)휴면추정", "25110", 1000, 900, 1, True),  # 비교군에서 빠져야 한다
+            ("(주)이력없음", "25110", 1000, 900, 0, False),  # 스냅샷 0건 → 후보 아님
+        ]
+        ids: dict[str, int] = {}
+        for name, code, revenue, gross_profit, stale, has_history in spec:
+            result = Result(
+                job_id=job.id,
+                corp_code=f"0010{len(ids):04d}",
+                rcept_no="20260601000001",
+                corp_name=name,
+                address=f"경상남도 김해시 삼계로 {len(ids)}",
+                ceo_name="홍길동",
+                induty_code=code,
+                induty_name="금속가공제품 제조업",
+                fiscal_date="20251231",
+                audit_opinion="적정",
+                auditor_name="안경회계법인",
+                parse_status=ParseStatus.OK,
+                excluded_by_stale_disclosure=stale,
+            )
+            db.add(result)
+            db.commit()
+            db.refresh(result)
+            ids[name] = result.id
+            if not has_history:
+                continue
+            db.add_all(
+                [
+                    FinancialSnapshot(
+                        result_id=result.id,
+                        rcept_no="20260601000001",
+                        fiscal_year=str(year),
+                        current_assets=10,
+                        noncurrent_assets=10,
+                        total_assets=20,
+                        current_liab=5,
+                        noncurrent_liab=5,
+                        total_liab=10,
+                        total_equity=10,
+                        revenue=revenue,
+                        cogs=revenue - gross_profit,
+                        gross_profit=gross_profit,
+                        sga=20,
+                        operating_income=20,
+                        net_income=10,
+                        parse_status=ParseStatus.OK,
+                        from_current_period=1,
+                    )
+                    for year in (2023, 2024)
+                ]
+            )
+            db.commit()
+        return job.id, ids
+    finally:
+        db.close()
+
+
+def test_generate_report_endpoint_fills_comparison_groups_from_same_job(
+    client_with_db, report_settings
+):
+    """[2026-08-04] 비교군은 선택 회사가 아니라 **같은 Job 전체**에서 온다.
+
+    대상 1건만 선택해도 같은 Job의 다른 회사가 peers/regionGroup에 실려야 하고,
+    휴면·폐업 추정과 재무이력 0건인 회사는 빠져야 한다.
+    """
+    client, factory = client_with_db
+    job_id, ids = _seed_peer_job(factory)
+
+    resp = client.post(
+        f"/api/jobs/{job_id}/generate-report", json={"ids": [ids["(주)대상"]]}
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["generated_count"] == 1
+
+    output_dir = Path(body["output_dir"])
+    data = _extract_embedded_json(
+        (output_dir / body["files"][0]["filename"]).read_text(encoding="utf-8")
+    )
+
+    # 소분류(251) 매칭 2건 — 타업종/휴면추정/이력없음은 들어오지 않는다.
+    assert [p["name"] for p in data["peers"]] == ["(주)동종A", "(주)동종B"]
+    assert data["industryAverage"]["매출총이익률"] == pytest.approx(200 / 2000)
+    assert "2개사" in data["industryAverage"]["설명"]
+
+    # 지역 비교군은 업종 무관 — 대상이 맨 앞 isTarget, 휴면/이력없음은 제외.
+    region = data["regionGroup"]
+    assert region[0]["name"] == "(주)대상" and region[0]["isTarget"] is True
+    assert sorted(r["name"] for r in region[1:]) == ["(주)동종A", "(주)동종B", "(주)타업종"]
+    assert not [r for r in region if r["name"] in ("(주)휴면추정", "(주)이력없음")]
+
+    assert data["opinionSummary"] == ""  # 자유 서술 필드는 이번 범위가 아니다
+
+
+def _seed_many_companies(factory, count: int) -> int:
+    """같은 Job에 회사 `count`건(각 2개년 스냅샷)을 넣고 job_id를 돌려준다."""
+    db = factory()
+    try:
+        job = Job(
+            created_at="2026-08-04T00:00:00",
+            name="N+1 회귀 가드 Job",
+            cond_region="{}",
+            cond_revenue="{}",
+            cond_industry="[]",
+            cond_period="{}",
+            status=JobStatus.DONE,
+            current_step=6,
+            progress_done=count,
+            progress_total=count,
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+
+        results = [
+            Result(
+                job_id=job.id,
+                corp_code=f"0020{i:04d}",
+                rcept_no="20260601000001",
+                corp_name=f"(주)회사{i:02d}",
+                address=f"경상남도 김해시 삼계로 {i}",
+                ceo_name="홍길동",
+                induty_code="25110",
+                induty_name="금속가공제품 제조업",
+                fiscal_date="20251231",
+                audit_opinion="적정",
+                auditor_name="안경회계법인",
+                parse_status=ParseStatus.OK,
+                excluded_by_stale_disclosure=0,
+            )
+            for i in range(count)
+        ]
+        db.add_all(results)
+        db.commit()
+        for result in results:
+            db.refresh(result)
+
+        db.add_all(
+            [
+                FinancialSnapshot(
+                    result_id=result.id,
+                    rcept_no="20260601000001",
+                    fiscal_year=str(year),
+                    current_assets=10,
+                    noncurrent_assets=10,
+                    total_assets=20,
+                    current_liab=5,
+                    noncurrent_liab=5,
+                    total_liab=10,
+                    total_equity=10,
+                    revenue=1000 + index,
+                    cogs=960 + index,
+                    gross_profit=40,
+                    sga=20,
+                    operating_income=20,
+                    net_income=10,
+                    parse_status=ParseStatus.OK,
+                    from_current_period=1,
+                )
+                for index, result in enumerate(results)
+                for year in (2023, 2024)
+            ]
+        )
+        db.commit()
+        return job.id
+    finally:
+        db.close()
+
+
+def test_load_job_peer_pool_runs_two_queries_regardless_of_company_count(client_with_db):
+    """[커버리지] 비교군 후보 풀 조회는 회사 수와 무관하게 **쿼리 2건**이어야 한다.
+
+    회사마다 재무이력을 조회하도록 회귀하면(N+1) 수천 건 Job에서 보고서 생성이
+    통째로 느려지는데, 기존 엔드포인트 테스트는 회사 6건짜리라 그 회귀가 조용히
+    통과한다. 여기서는 실제로 실행된 SQL 문 수를 세어 명시적으로 잠근다.
+    """
+    _, factory = client_with_db
+    job_id = _seed_many_companies(factory, 20)
+
+    db = factory()
+    try:
+        engine = db.get_bind()
+        statements: list[str] = []
+
+        def _record(conn, cursor, statement, parameters, context, executemany):
+            statements.append(statement)
+
+        event.listen(engine, "before_cursor_execute", _record)
+        try:
+            pool = _load_job_peer_pool(db, job_id)
+        finally:
+            event.remove(engine, "before_cursor_execute", _record)
+    finally:
+        db.close()
+
+    assert len(pool.candidates) == 20
+    assert len(statements) == 2, statements  # 결과 목록 1건 + 스냅샷 전체 1건
+    assert sum(1 for s in statements if "financial_snapshots" in s) == 1
 
 
 def test_generate_report_endpoint_returns_friendly_error_on_io_failure(
