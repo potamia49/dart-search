@@ -60,6 +60,14 @@
   .opinion-tag.한정{background:var(--amber);}
   .opinion-tag.의견거절{background:var(--red);}
   .footnote{font-size:9.5px;color:var(--gray);margin-top:4px;}
+  /* 비교군이 없을 때(regionGroup=[]) 빈 차트·머리글만 남은 표 대신 안내 문구를 보인다.
+     JS는 손대지 않고, 렌더된 행이 0건이라는 사실(`#regionTable tbody:empty`)만 CSS로 본다.
+     `:has()`를 못 쓰는 브라우저에서는 안내가 안 뜰 뿐 기존 동작 그대로다. */
+  .empty-note{display:none;}
+  #page2:has(#regionTable tbody:empty) #regionRankCard,
+  #page2:has(#regionTable tbody:empty) #regionTable,
+  #page2:has(#regionTable tbody:empty) #regionOpinionNote{display:none;}
+  #page2:has(#regionTable tbody:empty) .empty-note{display:block;}
 
   /* 리스크 경보 */
   .risk-list{display:flex;flex-direction:column;gap:6px;}
@@ -160,14 +168,16 @@
   <div class="footnote" id="peerFootnote"></div>
 
   <div class="section-title">동일 지역·규모 비교군 순위</div>
-  <div class="chart-card"><div class="chart-box" id="chartRegionRank"></div></div>
+  <div class="chart-card" id="regionRankCard"><div class="chart-box" id="chartRegionRank"></div></div>
+  <div class="footnote empty-note">※ 동일 지역·동종업종에 비교 가능한 회사가 없어 순위를 표시하지 않았습니다.</div>
 
   <div class="section-title">비교군 상세 현황</div>
   <table id="regionTable">
     <thead><tr><th style="text-align:left;">회사명</th><th style="text-align:left;">업종</th><th>매출액(백만)</th><th>매출총이익률</th><th>감사의견</th></tr></thead>
     <tbody></tbody>
   </table>
-  <div class="footnote">※ 의견거절 회사는 재무제표 신뢰성에 제한이 있어 비교 해석 시 유의가 필요합니다.</div>
+  <div class="footnote empty-note">※ 동일 지역·동종업종에 비교 가능한 회사가 없어 비교군 현황을 표시하지 않았습니다.</div>
+  <div class="footnote" id="regionOpinionNote">※ 의견거절 회사는 재무제표 신뢰성에 제한이 있어 비교 해석 시 유의가 필요합니다.</div>
 
   <div class="page-num">2 / 3</div>
 </div>

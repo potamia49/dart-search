@@ -61,7 +61,9 @@ from app.reports.audit_proposal import (
     collect_comparison_warnings,
     collect_warnings,
     compute_report_ratios,
+    match_by_industry_prefix,
     select_peers,
+    select_region_candidates,
     select_region_group,
     excel_safe_text,
     find_embedded_data_block,
@@ -1215,8 +1217,10 @@ def test_select_peers_returns_empty_when_both_prefixes_are_short_of_sample():
     peers = select_peers(pool, target)
     assert peers == []
     assert build_industry_average(peers, target) is None
-    # 업종이 달라도 지역 비교군(같은 Job 전체)에는 남는다 — 두 축은 독립이다.
-    assert len(select_region_group(pool, target)) == 3
+    # [2026-08-05] 지역 비교군도 같은 업종 매칭을 쓰므로 함께 빈 값이 된다 — 예전에는
+    # "같은 Job이면 업종 무관"이라 3행이 실렸다(타업종 회사끼리 매출총이익률 순위를
+    # 매기는 표가 인쇄되던 것이 이번 변경의 계기다).
+    assert select_region_group(pool, target) == []
 
     # 업종코드 자체가 비어 있으면(구 Job 등) 매칭을 시도하지 않는다.
     blank = build_peer_candidate(
@@ -1253,9 +1257,10 @@ def test_build_industry_average_is_revenue_weighted():
 
 def test_region_group_includes_target_first_with_is_target_flag():
     items = [
+        # 업종 매칭(2026-08-05)이 생겨 이웃도 같은 소분류(251)여야 표에 실린다.
         _peer_item(1, "㈜대상", "25110", 1000),
-        _peer_item(2, "㈜이웃A", "31000", 1010),
-        _peer_item(3, "㈜이웃B", "46000", 990),
+        _peer_item(2, "㈜이웃A", "25119", 1010),
+        _peer_item(3, "㈜이웃B", "25120", 990),
     ]
     pool, target = _pool_and_target(items)
 
@@ -1519,13 +1524,16 @@ def test_rendered_report_draws_comparison_charts(report_settings, tmp_path):
     assert "㈜동종A, ㈜동종B" in rendered["footnote"]
     assert "업종평균" in rendered["footnote"]
 
-    # 지역 순위 가로막대: 4개사 중 대상 회사 1건만 강조색(#b8892b)으로 칠해진다.
+    # 지역 순위 가로막대: 동종업종 3개사(대상 + 동종 2개사)만 그려지고 그 중 대상
+    # 회사 1건만 강조색(#b8892b)으로 칠해진다. **㈜타업종(46000)은 2026-08-05
+    # 업종 필터로 빠진다** — 예전에는 지역만 같으면 실려 4개 막대였다.
     region_rects = [n for n in _chart_nodes(rendered, "chartRegionRank") if n["tag"] == "rect"]
-    assert len(region_rects) == 4
+    assert len(region_rects) == 3
     assert len([r for r in region_rects if r["attrs"]["fill"] == "#b8892b"]) == 1
 
-    # 표에도 4행이 들어가고 대상 회사 행에만 target 클래스가 붙는다.
-    assert rendered["regionTable"].count("<tr") == 4
+    # 표에도 3행이 들어가고 대상 회사 행에만 target 클래스가 붙는다.
+    assert rendered["regionTable"].count("<tr") == 3
+    assert "㈜타업종" not in rendered["regionTable"]
     assert rendered["regionTable"].count('class="target"') == 1
 
 
@@ -1738,6 +1746,124 @@ def test_rendered_opinion_tag_has_visible_background_for_unknown_opinions(
         assert _contrast_ratio(background, _TARGET_ROW_BACKGROUND) >= _OPINION_TAG_MIN_CONTRAST
 
 
+# ---------------------------------------------------------------------------
+# [L1] 비교군이 없을 때의 안내 문구 — 템플릿 무수정 관행의 예외 ⑤ (2026-08-05)
+# ---------------------------------------------------------------------------
+#
+# 2026-08-05 업종 필터가 붙으면서 `regionGroup=[]`인 회사가 생겼다(개발 DB 실측
+# 후보 1,488건 중 63건, 4.2%). regionGroup이 비면 peers도 반드시 비므로(지역 후보
+# 목록이 peers 후보의 상위집합이다) 2페이지의 비교 영역 3개가 통째로 백지로
+# 인쇄되는데, peers 쪽에는 이미 각주("동종업종 비교사 데이터 없음")가 있는 반면
+# 지역 쪽 두 섹션(순위 차트 · 상세 현황 표)에는 아무 표시가 없었다.
+# → 템플릿 **HTML/CSS만** 고쳤다: 안내 문구 div 2개 + `#regionTable tbody:empty`를
+#   조건으로 쓰는 CSS 규칙 4줄. **JS 렌더 로직은 무변경**이라 regionGroup이 비어
+#   있지 않은 문서(95.8%)는 렌더 결과가 한 글자도 바뀌지 않는다.
+
+_EMPTY_NOTICE_CONDITION = "#page2:has(#regionTable tbody:empty)"
+_EMPTY_NOTICE_HIDDEN = ("#regionRankCard", "#regionTable", "#regionOpinionNote")
+
+
+def _template_style_block(template_text: str) -> str:
+    style = re.search(r"<style>(.*?)</style>", template_text, re.S)
+    assert style, "<style> 블록을 찾지 못했습니다"
+    return re.sub(r"/\*.*?\*/", "", style.group(1), flags=re.S)  # 주석은 선택자가 아니다
+
+
+def _resolve_display(template_text: str, element: str, *, region_group_empty: bool) -> str:
+    """템플릿 CSS만으로 해당 요소의 최종 `display`를 푼다(못 찾으면 빈 문자열 = 기본값).
+
+    이번 예외 수정이 쓰는 조건부 규칙(`#page2:has(#regionTable tbody:empty) …`)만
+    해석한다 — 그 조건은 "지역 비교군이 0건이라 tbody가 비었다"와 정확히 같으므로
+    `region_group_empty`로 바꿔 평가한다. 조건부 규칙이 기본 규칙보다 뒤에 오고
+    specificity도 높아, 마지막에 적용된 선언을 그대로 쓴다.
+    """
+    display = ""
+    for selectors, body in re.findall(r"([^{}]+)\{([^{}]*)\}", _template_style_block(template_text)):
+        declared = re.search(r"(?:^|;)\s*display\s*:\s*([^;]+)", body)
+        if not declared:
+            continue
+        for selector in selectors.split(","):
+            selector = selector.strip()
+            if not selector.endswith(element):
+                continue
+            condition = selector[: -len(element)].strip()
+            if condition and condition != _EMPTY_NOTICE_CONDITION:
+                continue  # 이 테스트가 다루지 않는 다른 조건부 규칙
+            if condition and not region_group_empty:
+                continue  # 조건이 성립하지 않으면 적용되지 않는다
+            display = declared.group(1).strip()
+    return display
+
+
+def test_template_hides_empty_comparison_sections_with_notice(template_text):
+    """[예외 ⑤] 빈 비교군 안내가 HTML/CSS만으로 들어가 있어야 한다(JS 무변경).
+
+    안내 문구 자체는 항상 HTML에 있고 CSS가 보이고/숨기고를 결정한다 —
+    JS를 고치지 않아야 regionGroup이 있는 문서의 렌더 결과가 그대로 유지된다.
+    """
+    notices = re.findall(r'<div class="footnote empty-note">(※[^<]*)</div>', template_text)
+    assert len(notices) == 2, "안내 문구 div 2개(순위 차트 자리 / 상세 현황 표 자리)가 필요합니다"
+    for notice in notices:
+        assert "비교 가능한 회사가 없어" in notice
+    # 두 안내는 각각 어느 섹션 자리인지 알 수 있게 문구가 달라야 한다.
+    assert notices[0] != notices[1]
+
+    # ① 비교군이 있으면(기존 95.8%) 안내는 숨고 차트·표는 손대지 않는다.
+    assert _resolve_display(template_text, ".empty-note", region_group_empty=False) == "none"
+    for element in _EMPTY_NOTICE_HIDDEN:
+        assert _resolve_display(template_text, element, region_group_empty=False) == ""
+
+    # ② 비교군이 없으면 안내가 뜨고, 빈 차트 카드·머리글만 남은 표·의견거절 각주는 숨는다.
+    assert _resolve_display(template_text, ".empty-note", region_group_empty=True) == "block"
+    for element in _EMPTY_NOTICE_HIDDEN:
+        assert _resolve_display(template_text, element, region_group_empty=True) == "none"
+
+    # ③ JS는 손대지 않았다 — 안내 문구/신설 id를 스크립트가 다루면 안 된다.
+    scripts = "".join(re.findall(r"<script>(.*?)</script>", template_text, re.S))
+    for token in ("empty-note", "regionRankCard", "regionOpinionNote"):
+        assert token not in scripts, f"JS가 {token}을 다루고 있습니다(HTML/CSS만 고쳐야 한다)"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js가 없어 템플릿 렌더 검증 생략")
+def test_rendered_report_leaves_region_sections_empty_without_industry_peers(
+    report_settings, tmp_path, template_text
+):
+    """[예외 ⑤] 동종업종 비교사가 없는 회사와 있는 회사를 한 번에 렌더해 비교한다.
+
+    앞쪽(비교군 없음)은 표·차트가 비어 CSS 안내가 뜨는 상태여야 하고, 뒤쪽은
+    **기존과 똑같이** 행·막대가 그려지고 안내는 숨어 있어야 한다(무회귀).
+    """
+    pool_items = [
+        _peer_item(1, "㈜단독업종", "25110", 1000, gross_profit=200),
+        _peer_item(2, "㈜비교대상", "46100", 1000, gross_profit=200),
+        _peer_item(3, "㈜동종A", "46110", 1100, gross_profit=110),
+        _peer_item(4, "㈜동종B", "46120", 900, gross_profit=90),
+    ]
+    outcome = generate_reports(
+        [pool_items[0], pool_items[1]],
+        peer_pool=build_peer_pool(pool_items),
+        today=date(2026, 8, 5),
+    )
+    rendered = _render_reports_with_node(outcome.output_dir, tmp_path)
+
+    # ① 동종업종 후보가 2건 미만이라 regionGroup=[] → 표 0행 · 순위 막대 0개.
+    alone = rendered["㈜단독업종.html"]
+    assert alone["regionTable"] == ""
+    assert [n for n in _chart_nodes(alone, "chartRegionRank") if n["tag"] == "rect"] == []
+    # 렌더는 중단되지 않는다(뒤쪽 섹션까지 그대로 채워진다).
+    assert alone["grades"] and alone["kpi"]
+    assert "동종업종 비교사 데이터 없음" in alone["footnote"]
+    # 이때만 CSS 안내가 켜진다.
+    assert _resolve_display(template_text, ".empty-note", region_group_empty=True) == "block"
+
+    # ② 동종업종이 있는 회사는 예전과 동일하다 — 표 3행(대상+2), 막대 3개, 안내는 숨김.
+    paired = rendered["㈜비교대상.html"]
+    assert paired["regionTable"].count("<tr") == 3
+    assert paired["regionTable"].count('class="target"') == 1
+    assert len([n for n in _chart_nodes(paired, "chartRegionRank") if n["tag"] == "rect"]) == 3
+    assert _resolve_display(template_text, ".empty-note", region_group_empty=False) == "none"
+
+
 def _partial_peer_item(result_id: int, name: str, revenue: int, year: str = "2024"):
     """최근 연도 스냅샷이 PARTIAL인 비교군 후보."""
     return _peer_item(
@@ -1891,6 +2017,149 @@ def test_capital_impaired_peer_keeps_explicit_negative_ratios(template_text):
     # 음수 부채비율이 차트/등급에 어떻게 들어가는지 먼저 검토해야 한다.
     assert "p.부채비율" not in template_text
     assert "p.자기자본비율" not in template_text
+
+
+# ---------------------------------------------------------------------------
+# [2026-08-05] regionGroup 업종 매칭 — peers와 같은 헬퍼를 공유한다
+# ---------------------------------------------------------------------------
+#
+# 사용자가 실제 생성된 문서의 "비교군 상세 현황" 표에서 조선부품/시내버스운송/도장공사/
+# 상품중개가 한 장에 나란히 실린 것을 보고 "업종기준으로 필터해야지"라고 지적해 추가된
+# 규칙이다. peers에 이미 있던 소분류(3자리) → 중분류(2자리) 1회 폴백을
+# `match_by_industry_prefix()`로 추출해 **두 비교군이 같은 함수를 호출**한다.
+
+
+def test_match_by_industry_prefix_rules():
+    """[헬퍼 단위] 소분류 우선 → 표본 부족 시 중분류 1회 폴백 → 그래도 부족하면 빈 값."""
+    pool = [
+        _peer_item(2, "㈜소분류A", "25119", 1000),
+        _peer_item(3, "㈜소분류B", "25120", 1000),
+        _peer_item(4, "㈜중분류", "25900", 1000),
+        _peer_item(5, "㈜타업종", "46000", 1000),
+    ]
+    candidates = list(build_peer_pool(pool).candidates)
+
+    # 소분류(251)로 2건 이상 → 중분류(25900)까지 넓히지 않는다.
+    assert [c.name for c in match_by_industry_prefix(candidates, "25110")] == [
+        "㈜소분류A", "㈜소분류B"
+    ]
+    # 소분류(259)는 1건뿐 → 중분류(25)로 한 번 넓힌다(소분류 매칭 건도 함께 들어온다).
+    assert {c.name for c in match_by_industry_prefix(candidates, "25910")} == {
+        "㈜소분류A", "㈜소분류B", "㈜중분류"
+    }
+    # 대분류(4)까지는 넓히지 않는다 — 46000 한 건뿐이라 빈 값이다.
+    assert match_by_industry_prefix(candidates, "46100") == []
+    # 업종코드가 없으면(구 Job 등) 매칭 자체를 시도하지 않는다.
+    assert match_by_industry_prefix(candidates, "") == []
+    assert match_by_industry_prefix(candidates, "  ") == []
+    # 코드가 prefix 길이보다 짧으면 그 단계를 건너뛴다(2자리 회사 → 중분류만).
+    assert {c.name for c in match_by_industry_prefix(candidates, "25")} == {
+        "㈜소분류A", "㈜소분류B", "㈜중분류"
+    }
+
+
+def test_region_group_excludes_other_industries():
+    """지역 비교군에서 업종이 다른 회사가 빠진다(이번 변경의 본체)."""
+    items = [
+        _peer_item(1, "㈜대상", "25110", 1000),
+        _peer_item(2, "㈜동종A", "25119", 1010),
+        _peer_item(3, "㈜동종B", "25120", 990),
+        _peer_item(4, "㈜시내버스", "49231", 1005),
+        _peer_item(5, "㈜상품중개", "46102", 995),
+    ]
+    pool, target = _pool_and_target(items)
+
+    region = select_region_group(pool, target)
+    # 매출 차이가 동률(±10)이라 id 오름차순으로 A → B.
+    assert [r["name"] for r in region] == ["㈜대상", "㈜동종A", "㈜동종B"]
+    assert not {"㈜시내버스", "㈜상품중개"} & {r["name"] for r in region}
+    # 기존 규칙은 그대로 — 대상이 맨 앞 isTarget, 나머지는 매출 근접순.
+    assert region[0]["isTarget"] is True
+    assert all(r["isTarget"] is False for r in region[1:])
+    # peers는 무영향(같은 매칭 결과를 공유한다).
+    assert [p.name for p in select_peers(pool, target)] == ["㈜동종A", "㈜동종B"]
+
+
+def test_region_group_falls_back_to_major_industry_prefix():
+    """소분류 매칭이 2건 미만이면 regionGroup도 peers와 **같은 조건**으로 중분류 폴백."""
+    items = [
+        _peer_item(1, "㈜대상", "25110", 1000),
+        _peer_item(2, "㈜같은소분류", "25130", 1000),  # 251 매칭 1건뿐 → 부족
+        _peer_item(3, "㈜같은중분류A", "25900", 1000),
+        _peer_item(4, "㈜같은중분류B", "25200", 1000),
+        _peer_item(5, "㈜타업종", "46000", 1000),
+    ]
+    pool, target = _pool_and_target(items)
+
+    region = {r["name"] for r in select_region_group(pool, target)}
+    assert region == {"㈜대상", "㈜같은소분류", "㈜같은중분류A", "㈜같은중분류B"}
+    assert "㈜타업종" not in region
+    # 폴백 단계까지 peers와 동일해야 한다(같은 헬퍼를 쓰므로 드리프트가 없다).
+    assert region - {"㈜대상"} == {p.name for p in select_peers(pool, target)}
+
+
+def test_region_group_is_empty_when_industry_match_is_short_of_sample():
+    """중분류 폴백까지 실패하면 `regionGroup=[]` — peers의 기존 규칙을 그대로 따른다.
+
+    1개사만 놓고 "지역 내 순위"라고 인쇄하면 대외 문서로서 오해를 주기 때문이다
+    (템플릿은 빈 배열을 "비교군 없음"으로 안전하게 렌더한다).
+    """
+    items = [
+        _peer_item(1, "㈜대상", "25110", 1000),
+        _peer_item(2, "㈜유일한동종", "25119", 1010),  # 251 매칭 1건뿐
+        _peer_item(3, "㈜타업종A", "46000", 1000),
+        _peer_item(4, "㈜타업종B", "49000", 1000),
+        _peer_item(5, "㈜타업종C", "20000", 1000),
+    ]
+    pool, target = _pool_and_target(items)
+
+    assert select_region_group(pool, target) == []
+    assert select_region_candidates(pool, target) == []
+    assert select_peers(pool, target) == []
+
+    # 업종코드가 비어 있는 회사도 같은 이유로 빈 값이다(매칭 자체가 불가능).
+    blank = build_peer_candidate(
+        _result_stub(9, "㈜업종없음", "주소", induty_code=None),
+        select_financial_rows([_snapshot_stub("2024")]),
+    )
+    assert select_region_group(pool, blank) == []
+
+
+def test_region_group_industry_filter_runs_before_the_size_cap():
+    """업종 필터는 매출 근접순 상한 절단 **앞에** 온다.
+
+    뒤에 두면 상한 15칸이 매출만 가까운 타업종으로 채워져 업종 필터가 사실상 무력해진다
+    (여기서는 타업종 20곳이 매출이 훨씬 가깝지만 동종 3곳만 남아야 한다).
+    """
+    items = [_peer_item(1, "㈜대상", "25110", 1000)]
+    items += [_peer_item(i, f"㈜타업종{i:02d}", "46000", 1000 + i) for i in range(2, 22)]
+    items += [_peer_item(30 + i, f"㈜동종{i}", "25110", 5000 + i) for i in range(3)]
+    pool, target = _pool_and_target(items)
+
+    region = select_region_group(pool, target)
+    assert [r["name"] for r in region] == ["㈜대상", "㈜동종0", "㈜동종1", "㈜동종2"]
+    assert len(region) < MAX_REGION_GROUP
+
+
+def test_region_group_counts_unreliable_opinion_companies_as_sample():
+    """의견거절/부적정은 regionGroup에서 **표본으로는 센다**(peers와 적용 지점이 다름).
+
+    regionGroup은 그 회사들의 행을 남기고 금액/비율만 감추므로(`_region_row()`),
+    업종 매칭·최소 표본 판정에서 미리 빼면 표에 실릴 회사와 셈이 어긋난다.
+    """
+    items = [
+        _peer_item(1, "㈜대상", "25110", 1000),
+        _peer_item(2, "㈜의견거절", "25110", 1010, audit_opinion="의견거절"),
+        _peer_item(3, "㈜부적정", "25110", 1020, audit_opinion="부적정"),
+    ]
+    pool, target = _pool_and_target(items)
+
+    region = {r["name"]: r for r in select_region_group(pool, target)}
+    assert set(region) == {"㈜대상", "㈜의견거절", "㈜부적정"}
+    for name in ("㈜의견거절", "㈜부적정"):
+        assert region[name]["매출액"] is None and region[name]["매출총이익률"] is None
+    # peers 쪽은 두 회사를 후보에서 통째로 빼므로 표본 부족으로 빈 값이다.
+    assert select_peers(pool, target) == []
 
 
 # ---------------------------------------------------------------------------
@@ -2224,11 +2493,14 @@ def test_generate_report_endpoint_fills_comparison_groups_from_same_job(
     assert data["industryAverage"]["매출총이익률"] == pytest.approx(200 / 2000)
     assert "2개사" in data["industryAverage"]["설명"]
 
-    # 지역 비교군은 업종 무관 — 대상이 맨 앞 isTarget, 휴면/이력없음은 제외.
+    # 지역 비교군도 **같은 업종 매칭**을 쓴다(2026-08-05) — 대상이 맨 앞 isTarget,
+    # 타업종/휴면/이력없음은 제외. 예전에는 업종 무관이라 (주)타업종도 실렸다.
     region = data["regionGroup"]
     assert region[0]["name"] == "(주)대상" and region[0]["isTarget"] is True
-    assert sorted(r["name"] for r in region[1:]) == ["(주)동종A", "(주)동종B", "(주)타업종"]
-    assert not [r for r in region if r["name"] in ("(주)휴면추정", "(주)이력없음")]
+    assert sorted(r["name"] for r in region[1:]) == ["(주)동종A", "(주)동종B"]
+    assert not [
+        r for r in region if r["name"] in ("(주)타업종", "(주)휴면추정", "(주)이력없음")
+    ]
 
     assert data["opinionSummary"] == ""  # 자유 서술 필드는 이번 범위가 아니다
 

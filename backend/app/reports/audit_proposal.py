@@ -19,8 +19,8 @@ HTML/CSS/차트 렌더 로직은 **원칙적으로** 건드리지 않는다(템�
 치환은 정규식 자르기가 아니라 **중괄호 짝맞추기 스캐너**(`find_embedded_data_block`,
 문자열/주석 안의 중괄호를 건너뛴다)로 블록 범위를 찾아 교체한다.
 
-이 "템플릿 무수정" 관행에는 **예외가 3건 있다**(전부 2026-08-03, dart-qa 리뷰,
-사용자 승인). 셋 다 뿌리가 같다 — **완전자본잠식(자본총계 < 0)이면 부채비율이 음수**가
+이 "템플릿 무수정" 관행에는 **예외가 5건 있다**(전부 dart-qa 리뷰 후 사용자 승인).
+앞의 ①②③(2026-08-03)은 뿌리가 같다 — **완전자본잠식(자본총계 < 0)이면 부채비율이 음수**가
 되는데, 음수는 `null`도 `0`도 `NaN`/`Infinity`도 아니라 아래 `select_financial_rows()`의
 결측·0분모 가드를 **정상값으로 통과**하므로 이 모듈에서는 막을 수 없다(그리고 자본잠식
 자체는 실재하는 상태라 연도를 버려서도 안 된다 — `RATIO_POSITIVE_DENOMINATOR_KEYS`
@@ -36,6 +36,17 @@ HTML/CSS/차트 렌더 로직은 **원칙적으로** 건드리지 않는다(템�
      선그래프는 y축이 0부터 시작해 **음수 부채비율 지점이 차트 밖으로 잘려** 보이지
      않았다. 도넛은 음수가 섞이면 구성비 대신 금액 안내로 대체하고, 선그래프는
      음수까지 포함해 스케일을 잡고 0선을 긋는다(양수 구간 렌더는 수식상 동일).
+
+뒤의 두 건은 자본잠식과 무관하고, **JS는 건드리지 않은 HTML/CSS 수정**이다:
+
+  ④ `.opinion-tag` 배경색 fallback(2026-08-04 F1, CSS 1줄) — 전용 클래스가 없는
+     `부적정`/`미상`이 흰 종이에 흰 글자로 찍혔다(`UNKNOWN_OPINION_LABEL` 주석 참고).
+  ⑤ 비교군이 없을 때(`regionGroup=[]`)의 안내 문구(2026-08-05, HTML 2줄 + CSS 4줄) —
+     업종 필터 도입으로 생긴 63건(4.2%)에서 2페이지의 비교 영역 3개가 **안내 없이
+     통째로 백지**였다(peers 쪽 각주만 "동종업종 비교사 데이터 없음"을 찍고 지역
+     쪽 두 섹션은 조용했다). `#regionTable tbody:empty`(= 렌더된 행 0건)를 조건으로
+     쓰는 CSS만 얹어 순위 차트·상세 표 자리에 안내 문구를 보인다 — regionGroup이
+     있는 문서(95.8%)는 렌더 결과가 한 글자도 바뀌지 않는다.
 
 회귀 테스트는 전부 `tests/test_reports.py`에 있다(템플릿 원문 파싱 + Node `vm` 실제
 렌더 검증 2중 구조).
@@ -612,6 +623,10 @@ def select_financial_rows(snapshots: Sequence[Any]) -> FinancialSelection:
 # peers는 후보에서 통째로 빼고(`select_peers()`), regionGroup은 행은 남기되 금액/비율만
 # `None`으로 둔다(`_region_row()`). 한정의견은 제외 대상이 아니다.
 #
+# **업종 매칭(`match_by_industry_prefix()`)은 peers와 regionGroup 양쪽에 똑같이 적용된다**
+# (2026-08-05 — regionGroup은 그전까지 "같은 Job이면 업종 무관"이었다). 규칙이 갈리지
+# 않도록 함수 하나만 두고 두 곳이 같이 호출한다.
+#
 # 비율 계산식은 템플릿 `calcRatios()`와 **반드시 동일**해야 한다 —
 # 같은 문서 안에서 대상 회사(템플릿이 계산)와 비교군(여기서 계산)의 수치가 다른 식으로
 # 나오면 순위 차트가 조용히 어긋난다.
@@ -812,18 +827,34 @@ def _closest_by_revenue(
     return ordered[: max(limit, 0)]
 
 
-def select_peers(pool: PeerPool, target: PeerCandidate) -> list[PeerCandidate]:
-    """동종업종 비교사 — `induty_code` prefix 매칭(소분류 → 중분류 폴백).
+def match_by_industry_prefix(
+    candidates: Sequence[PeerCandidate], industry_code: str
+) -> list[PeerCandidate]:
+    """`induty_code` prefix 매칭 — 소분류(3자리) → 중분류(2자리) **한 번만** 폴백.
 
-    소분류(앞 3자리)로 자기 자신을 뺀 매칭이 `MIN_COMPARISON_SAMPLE`건 미만이면
-    중분류(앞 2자리)로 한 번 넓히고, 그래도 모자라면 **빈 목록**을 준다(에러가 아니라
-    정상 케이스다 — 템플릿이 "동종업종 비교사 데이터 없음"으로 렌더한다).
+    `peers`와 `regionGroup`이 **같은 함수**를 쓴다(2026-08-05). 두 곳에 같은 규칙을
+    복사해 두면 한쪽만 고쳐져 "동종업종 표에는 있는데 지역 표에는 없는 회사"처럼
+    같은 문서 안에서 기준이 갈린다 — 그래서 매칭 규칙은 여기 한 곳에만 둔다.
 
-    **의견거절/부적정 회사는 여기서 통째로 뺀다** — regionGroup처럼 값을 null로 두는
-    방식이 peers에서는 통하지 않는다(`UNRELIABLE_OPINIONS` 주석 참고: 템플릿이
-    `null*100 == 0`을 "0.0%"로 인쇄한다). 상한 절단(`_closest_by_revenue`)보다 먼저
-    걸러야 `build_industry_average()`의 가중평균에도 섞이지 않고, 최소 표본(2건) 판정도
-    "쓸 수 있는 후보" 기준으로 이뤄진다(부족하면 중분류 폴백이 정상 작동).
+    **다만 "규칙 공유"가 "결과 일치"를 보장하지는 않는다**(2026-08-05 L3, 문서화만
+    하고 로직은 그대로 둔다): 아래 두 호출부가 넘기는 **입력 목록이 다르므로**
+    (peers는 의견거절/부적정을 먼저 뺀다) 소분류에서 표본 2건을 채우느냐가 갈려
+    **선택되는 분류 단계(소분류 vs 중분류)가 서로 달라질 수 있다** — 그러면 peers
+    차트에는 있는데 지역 표에는 없는 회사가 여전히 남는다. 개발 DB 실측(후보
+    1,488건)으로 단계 불일치 6건, 그중 실제로 "peers에만 있는 회사"가 생기는 것은
+    4건(0.27%)이다(업종 매칭 도입 전 1,421건에서 대폭 줄었지만 0은 아니다).
+
+    소분류로 `MIN_COMPARISON_SAMPLE`건 미만이면 중분류로 한 번 넓히고, 그래도 모자라면
+    **빈 목록**을 준다(에러가 아니라 정상 케이스다). **대분류까지는 넓히지 않는다** —
+    거기까지 가면 "동종업종"이라는 말이 무의미해진다.
+
+    `candidates`는 **호출부가 이미 자기 자신과 각 비교군의 자격 요건을 걸러 넘긴
+    목록**이어야 한다. 최소 표본(2건) 판정이 그 목록 기준으로 이뤄지기 때문이다 —
+    나중에 걸러낼 회사를 여기서 세면 "표본은 충분하다고 보고 폴백을 멈췄는데 정작
+    표에는 한 곳만 남는" 상태가 된다. 두 호출부가 넘기는 목록이 다르다:
+      - `select_peers()`      : 자기 자신 + **의견거절/부적정 제외** 후의 목록
+      - `select_region_group()`: 자기 자신만 제외한 목록(의견거절/부적정은 행을 남기고
+                                수치만 감추므로 표본으로 센다 — `_region_row()` 참고)
 
     **[알려진 제약, 2026-08-04 L4] `induty_code` 자릿수가 회사마다 2~5자리로 제각각이라
     이 prefix 매칭은 비대칭이다** — 2자리 회사는 소분류 매칭을 건너뛰고 곧장 중분류
@@ -833,20 +864,34 @@ def select_peers(pool: PeerPool, target: PeerCandidate) -> list[PeerCandidate]:
     자릿수를 임의로 맞추거나 대분류까지 넓히는 식으로 "고치지 말 것"(표본만 늘고
     동종업종이라는 말이 무의미해진다).
     """
-    code = target.industry_code
+    code = (industry_code or "").strip()
     if not code:
         return []
-    others = [
-        c for c in _exclude_self(pool.candidates, target) if not is_unreliable_opinion(c.opinion)
-    ]
     for length in INDUSTRY_PREFIX_LENGTHS:
         if len(code) < length:
             continue
         prefix = code[:length]
-        matched = [c for c in others if c.industry_code.startswith(prefix)]
+        matched = [c for c in candidates if c.industry_code.startswith(prefix)]
         if len(matched) >= MIN_COMPARISON_SAMPLE:
-            return _closest_by_revenue(matched, target.revenue, MAX_PEERS)
+            return matched
     return []
+
+
+def select_peers(pool: PeerPool, target: PeerCandidate) -> list[PeerCandidate]:
+    """동종업종 비교사 — `match_by_industry_prefix()`(소분류 → 중분류 폴백) + 매출 근접순.
+
+    **의견거절/부적정 회사는 여기서 통째로 뺀다** — regionGroup처럼 값을 null로 두는
+    방식이 peers에서는 통하지 않는다(`UNRELIABLE_OPINIONS` 주석 참고: 템플릿이
+    `null*100 == 0`을 "0.0%"로 인쇄한다). 업종 매칭·상한 절단(`_closest_by_revenue`)
+    보다 먼저 걸러야 `build_industry_average()`의 가중평균에도 섞이지 않고, 최소
+    표본(2건) 판정도 "쓸 수 있는 후보" 기준으로 이뤄진다(부족하면 중분류 폴백이 정상
+    작동).
+    """
+    others = [
+        c for c in _exclude_self(pool.candidates, target) if not is_unreliable_opinion(c.opinion)
+    ]
+    matched = match_by_industry_prefix(others, target.industry_code)
+    return _closest_by_revenue(matched, target.revenue, MAX_PEERS)
 
 
 def build_peer_rows(peers: Sequence[PeerCandidate]) -> list[dict[str, Any]]:
@@ -961,25 +1006,60 @@ def _region_row(candidate: PeerCandidate, *, is_target: bool) -> dict[str, Any]:
 
 
 def select_region_candidates(pool: PeerPool, target: PeerCandidate) -> list[PeerCandidate]:
-    """지역 비교군에 실을 **다른 회사들**(대상 회사 제외)을 고른다.
+    """지역 비교군에 실을 **다른 회사들**(대상 회사 제외 + 동종업종만)을 고른다.
 
     `select_region_group()`이 표 행으로 변환하기 전 단계이며, 경고 집계
     (`collect_comparison_warnings()`)도 같은 목록을 봐야 하므로 함수로 분리해 뒀다 —
     두 곳이 각자 고르면 "경고에는 있는데 표에는 없는 회사"가 생긴다.
+
+    필터 순서(2026-08-05에 ②가 추가됐다):
+
+      ① 자기 자신 제외(`_exclude_self`)
+      ② **업종 매칭**(`match_by_industry_prefix`, 소분류 → 중분류 1회 폴백)
+      ③ 최소 표본(2건) 미달이면 빈 목록
+      ④ 매출 근접순 상한 절단(`MAX_REGION_GROUP - 1`)
+
+    ②를 ③④ **앞에** 두는 이유는 두 가지다. (a) 최소 표본과 소분류→중분류 폴백 판정은
+    "실제로 표에 실릴 회사" 기준이어야 한다 — 뒤에 걸러낼 회사를 세면 소분류로 충분한
+    줄 알고 폴백을 멈췄는데 정작 표에는 한 곳만 남는다. (b) 상한 15건을 매출 근접순으로
+    먼저 자르면 그 15칸이 타업종으로 채워져 업종 필터가 사실상 무력해진다.
+
+    반면 **감사의견 의견거절/부적정 회사는 여기서 빼지 않는다**(peers와 다른 점) —
+    regionGroup은 그 회사들의 행을 남기고 금액/비율만 감추는 방식이라(`_region_row()`)
+    표본으로도 그대로 센다. 기존 규칙(휴면·폐업 추정 제외·±100% 비율 상한은 풀 단계,
+    "미상" 표기·대상 회사 첫머리·매출 근접순 상한)은 전부 무변경이고 업종 필터만
+    얹었다.
     """
     others = _exclude_self(pool.candidates, target)
-    if len(others) < MIN_COMPARISON_SAMPLE:
+    matched = match_by_industry_prefix(others, target.industry_code)
+    if len(matched) < MIN_COMPARISON_SAMPLE:
         return []
-    return _closest_by_revenue(others, target.revenue, MAX_REGION_GROUP - 1)
+    return _closest_by_revenue(matched, target.revenue, MAX_REGION_GROUP - 1)
 
 
 def select_region_group(pool: PeerPool, target: PeerCandidate) -> list[dict[str, Any]]:
-    """지역 비교군 — 별도 시도/시군구 세분화 없이 **같은 Job 전체**를 후보 풀로 본다.
+    """지역 비교군 — 같은 Job(=같은 지역) 안에서 **업종까지 같은** 회사들만 싣는다.
 
-    Job의 검색 조건 자체가 지역이라(§4-9) Job 전체가 곧 "같은 지역"이다. 대상 회사는
-    업종·규모와 무관하게 **항상 `isTarget: true`로 배열 첫머리**에 들어가고(템플릿이
-    순위 차트에서 이 항목을 강조 색으로 칠한다), 나머지는 매출 규모가 가까운 순이다.
-    다른 회사가 `MIN_COMPARISON_SAMPLE`건 미만이면 빈 목록을 준다.
+    Job의 검색 조건 자체가 지역이라(§4-9) Job 전체가 곧 "같은 지역"이고, 여기에
+    **업종 매칭이 2026-08-05에 추가됐다** — 그전에는 지역만 같으면 됐기 때문에 "비교군
+    상세 현황" 표에 조선부품·시내버스운송·도장공사·상품중개가 한 회사의 문서에 나란히
+    실려, 매출총이익률 순위를 나열해도 비교의 의미가 없다는 지적을 사용자가 실제 생성
+    문서를 보고 제기했다. 매칭 규칙은 peers와 **완전히 같은 함수**를 쓴다
+    (`match_by_industry_prefix()`: 소분류 3자리 → 중분류 2자리 1회 폴백).
+
+    대상 회사는 규모와 무관하게 **항상 `isTarget: true`로 배열 첫머리**에 들어가고
+    (템플릿이 순위 차트에서 이 항목을 강조 색으로 칠한다), 나머지는 매출 규모가 가까운
+    순이다. 동종업종 후보가 `MIN_COMPARISON_SAMPLE`건 미만이면 **빈 목록**을 준다 —
+    peers가 표본 부족일 때 빈 값을 주는 것과 같은 기준이고, 템플릿도 빈 배열에 안전하다
+    (1개사만 놓고 "지역 내 순위"라고 인쇄하면 대외 문서로서 오해를 준다). 개발 DB
+    실측으로 이 경우는 후보 1,488건 중 63건(4.2%)이고, 그때는 템플릿이 순위 차트·상세
+    표 대신 안내 문구를 보인다(2026-08-05 템플릿 예외 ⑤ — HTML/CSS만 수정).
+
+    **단, 이 "2건" 게이트가 곧 "비교 막대 2개"는 아니다**(2026-08-05 L2, 문서화만):
+    의견거절/부적정 회사는 표본으로는 세지만 `_region_row()`가 금액/비율을 `None`으로
+    두고 템플릿 735행이 `filter(r=>r.매출총이익률!=null)`로 걸러내므로, **표본 2건을
+    채우고도 순위 차트에는 비교사가 1곳만 그려질 수 있다**(개발 DB 실측 6건, 0.4%).
+    표에는 두 곳 다 남으므로(수치만 "-") 차트와 표의 건수가 다른 것은 정상이다.
 
     표에 **회계연도 컬럼이 없다** — 후보마다 기준 연도가 다를 수 있지만(L1) 컬럼을
     추가하려면 템플릿 `<thead>`와 행 렌더를 고쳐야 해 손대지 않았다. 연도 표기는
