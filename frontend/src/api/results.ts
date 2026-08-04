@@ -73,7 +73,7 @@ export class SelectAllUnsupportedError extends Error {
  * 페이징 없이 전부 받아온다(2026-08-03).
  *
  * 목록 조회를 `page_size`만 키워 재사용할 수는 없다 — 백엔드가 `page_size`를 500으로
- * 조용히 상한 처리하고(에러 없이 잘림), 결과 1행이 63개 필드라 전체를 받으면
+ * 조용히 상한 처리하고(에러 없이 잘림), 결과 1행이 73개 필드라 전체를 받으면
  * 무겁기 때문이다(실측 1,222건 약 2.4MB vs id만 12.4KB).
  *
  * 응답에 `ids`가 없으면(구버전 서버) 빈 배열로 뭉개지 말고 `SelectAllUnsupportedError`를

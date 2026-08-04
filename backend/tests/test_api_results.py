@@ -18,12 +18,14 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app import main as app_main
+from app.api.results import SORTABLE_COLUMNS
 from app.core.db import get_db
 from app.exporters.excel import RESULT_COLUMN_LABELS
 from app.models import Base
 from app.models.financial_snapshot import FinancialSnapshot
 from app.models.job import Job, JobStatus
 from app.models.result import ParseStatus, Result
+from app.parsers.base import DETAIL_FINANCIAL_FIELDS
 
 
 @pytest.fixture
@@ -1247,6 +1249,120 @@ def test_get_result_history_returns_oldest_first(client_with_db):
     body = resp.json()
     assert [row["fiscal_year"] for row in body] == ["2023", "2024", "2025"]  # 오래된 -> 최신 순
     assert body[0]["revenue"] == 8_000
+
+
+def test_result_response_exposes_detail_account_fields(client_with_db):
+    """세부계정 5항목이 목록 응답에 실린다(2026-08-05) — CF 4항목·영업외손익 2항목과
+    동형이라 **결측(null)이 정상**이고, 구버전 수집분은 전부 null이다.
+
+    화면이 이 값을 쓰려면 라벨에 출처를 남겨야 한다(현금/매출채권은 contra 차감 후
+    **순액**, 감가상각비는 **현금흐름표** 기준 총액) — 필드명 자체에는 그 정보가
+    없으므로 엑셀 라벨(`FINANCIAL_SNAPSHOT_ACCOUNT_LABELS`)을 따를 것.
+    """
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+
+    db = factory()
+    try:
+        row = (
+            db.query(Result)
+            .filter(Result.job_id == job_id, Result.corp_code == "00100001")
+            .one()
+        )
+        row.cash_and_equivalents_cur = 1_500
+        row.trade_receivables_cur = 2_500
+        row.interest_expense_cur = 300
+        row.depreciation_cur = 700
+        row.amortization_cur = 100
+        db.commit()
+    finally:
+        db.close()
+
+    items = client.get(f"/api/jobs/{job_id}/results?sort=corp_name:asc").json()["items"]
+    filled = next(i for i in items if i["corp_code"] == "00100001")
+    empty = next(i for i in items if i["corp_code"] == "00100002")
+
+    assert filled["cash_and_equivalents_cur"] == 1_500
+    assert filled["trade_receivables_cur"] == 2_500
+    assert filled["interest_expense_cur"] == 300
+    assert filled["depreciation_cur"] == 700
+    assert filled["amortization_cur"] == 100
+    # 당기만 채운 행의 전기는 null(0으로 채우면 "이자비용 0원"이라는 틀린 사실이 된다).
+    assert filled["interest_expense_prv"] is None
+    for field in DETAIL_FINANCIAL_FIELDS:
+        assert empty[f"{field}_cur"] is None
+        assert empty[f"{field}_prv"] is None
+
+
+def test_detail_account_fields_are_sortable(client_with_db):
+    """세부계정 5항목도 `SORTABLE_COLUMNS` 화이트리스트에 있다(CF 4항목 전례와 동일).
+
+    값이 없는 행은 방향과 무관하게 항상 뒤로 밀린다(`_apply_sort()`).
+    """
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+
+    db = factory()
+    try:
+        row = (
+            db.query(Result)
+            .filter(Result.job_id == job_id, Result.corp_code == "00100001")
+            .one()
+        )
+        row.interest_expense_cur = 300
+        db.commit()
+    finally:
+        db.close()
+
+    for field in DETAIL_FINANCIAL_FIELDS:
+        assert f"{field}_cur" in SORTABLE_COLUMNS
+        assert f"{field}_prv" in SORTABLE_COLUMNS
+
+    body = client.get(
+        f"/api/jobs/{job_id}/results?sort=interest_expense_cur:desc"
+    ).json()
+    assert [i["corp_code"] for i in body["items"]] == ["00100001", "00100002"]
+
+
+def test_get_result_history_exposes_detail_account_fields(client_with_db):
+    """연도별 재무이력 응답에도 세부계정 5항목이 실린다(2026-08-05)."""
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+    result_id = _get_result_id(factory, job_id, "00100001")
+
+    db = factory()
+    try:
+        db.add_all(
+            [
+                FinancialSnapshot(
+                    result_id=result_id,
+                    rcept_no="R2",
+                    fiscal_year="2025",
+                    cash_and_equivalents=1_500,
+                    trade_receivables=2_500,
+                    interest_expense=300,
+                    depreciation=700,
+                    amortization=100,
+                ),
+                # 세부계정 도입 이전에 수집된 연도 — 전부 null이 정상이다.
+                FinancialSnapshot(result_id=result_id, rcept_no="R1", fiscal_year="2024"),
+            ]
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    body = client.get(f"/api/jobs/{job_id}/results/{result_id}/history").json()
+    old_year, new_year = body
+
+    assert [new_year[field] for field in DETAIL_FINANCIAL_FIELDS] == [
+        1_500,  # cash_and_equivalents (재무상태표, contra 차감 후 순액)
+        2_500,  # trade_receivables (재무상태표, 대손충당금 차감 후 순액)
+        300,  # interest_expense (손익계산서, 발생주의)
+        700,  # depreciation (현금흐름표, 제조원가 몫 포함 총액)
+        100,  # amortization (현금흐름표)
+    ]
+    assert all(old_year[field] is None for field in DETAIL_FINANCIAL_FIELDS)
 
 
 def test_get_result_history_includes_per_year_auditor_name(client_with_db):

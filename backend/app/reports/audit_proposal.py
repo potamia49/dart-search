@@ -115,10 +115,22 @@ LABEL_COLUMNS: tuple[str, str] = ("회사명", "주소")
 
 # `financial_snapshots` 컬럼 -> 템플릿 `financials[]` 키.
 #
-# 템플릿이 쓰는 14개 키(year + 13항목)만 싣는다 — 현금흐름표/영업외손익은 템플릿에
-# 대응 항목이 없어 제외한다. 라벨은 템플릿의 계산식(`calcRatios`)이 참조하는 이름이라
-# 임의로 바꾸면 안 된다("판관비"는 엑셀 내보내기의 "판매비와관리비"와 표기가 다른데,
-# 이는 템플릿 쪽 이름을 따른 것이다).
+# **앞의 13항목은 템플릿이 실제로 읽는 키**다. 라벨은 템플릿의 계산식(`calcRatios`)이
+# 참조하는 이름이라 임의로 바꾸면 안 된다("판관비"는 엑셀 내보내기의 "판매비와관리비"와
+# 표기가 다른데, 이는 템플릿 쪽 이름을 따른 것이다).
+#
+# **뒤의 세부계정 5항목(2026-08-05)은 템플릿이 아직 읽지 않는다** — EMBEDDED_DATA의
+# `financials[]`에 값만 실린다. 이 확장이 안전한 이유는 템플릿 JS가 `financials` 행을
+# **명시 키로만** 읽기 때문이다(`f.매출액` 등. 유일한 `for...in`은 `svgEl()`의 SVG 속성
+# 객체 순회이고 financials와 무관하다) — 모르는 키가 늘어도 렌더 결과가 한 글자도
+# 바뀌지 않는다. 화면에 실제로 인쇄하려면 템플릿에 카드/표를 새로 넣어야 하고, 그건
+# "템플릿은 원칙적으로 수정하지 않는다" 관행 때문에 **사용자 판단 사항으로 남겨 뒀다**.
+#
+# 세부계정 5항목의 라벨은 **엑셀 내보내기와 글자까지 동일**하게 둔다(위 "판관비"와 달리
+# 템플릿이 요구하는 이름이 없으므로 굳이 다른 표기를 만들 이유가 없다). 특히
+# "(순액)"/"(현금흐름표)" 접미어는 장식이 아니라 **출처 표시**다 — 매출채권 총액은
+# 순액의 최대 6.4배이고, 감가상각비는 손익계산서 판관비 몫과 실측 75.4% 불일치한다
+# (`parsers/base.py`의 `DETAIL_FINANCIAL_FIELDS` 주석 참고).
 #
 # 키(왼쪽)가 실제 스냅샷 컬럼인지는 tests/test_reports.py의 드리프트 가드가
 # `FINANCIAL_SNAPSHOT_ACCOUNT_LABELS`(app/exporters/excel.py)와 대조해 잠근다.
@@ -136,7 +148,34 @@ SNAPSHOT_FIELD_TO_REPORT_KEY: dict[str, str] = {
     "sga": "판관비",
     "operating_income": "영업이익",
     "net_income": "당기순이익",
+    # --- 여기부터 세부계정 5항목 (2026-08-05). 템플릿 미사용(위 주석 참고). ---
+    "cash_and_equivalents": "현금및현금성자산(순액)",
+    "trade_receivables": "매출채권(순액)",
+    "interest_expense": "이자비용",
+    "depreciation": "감가상각비(현금흐름표)",
+    "amortization": "무형자산상각비",
 }
+
+# 위 매핑 중 **템플릿이 실제로 읽는** 13항목의 컬럼명. 세부계정 5항목처럼 "값만 싣고
+# 템플릿은 아직 안 쓰는" 키가 늘어날 때, 연도 선별(`RATIO_REQUIRED_KEYS`)이나 등급
+# 계산이 그 키에 끌려가지 않는지 테스트가 대조하기 위한 기준선이다.
+TEMPLATE_USED_SNAPSHOT_FIELDS: frozenset[str] = frozenset(
+    {
+        "current_assets",
+        "noncurrent_assets",
+        "total_assets",
+        "current_liab",
+        "noncurrent_liab",
+        "total_liab",
+        "total_equity",
+        "revenue",
+        "cogs",
+        "gross_profit",
+        "sga",
+        "operating_income",
+        "net_income",
+    }
+)
 
 # 템플릿이 **계산에 쓰는** 항목(하나라도 null이면 그 연도를 통째로 제외한다).
 #

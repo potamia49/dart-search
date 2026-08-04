@@ -34,6 +34,7 @@ from app.models import Base
 from app.models.financial_snapshot import FinancialSnapshot
 from app.models.job import Job, JobStatus
 from app.models.result import ParseStatus, Result
+from app.parsers.base import DETAIL_FINANCIAL_FIELDS
 from app.reports import audit_proposal, firm_profile
 from app.reports.audit_proposal import (
     LABEL_FILENAME,
@@ -46,6 +47,7 @@ from app.reports.audit_proposal import (
     UNRELIABLE_OPINIONS,
     RATIO_REQUIRED_KEYS,
     SNAPSHOT_FIELD_TO_REPORT_KEY,
+    TEMPLATE_USED_SNAPSHOT_FIELDS,
     PeerPool,
     ReportGenerationError,
     ReportInput,
@@ -120,8 +122,60 @@ def test_snapshot_field_mapping_matches_real_snapshot_columns():
     """
     unknown = set(SNAPSHOT_FIELD_TO_REPORT_KEY) - set(FINANCIAL_SNAPSHOT_ACCOUNT_LABELS)
     assert not unknown, f"스냅샷에 없는 컬럼을 매핑하고 있습니다: {sorted(unknown)}"
-    # 템플릿이 요구하는 13항목(재무상태표 7 + 손익계산서 6)이 모두 있어야 한다.
-    assert len(SNAPSHOT_FIELD_TO_REPORT_KEY) == 13
+    # 템플릿이 요구하는 13항목(재무상태표 7 + 손익계산서 6) + 세부계정 5항목
+    # (2026-08-05, 템플릿 미사용이지만 EMBEDDED_DATA에는 싣는다).
+    assert len(SNAPSHOT_FIELD_TO_REPORT_KEY) == 18
+    assert TEMPLATE_USED_SNAPSHOT_FIELDS <= set(SNAPSHOT_FIELD_TO_REPORT_KEY)
+    assert len(TEMPLATE_USED_SNAPSHOT_FIELDS) == 13
+
+
+def test_detail_fields_are_mapped_with_export_labels():
+    """세부계정 5항목이 **엑셀 내보내기와 글자까지 같은 라벨**로 매핑돼 있어야 한다.
+
+    "(순액)"/"(현금흐름표)" 접미어는 장식이 아니라 출처 표시다 — 이걸 줄이면 같은
+    이름의 다른 숫자(매출채권 총액=순액의 최대 6.4배, 손익계산서 감가상각비=실측
+    75.4% 불일치)와 섞인다. 보고서와 엑셀에서 표기가 갈리는 것도 같은 문제다.
+    """
+    for column in DETAIL_FINANCIAL_FIELDS:
+        assert column in SNAPSHOT_FIELD_TO_REPORT_KEY, f"보고서 매핑 누락: {column}"
+        assert (
+            SNAPSHOT_FIELD_TO_REPORT_KEY[column]
+            == FINANCIAL_SNAPSHOT_ACCOUNT_LABELS[column]
+        ), f"엑셀 내보내기와 라벨이 어긋납니다: {column}"
+
+    # 템플릿이 읽는 13항목과 겹치지 않아야 한다(겹치면 계산에 끌려간다).
+    assert not (set(DETAIL_FINANCIAL_FIELDS) & TEMPLATE_USED_SNAPSHOT_FIELDS)
+
+
+def test_detail_fields_do_not_affect_year_selection():
+    """세부계정 5항목은 결측이어도 그 연도를 버리지 않는다(best-effort 성격 유지).
+
+    `RATIO_REQUIRED_KEYS`(연도 제외 판정)에 새 라벨이 섞여 들어가면, 지금까지
+    보고서가 나오던 회사가 새 컬럼이 NULL이라는 이유만으로 조용히 미생성으로
+    바뀐다 — 기존 5,204행이 전부 NULL이므로 사실상 전멸이다.
+    """
+    detail_labels = {SNAPSHOT_FIELD_TO_REPORT_KEY[c] for c in DETAIL_FINANCIAL_FIELDS}
+    assert not (detail_labels & set(RATIO_REQUIRED_KEYS))
+
+    row = {key: 1 for key in RATIO_REQUIRED_KEYS}
+    row.update({label: None for label in detail_labels})
+    assert missing_ratio_inputs(row) == []
+
+
+def test_template_reads_financial_rows_by_explicit_key_only(template_text):
+    """템플릿 확장 안전성 — `financials` 행을 **명시 키로만** 읽는지 확인한다.
+
+    세부계정 5항목을 화이트리스트에 넣으면 EMBEDDED_DATA의 `financials[]`에 모르는
+    키가 5개 늘어난다. 템플릿이 행을 키 순회(`for...in`/`Object.keys`)로 렌더한다면
+    새 항목이 라벨 없이 표에 새어 나오므로, 그런 코드가 없다는 것을 잠근다.
+    (유일한 `for...in`은 SVG 속성 객체를 도는 `svgEl()`이고 financials와 무관하다.)
+    """
+    script = template_text[template_text.index("<script>") :]
+    assert "Object.keys" not in script
+    assert "Object.entries" not in script
+    assert "Object.values" not in script
+    for_in = re.findall(r"for\s*\(\s*(?:const|let|var)\s+(\w+)\s+in\s+(\w+)\s*\)", script)
+    assert for_in == [("k", "attrs")], f"예상치 못한 키 순회: {for_in}"
 
 
 def test_template_is_resolvable_from_repo(report_settings):
@@ -488,6 +542,48 @@ def test_generate_reports_writes_html_per_company_and_label_excel(report_setting
     ]
 
 
+def test_generated_html_carries_detail_account_values(report_settings):
+    """세부계정 5항목이 EMBEDDED_DATA의 `financials[]`에 실제로 실린다(2026-08-05).
+
+    템플릿은 아직 이 값을 인쇄하지 않지만(카드/표 추가는 사용자 판단 사항),
+    데이터는 문서 안에 남아 있어야 다음 단계에서 템플릿만 고치면 된다.
+    결측(NULL)은 그대로 null이어야 한다 — best-effort 필드라 결측이 정상이고,
+    0으로 채우면 "이자비용 0원"이라는 틀린 사실이 문서에 남는다.
+    """
+    detail_2024 = {
+        "cash_and_equivalents": 1_500,
+        "trade_receivables": 2_500,
+        "interest_expense": 300,
+        "depreciation": 700,
+        "amortization": 100,
+    }
+    items = [
+        ReportInput(
+            result=_result_stub(1, "㈜세부계정", "경남 김해시 1"),
+            snapshots=[
+                _snapshot_stub("2023"),  # 세부계정 전부 결측(구버전 수집분)
+                _snapshot_stub("2024", **detail_2024),
+            ],
+        )
+    ]
+    outcome = generate_reports(items, today=date(2026, 8, 5))
+    data = _extract_embedded_json(
+        (outcome.output_dir / "㈜세부계정.html").read_text(encoding="utf-8")
+    )
+    older, latest = data["financials"]
+
+    for column, value in detail_2024.items():
+        label = SNAPSHOT_FIELD_TO_REPORT_KEY[column]
+        assert latest[label] == value
+        assert older[label] is None  # 결측은 0이 아니라 null
+
+    # 결측 연도(2023)도 버려지지 않는다 — 세부계정은 연도 선별 기준이 아니다.
+    assert [row["year"] for row in data["financials"]] == [2023, 2024]
+    # 라벨에 출처가 남아 있어야 한다(총액/판관비 몫과 혼동 방지).
+    assert latest["현금및현금성자산(순액)"] == 1_500
+    assert latest["감가상각비(현금흐름표)"] == 700
+
+
 def test_generate_reports_skips_company_whose_only_year_is_incomplete(report_settings):
     """[H1/H2] 유일한 연도의 매출액이 없으면 → 실을 연도 0건 → 생성 자체를 건너뛴다."""
     items = [
@@ -767,6 +863,43 @@ def test_rendered_report_grades_capital_impaired_company_as_d(report_settings, t
     assert rendered["㈜자본잠식.html"]["grades"]["재무안정성"] == "D"
     # 정상 회사(부채비율 1.0 / 유동비율 2.0)는 기존과 같은 B.
     assert rendered["㈜정상.html"]["grades"]["재무안정성"] == "B"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js가 없어 템플릿 렌더 검증 생략")
+def test_rendered_report_is_unchanged_by_detail_accounts(report_settings, tmp_path):
+    """세부계정 5항목을 실어도 **렌더 결과가 한 글자도 바뀌지 않는다**(2026-08-05).
+
+    화이트리스트 확장은 EMBEDDED_DATA에 모르는 키 5개를 더하는 일이라, 템플릿이
+    행을 키 순회로 렌더한다면 라벨 없는 값이 표에 새어 나온다. 재무 13항목이
+    완전히 같고 세부계정만 다른 두 회사를 한 번에 렌더해 등급·리스크 문구가
+    동일한지 대조한다(정적 검사는 `test_template_reads_financial_rows_by_
+    explicit_key_only`가 별도로 잠근다).
+    """
+    detail = {
+        "cash_and_equivalents": 1_500,
+        "trade_receivables": 2_500,
+        "interest_expense": 300,
+        "depreciation": 700,
+        "amortization": 100,
+    }
+    items = [
+        ReportInput(
+            result=_result_stub(1, "㈜세부있음", "주소1"),
+            snapshots=[
+                _snapshot_stub("2024", **detail),
+                _snapshot_stub("2025", **detail),
+            ],
+        ),
+        ReportInput(
+            result=_result_stub(2, "㈜세부없음", "주소2"),
+            snapshots=[_snapshot_stub("2024"), _snapshot_stub("2025")],
+        ),
+    ]
+    outcome = generate_reports(items, today=date(2026, 8, 5))
+    rendered = _render_reports_with_node(outcome.output_dir, tmp_path)
+
+    assert rendered["㈜세부있음.html"]["grades"] == rendered["㈜세부없음.html"]["grades"]
+    assert rendered["㈜세부있음.html"]["risks"] == rendered["㈜세부없음.html"]["risks"]
 
 
 # ---------------------------------------------------------------------------

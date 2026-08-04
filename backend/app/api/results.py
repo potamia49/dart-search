@@ -105,6 +105,14 @@ SORTABLE_COLUMNS: tuple[str, ...] = (
     "cf_ending_cash_cur", "cf_ending_cash_prv",
     "non_operating_income_cur", "non_operating_income_prv",
     "non_operating_expense_cur", "non_operating_expense_prv",
+    # 세부계정 5항목 (`DETAIL_FINANCIAL_FIELDS`, 2026-08-05). CF 4항목·영업외손익
+    # 2항목과 동형인 best-effort 필드라 정렬 대상에도 같은 방식으로 넣는다 —
+    # 값이 없는 행은 `_apply_sort()`가 방향과 무관하게 항상 뒤로 보낸다.
+    "cash_and_equivalents_cur", "cash_and_equivalents_prv",
+    "trade_receivables_cur", "trade_receivables_prv",
+    "interest_expense_cur", "interest_expense_prv",
+    "depreciation_cur", "depreciation_prv",
+    "amortization_cur", "amortization_prv",
     "latest_disclosure_date",
 )
 
@@ -266,6 +274,28 @@ class ResultResponse(BaseModel):
     non_operating_income_prv: int | None
     non_operating_expense_cur: int | None
     non_operating_expense_prv: int | None
+    # 세부계정 5항목 (`DETAIL_FINANCIAL_FIELDS`, 2026-08-05) — CF 4항목·영업외손익
+    # 2항목과 동형인 best-effort 필드다. `determine_parse_status()` 판정에 관여하지
+    # 않으므로 **결측(null)이 정상**이고, "컬럼 추가만, 소급 재파싱 없음" 관행대로
+    # 2026-08-05 이전에 수집된 행은 전부 null이다(신규 Phase 2 실행분부터 채워짐).
+    #
+    # **각 필드의 원천 재무제표가 하나로 고정돼 있다**(`parsers/base.py` 주석 참고):
+    # 현금·매출채권은 재무상태표의 **contra 행 차감 후 순액**(총액이 아니다 — 매출채권
+    # 총액은 순액의 최대 6.4배), 이자비용은 손익계산서(발생주의), 감가상각비·
+    # 무형자산상각비는 현금흐름표(제조원가 몫 포함 총액 — 손익계산서 판관비 몫과
+    # 실측 75.4% 불일치)다. 화면에 라벨을 붙일 때 이 출처를 지우면 같은 이름의
+    # 다른 숫자와 섞인다(엑셀 라벨은 "현금및현금성자산(순액)"/"매출채권(순액)"/
+    # "감가상각비(현금흐름표)").
+    cash_and_equivalents_cur: int | None
+    cash_and_equivalents_prv: int | None
+    trade_receivables_cur: int | None
+    trade_receivables_prv: int | None
+    interest_expense_cur: int | None
+    interest_expense_prv: int | None
+    depreciation_cur: int | None
+    depreciation_prv: int | None
+    amortization_cur: int | None
+    amortization_prv: int | None
 
     # 금융위 요약재무 참고값 + 기준연도 (§4-10-C/D) — 후보 목록에서 "재무정보 수집을
     # 시작할지" 판단할 근거로만 쓴다. 필터 판정은 항상 `_cur`(원문 파싱값) 기준이다.
@@ -343,7 +373,8 @@ async def list_results(
     - `items`는 **항상 빈 배열**이고 `ids`가 정렬 순서 그대로 전체 id를 담는다.
       `page`/`page_size` 파라미터는 무시하며(전체를 한 번에 준다), 응답의
       `page`는 1, `page_size`는 반환한 id 개수(=`total`)로 채운다.
-    - 전체 필드를 담은 `items`(컬럼 63개, 실측 약 1.9KB/행)를 다시 내려받지 않기
+    - 전체 필드를 담은 `items`(컬럼 73개 — 2026-08-05 세부계정 5항목 노출로 63개에서
+      늘었다. 아래 크기 수치는 63개 시점 실측이라 지금은 그보다 크다)를 다시 내려받지 않기
       위해 SQL 자체가 `results.id` 한 컬럼만 SELECT한다 — 4,383건 기준 응답이
       약 8.5MB → 약 26KB로 줄고, `page_size` 상한(500) 때문에 필요했던 9회
       페이지 순회도 1회로 줄어든다.
@@ -725,7 +756,7 @@ def _load_job_peer_pool(db: Session, job_id: int) -> PeerPool:
     **요청당 쿼리 2건**(결과 목록 + 그 Job의 스냅샷 전체)으로 끝낸다.
 
     - 결과는 회사명/업종/의견만 있으면 되므로 필요한 5컬럼만 SELECT한다
-      (`ResultResponse` 63필드를 수천 행 적재하지 않기 위함).
+      (`ResultResponse` 73필드를 수천 행 적재하지 않기 위함).
     - 휴면·폐업 추정(`excluded_by_stale_disclosure=1`)은 SQL에서 미리 뺀다.
       `excluded_by_revenue`/`excluded_by_assets`는 **빼지 않는다**(정상 영업 회사라
       비교군으로는 유효하다 — audit_proposal.py "비교군" 주석 참고).
@@ -1019,6 +1050,14 @@ class FinancialSnapshotResponse(BaseModel):
     cf_ending_cash: int | None
     non_operating_income: int | None
     non_operating_expense: int | None
+    # 세부계정 5항목 (`DETAIL_FINANCIAL_FIELDS`, 2026-08-05) — `ResultResponse`의
+    # 같은 이름 `_cur`/`_prv` 필드와 동일한 값의 연도별 판이다(결측 null이 정상,
+    # 원천 재무제표 고정 — 위 `ResultResponse` 주석 참고).
+    cash_and_equivalents: int | None
+    trade_receivables: int | None
+    interest_expense: int | None
+    depreciation: int | None
+    amortization: int | None
 
     # 그 연도를 **당기**로 감사한 감사인 이름 (2026-07-26). 전기 열 유래 행
     # (`from_current_period=0`)과 이 기능 도입 이전에 수집된 기존 이력은 null이다
