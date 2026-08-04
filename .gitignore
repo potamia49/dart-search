@@ -29,8 +29,12 @@ backend/data/documents/*
 !backend/data/documents/.gitkeep
 
 # --- 선택 항목 보고서 산출물 (POST /api/jobs/{id}/generate-report, 2026-08-03) ---
-# 실행 시 REPORT_OUTPUT_DIR(기본 backend/report) 아래 날짜 폴더로 생성되는 결과물이다.
+# 실행 시 REPORT_OUTPUT_DIR(기본 backend/report, 이 저장소의 .env는 저장소 루트 report/로
+# 재정의돼 있음) 아래 날짜 폴더로 생성되는 결과물이다. 실제 회사명/주소/재무수치가 담긴
+# 산출물이라 REPORT_OUTPUT_DIR 값과 무관하게 원격에 올라가지 않도록 두 경로 모두 무시한다
+# (2026-08-04 dart-qa 지적 — backend/report/만 있어 루트 report/가 사각지대였음).
 backend/report/
+/report/
 
 # --- Node / 프론트엔드 ---
 node_modules/

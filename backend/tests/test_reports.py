@@ -1804,7 +1804,8 @@ def test_template_hides_empty_comparison_sections_with_notice(template_text):
     notices = re.findall(r'<div class="footnote empty-note">(※[^<]*)</div>', template_text)
     assert len(notices) == 2, "안내 문구 div 2개(순위 차트 자리 / 상세 현황 표 자리)가 필요합니다"
     for notice in notices:
-        assert "비교 가능한 회사가 없어" in notice
+        # 문구는 섹션 제목("동일 지역·규모 비교군 순위")과 어휘를 맞춘다(2026-08-05 Info-3).
+        assert "동일 지역에 비교 가능한 동종업종 회사가 없어" in notice
     # 두 안내는 각각 어느 섹션 자리인지 알 수 있게 문구가 달라야 한다.
     assert notices[0] != notices[1]
 
