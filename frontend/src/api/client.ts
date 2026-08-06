@@ -5,6 +5,13 @@ import axios from 'axios'
 // 전혀 다루지 않는다 — 모든 DART 호출은 백엔드가 대신 수행한다 (CLAUDE.md 원칙).
 export const apiClient = axios.create({
   baseURL: '/api',
+  // 배열 파라미터를 **같은 이름의 반복 쿼리**(`?f=A&f=B`)로 직렬화한다 — axios 기본값은
+  // `?f[]=A&f[]=B`라 FastAPI의 `list[str]` 파라미터가 **하나도 안 잡힌다**(모르는
+  // 파라미터로 조용히 무시돼 "필터를 걸었는데 결과가 그대로"가 된다).
+  // §4-14의 값 목록 필터(`induty_name_in` 등)가 이 형식을 쓴다 — 값이 업종명 같은
+  // 자유 텍스트라 콤마 구분을 쓸 수 없어(값 자체에 쉼표가 흔함) 백엔드가 반복
+  // 파라미터로 계약했다. 배열이 아닌 파라미터에는 영향이 없다.
+  paramsSerializer: { indexes: null },
 })
 
 /** FastAPI 에러 응답(`{"detail": ...}`)에서 사용자에게 보여줄 문구를 뽑는다.

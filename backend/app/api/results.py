@@ -40,9 +40,9 @@ from collections.abc import Sequence
 from functools import partial
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import Select, and_, false, func, or_, select
+from sqlalchemy import Select, and_, distinct, false, func, or_, select, true
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
@@ -223,6 +223,206 @@ def _auditor_changed_ext_condition(value: str):
     )
 
 
+# ---------------------------------------------------------------------------
+# 결과화면 컬럼 필터 2차 — 텍스트/값 목록 컬럼 (§4-14, 2026-08-05)
+#
+# §4-13-B가 다룬 4개 컬럼(매출액/총자산/파싱상태/감사인변동) 외에 회사명·주소·업종·
+# 감사인·감사의견 5개 컬럼에도 헤더 필터를 붙이기 위한 파라미터다. 두 부류로 나뉘고,
+# **각 컬럼마다 포함(선택)과 제외를 모두 지원**한다(사용자 요구):
+#
+#   (1) 자유 텍스트 부분일치 — 회사명(`corp_name_contains`/`corp_name_not_contains`),
+#       주소(`address_contains`/`address_not_contains`). 고유값이 사실상 전부 달라
+#       값 목록을 고르는 방식이 성립하지 않는다.
+#   (2) 값 목록 다중 선택 — 업종명/감사인명/감사의견(`*_in`/`*_not_in`). 고를 값의
+#       목록은 `GET /api/jobs/{id}/results/distinct-values`가 준다(엑셀 컬럼 필터의
+#       "값 목록"에 해당. 이 조회가 없다는 이유로 §4-13-C에서 향후 과제로 미뤄 뒀던
+#       바로 그 부분이다).
+#
+# **기존 콤마 구분 목록 규약(`parse_status_ext` 등)을 값 목록에는 쓰지 않는다** —
+# 그쪽은 값이 코드 상수(`OK`/`CHANGED`…)라 안전하지만, 여기 값은 DB에 실제로 들어 있는
+# 자유 텍스트(업종명·감사인명)라 값 자체에 쉼표가 들어가면 토큰이 조용히 쪼개져 **아무
+# 것도 매칭되지 않는다**. 가정이 아니라 실측이다 — 개발 DB의 업종명에는 쉼표가 흔하다
+# ("직물, 편조원단 및 의복류 염색 가공업" 등 Job 27 기준 330건/7.5%). 그래서 값 목록은
+# **같은 이름을 여러 번 반복**하는 방식(`?induty_name_in=A&induty_name_in=B`)으로
+# 받는다 — 이스케이프가 필요 없고 값을 그대로 왕복시킬 수 있다.
+# 다만 기존 규약의 *정신*(파라미터 미지정 = 필터 없음 / 빈 값 = 아무 것도 선택 안 함
+# = 0건 / 잘못된 입력은 조용히 버리지 않고 400)은 그대로 지킨다.
+# ---------------------------------------------------------------------------
+
+# 값 목록 조회(`distinct-values`)와 `*_in`/`*_not_in` 필터를 지원하는 컬럼.
+# 회사명/주소는 **일부러 빼 뒀다** — 고유값이 행 수와 사실상 같아 목록을 뽑아 봐야
+# 고를 수 없고, 그쪽은 (1)의 텍스트 부분일치가 맞는 도구다.
+DISTINCT_VALUE_FIELDS: tuple[str, ...] = (
+    "induty_name",
+    "auditor_name",
+    "audit_opinion",
+)
+
+# "값 없음"을 값 목록에서 **명시적으로 고르기 위한** 예약 토큰(엑셀 필터의
+# "(필드 값 없음)" 항목과 같은 역할). `?audit_opinion_in=__BLANK__`이면 감사의견이
+# NULL이거나 빈 문자열인 행만 남고, `?audit_opinion_not_in=__BLANK__`이면 그 행들만
+# 빠진다. NULL/빈 문자열을 하나로 묶는 이유는 두 가지다 — ① 사용자에게는 둘 다 "빈
+# 셀"이라 구분할 이유가 없고, ② 빈 문자열을 일반 값으로 두면 `?field_in=`(빈 쿼리
+# 파라미터)이 "아무 것도 선택 안 함"인지 "빈 값을 골랐음"인지 구분되지 않는다.
+# (개발 DB 실측으로는 빈 문자열이 0건이고 전부 NULL이지만, 파서/파이프라인이 어느 날
+#  빈 문자열을 쓰기 시작해도 화면 동작이 갈라지지 않게 처음부터 묶어 둔다.)
+#
+# 이 토큰이 필요한 규모의 근거: 감사인명은 Job 27에서 4,383건 중 **1,886건(43.0%)**,
+# 감사의견은 **1,990건(45.4%)** 이 값 없음이다(파싱 실패·감사보고서 없음). 값 없음을
+# 고를 수단이 없으면 목록 필터를 켜는 순간 그 절반이 통째로 사라진다.
+BLANK_VALUE_TOKEN = "__BLANK__"
+
+# 입력 상한 — 자유 텍스트라 화이트리스트 검증이 불가능한 대신 크기만 막는다.
+# (넘으면 400. 조용히 자르면 "고른 값 중 일부가 무시됐다"가 되어 더 위험하다.)
+_MAX_TEXT_FILTER_LEN = 200
+_MAX_VALUE_FILTER_ITEMS = 500
+_MAX_VALUE_FILTER_LEN = 500
+
+# 값 목록 조회 상한 — 개발 DB 실측 최대치는 업종명 738종(Job 27, 결과 4,383건)이라
+# 기본값 1000이면 현실적인 Job은 한 번에 다 담긴다(감사인 247종 / 감사의견 4종).
+# 그래도 넘치면 `truncated=true`로 알리고 화면이 `q`로 좁히게 한다.
+_DISTINCT_VALUES_DEFAULT_LIMIT = 1000
+_DISTINCT_VALUES_MAX_LIMIT = 2000
+
+# LIKE 패턴에서 특수 의미를 갖는 문자 — 사용자가 친 그대로를 찾게 하려면 반드시
+# 이스케이프해야 한다(회사명에 실제로 `_`가 들어가는 경우가 있고, `%`를 치면
+# 이스케이프 없이는 "아무 글자나"가 되어 전 행이 매칭된다).
+_LIKE_ESCAPE_CHAR = "\\"
+
+
+def _is_blank(column):
+    """"값 없음" 조건 — NULL 또는 빈 문자열(위 `BLANK_VALUE_TOKEN` 주석 참고)."""
+    return or_(column.is_(None), column == "")
+
+
+def _like_pattern(keyword: str) -> str:
+    """부분일치용 LIKE 패턴(`%키워드%`) — 와일드카드/이스케이프 문자를 먼저 escape."""
+    escaped = (
+        keyword.replace(_LIKE_ESCAPE_CHAR, _LIKE_ESCAPE_CHAR * 2)
+        .replace("%", _LIKE_ESCAPE_CHAR + "%")
+        .replace("_", _LIKE_ESCAPE_CHAR + "_")
+    )
+    return f"%{escaped}%"
+
+
+def _normalize_text_filter(raw: str | None, param_name: str) -> str | None:
+    """텍스트 부분일치 파라미터 정규화 — 공백뿐이면 `None`(=필터 없음)."""
+    if raw is None:
+        return None
+    keyword = raw.strip()
+    if not keyword:
+        # 검색어(`q`)와 같은 방침: 빈 입력은 "필터 없음"이다. 값 목록(`*_in`)의
+        # 빈 값과 달리 0건으로 두지 않는 이유는, 텍스트 입력칸을 비우는 행위가
+        # 화면에서 "이 필터를 끈다"는 뜻이기 때문이다(체크박스를 전부 끄는 것과 다르다).
+        return None
+    if len(keyword) > _MAX_TEXT_FILTER_LEN:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{param_name}이(가) 너무 깁니다: {len(keyword)}자 "
+                f"(최대 {_MAX_TEXT_FILTER_LEN}자)"
+            ),
+        )
+    return keyword
+
+
+def _apply_text_filter(stmt: Select, column, keyword: str | None, *, exclude: bool) -> Select:
+    """회사명/주소 부분일치(포함/제외) 조건을 건다(§4-14).
+
+    - 포함(`exclude=False`): `컬럼 LIKE '%키워드%'`. 값이 NULL인 행은 "그 글자를
+      포함한다"고 볼 수 없으므로 빠진다(NULL LIKE는 SQL에서 NULL = 거짓 취급).
+    - 제외(`exclude=True`): `컬럼 IS NULL OR 컬럼 = '' OR NOT (컬럼 LIKE ...)`.
+      **NULL/빈 값 행을 반드시 통과시켜야 한다** — 순진하게 `NOT LIKE`만 쓰면
+      NULL이 NULL로 평가돼 조용히 사라진다(금액 범위 필터의 NULL 통과 방침과 같은
+      이유다. 이 화면은 검수용이라 값 없는 회사가 사라지면 검수 경로가 끊긴다).
+    """
+    if keyword is None:
+        return stmt
+    matches = column.ilike(_like_pattern(keyword), escape=_LIKE_ESCAPE_CHAR)
+    if not exclude:
+        return stmt.where(matches)
+    return stmt.where(or_(_is_blank(column), ~matches))
+
+
+def _parse_value_filter(raw: list[str] | None, param_name: str) -> list[str] | None:
+    """반복 쿼리 파라미터(`?f=A&f=B`)를 값 목록으로 정규화한다(§4-14).
+
+    - 파라미터 자체가 없으면 `None` = **필터하지 않음**.
+    - 빈 토큰(`?f=`)은 값이 아니라 "선택 없음"으로 보고 버린다 → 빈 리스트가 되며,
+      호출부가 포함/제외에 따라 다르게 해석한다(포함=0건 / 제외=아무 것도 안 뺌).
+      실제 "빈 값"을 고르려면 `__BLANK__` 토큰을 쓴다.
+    - **값의 앞뒤 공백을 다듬지 않는다** — 이 값은 `distinct-values` 응답을 그대로
+      되돌려 보내는 계약이라, 다듬으면 앞뒤 공백이 붙은 원본 값과 매칭되지 않는다.
+    - 개수/길이 상한을 넘으면 400.
+    """
+    if raw is None:
+        return None
+    values: list[str] = []
+    for token in raw:
+        if token == "":
+            continue
+        if len(token) > _MAX_VALUE_FILTER_LEN:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{param_name}의 값이 너무 깁니다: {len(token)}자 "
+                    f"(최대 {_MAX_VALUE_FILTER_LEN}자)"
+                ),
+            )
+        if token not in values:
+            values.append(token)
+    if len(values) > _MAX_VALUE_FILTER_ITEMS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{param_name}에 값이 너무 많습니다: {len(values)}개 "
+                f"(최대 {_MAX_VALUE_FILTER_ITEMS}개)"
+            ),
+        )
+    return values
+
+
+def _value_list_condition(column, values: list[str]):
+    """선택한 값 중 **하나라도** 일치하는 행 조건(`__BLANK__`는 값 없음)."""
+    plain = [v for v in values if v != BLANK_VALUE_TOKEN]
+    clauses = []
+    if plain:
+        clauses.append(column.in_(plain))
+    if len(plain) != len(values):
+        clauses.append(_is_blank(column))
+    return or_(*clauses) if clauses else false()
+
+
+def _value_list_exclude_condition(column, values: list[str]):
+    """선택한 값을 **전부** 빼는 행 조건 — NULL 안전하게 직접 조립한다.
+
+    `~_value_list_condition(...)`으로 뒤집으면 `NOT (컬럼 IN (...))`이 NULL 행에서
+    NULL로 평가돼 **감사인명이 없는 회사가 "특정 감사인 제외"에서 조용히 사라진다**
+    (텍스트 제외 필터와 같은 함정). 그래서 값 없는 행은 명시적으로 통과시키고,
+    `__BLANK__`를 제외 목록에 넣었을 때만 뺀다.
+    """
+    plain = [v for v in values if v != BLANK_VALUE_TOKEN]
+    clauses = []
+    if plain:
+        clauses.append(or_(_is_blank(column), column.not_in(plain)))
+    if len(plain) != len(values):
+        clauses.append(and_(column.is_not(None), column != ""))
+    return and_(*clauses) if clauses else true()
+
+
+def _apply_value_filters(
+    stmt: Select, column, include: list[str] | None, exclude: list[str] | None
+) -> Select:
+    """한 컬럼의 포함/제외 목록을 함께 적용한다(둘 다 주면 AND)."""
+    if include is not None:
+        # 빈 목록 = 체크박스를 전부 끈 상태 = 0건(`parse_status_ext`와 같은 규약).
+        stmt = stmt.where(_value_list_condition(column, include) if include else false())
+    if exclude:
+        # 제외는 빈 목록이 "뺄 것이 없음"이라 no-op이다(0건이 아니다).
+        stmt = stmt.where(_value_list_exclude_condition(column, exclude))
+    return stmt
+
+
 def _check_amount_bound(value: int | None, param_name: str) -> None:
     if value is not None and not _SQLITE_INT_MIN <= value <= _SQLITE_INT_MAX:
         raise HTTPException(
@@ -266,11 +466,23 @@ def _build_results_query(
     revenue_max: int | None = None,
     assets_min: int | None = None,
     assets_max: int | None = None,
+    corp_name_contains: str | None = None,
+    corp_name_not_contains: str | None = None,
+    address_contains: str | None = None,
+    address_not_contains: str | None = None,
+    induty_name_in: list[str] | None = None,
+    induty_name_not_in: list[str] | None = None,
+    auditor_name_in: list[str] | None = None,
+    auditor_name_not_in: list[str] | None = None,
+    audit_opinion_in: list[str] | None = None,
+    audit_opinion_not_in: list[str] | None = None,
 ) -> Select:
     """`results` 조회 쿼리 빌더 — `/results`(페이징)와 `/export`(전체)가 공유한다.
 
     2026-08-05(§4-13-B)에 결과화면 컬럼 필터용 파라미터 6개가 추가됐다
     (`parse_status_ext`/`auditor_changed_ext` 다중 선택 + 금액 범위 4개).
+    같은 날 §4-14로 텍스트 부분일치 4개(회사명/주소 × 포함/제외)와 값 목록 6개
+    (업종명/감사인명/감사의견 × 포함/제외)가 더해졌다.
     기존 파라미터는 하나도 바뀌지 않았고, 새 것과 함께 주면 전부 **AND**로 묶인다.
     """
     stmt = select(Result).where(Result.job_id == job_id)
@@ -334,6 +546,53 @@ def _build_results_query(
     _check_amount_bound(assets_max, "assets_max")
     stmt = _apply_amount_range(stmt, Result.revenue_cur, revenue_min, revenue_max)
     stmt = _apply_amount_range(stmt, Result.total_assets_cur, assets_min, assets_max)
+
+    # --- 텍스트/값 목록 컬럼 필터(§4-14, 2026-08-05) ------------------------
+    # 회사명·주소는 부분일치(포함/제외), 업종명·감사인명·감사의견은 값 목록
+    # 다중 선택(포함/제외)이다. 같은 컬럼에 포함과 제외를 함께 주면 AND다
+    # (예: 업종을 3개 고르고 그중 1개를 다시 제외 — 교집합이라 2개만 남는다).
+    stmt = _apply_text_filter(
+        stmt,
+        Result.corp_name,
+        _normalize_text_filter(corp_name_contains, "corp_name_contains"),
+        exclude=False,
+    )
+    stmt = _apply_text_filter(
+        stmt,
+        Result.corp_name,
+        _normalize_text_filter(corp_name_not_contains, "corp_name_not_contains"),
+        exclude=True,
+    )
+    stmt = _apply_text_filter(
+        stmt,
+        Result.address,
+        _normalize_text_filter(address_contains, "address_contains"),
+        exclude=False,
+    )
+    stmt = _apply_text_filter(
+        stmt,
+        Result.address,
+        _normalize_text_filter(address_not_contains, "address_not_contains"),
+        exclude=True,
+    )
+    stmt = _apply_value_filters(
+        stmt,
+        Result.induty_name,
+        _parse_value_filter(induty_name_in, "induty_name_in"),
+        _parse_value_filter(induty_name_not_in, "induty_name_not_in"),
+    )
+    stmt = _apply_value_filters(
+        stmt,
+        Result.auditor_name,
+        _parse_value_filter(auditor_name_in, "auditor_name_in"),
+        _parse_value_filter(auditor_name_not_in, "auditor_name_not_in"),
+    )
+    stmt = _apply_value_filters(
+        stmt,
+        Result.audit_opinion,
+        _parse_value_filter(audit_opinion_in, "audit_opinion_in"),
+        _parse_value_filter(audit_opinion_not_in, "audit_opinion_not_in"),
+    )
     return stmt
 
 
@@ -516,6 +775,16 @@ async def list_results(
     revenue_max: int | None = None,
     assets_min: int | None = None,
     assets_max: int | None = None,
+    corp_name_contains: str | None = None,
+    corp_name_not_contains: str | None = None,
+    address_contains: str | None = None,
+    address_not_contains: str | None = None,
+    induty_name_in: list[str] | None = Query(default=None),
+    induty_name_not_in: list[str] | None = Query(default=None),
+    auditor_name_in: list[str] | None = Query(default=None),
+    auditor_name_not_in: list[str] | None = Query(default=None),
+    audit_opinion_in: list[str] | None = Query(default=None),
+    audit_opinion_not_in: list[str] | None = Query(default=None),
     sort: str | None = None,
     sort_by: str | None = None,
     sort_dir: str = "asc",
@@ -560,6 +829,34 @@ async def list_results(
       얻은 회사(파싱 실패·부분 성공)는 범위를 걸어도 계속 보인다(2026-08-05 사용자
       확정, `_apply_amount_range()` 주석 참고). 조건은 `IS NULL OR BETWEEN`이다.
 
+    **텍스트/값 목록 컬럼 필터(§4-14, 2026-08-05 추가)** — 회사명·주소·업종·감사인·
+    감사의견 5개 컬럼의 헤더 필터다. **모든 컬럼이 포함(선택)과 제외를 모두 지원**하며,
+    서로 다른 컬럼끼리는 물론 같은 컬럼의 포함/제외끼리도 AND로 결합된다:
+
+    - `corp_name_contains` / `corp_name_not_contains`: 회사명 **부분일치**(대소문자
+      무시). 사용자가 친 글자는 그대로 찾는다 — `%`/`_`/`\\`는 LIKE 와일드카드가
+      아니라 리터럴로 이스케이프된다. 값이 공백뿐이면 필터하지 않는다(검색어 `q`와
+      같은 방침). 200자를 넘으면 400.
+    - `address_contains` / `address_not_contains`: 주소에 같은 규칙.
+    - `induty_name_in` / `induty_name_not_in`, `auditor_name_in` /
+      `auditor_name_not_in`, `audit_opinion_in` / `audit_opinion_not_in`:
+      **값 목록 다중 선택**. 값은 **완전 일치**이고, 같은 파라미터를 여러 번 반복해
+      넘긴다(`?induty_name_in=A&induty_name_in=B`) — 값 자체에 쉼표가 들어갈 수 있어
+      `parse_status_ext`류의 콤마 구분 목록을 쓰지 않았다. 고를 값의 목록은
+      `GET /api/jobs/{id}/results/distinct-values`가 준다.
+      값 개수 500개/값 길이 500자를 넘으면 400이다.
+    - **"값 없음"은 `__BLANK__` 예약 토큰으로 명시적으로 고른다**(NULL 또는 빈 문자열).
+      `?auditor_name_in=__BLANK__`면 감사인을 확보하지 못한 회사만,
+      `?auditor_name_not_in=__BLANK__`면 그 회사들만 빠진다.
+    - **NULL/빈 값 행의 기본 처리**: *제외* 조건에서는 항상 통과하고(`__BLANK__`를
+      제외 목록에 넣었을 때만 빠진다), *포함* 조건에서는 빠진다(`__BLANK__`를
+      포함 목록에 넣었을 때만 남는다). 금액 범위(항상 통과)와 규칙이 다른 이유는,
+      값 목록에는 "값 없음"을 **직접 고를 수단**이 있어 조용히 사라지는 일이 없기
+      때문이다(`distinct-values` 응답의 `blank_count`가 그 존재를 화면에 알린다).
+    - 목록형 파라미터의 빈 값 규약: `?induty_name_in=`(빈 문자열)은 **아무 것도 선택
+      안 함 = 0건**이고(체크박스를 전부 끈 상태), `?induty_name_not_in=`은 **뺄 것이
+      없음 = 필터 없음**이다. 파라미터를 아예 안 주면 둘 다 필터 없음이다.
+
     - `sort`: 다중 컬럼 정렬 — 콤마 구분 `field:dir` 목록(예:
       `corp_name:asc,induty_name:desc`). 앞쪽이 1순위, 뒤쪽이 보조 정렬이다.
       화이트리스트(`SORTABLE_COLUMNS`) 밖 컬럼/형식 오류는 무시한다.
@@ -600,6 +897,16 @@ async def list_results(
         revenue_max=revenue_max,
         assets_min=assets_min,
         assets_max=assets_max,
+        corp_name_contains=corp_name_contains,
+        corp_name_not_contains=corp_name_not_contains,
+        address_contains=address_contains,
+        address_not_contains=address_not_contains,
+        induty_name_in=induty_name_in,
+        induty_name_not_in=induty_name_not_in,
+        auditor_name_in=auditor_name_in,
+        auditor_name_not_in=auditor_name_not_in,
+        audit_opinion_in=audit_opinion_in,
+        audit_opinion_not_in=audit_opinion_not_in,
     )
 
     sort_specs = _resolve_sort_specs(sort, sort_by, sort_dir)
@@ -635,6 +942,117 @@ async def list_results(
         page=page,
         page_size=page_size,
         items=[ResultResponse.model_validate(r) for r in rows],
+    )
+
+
+class DistinctValueItem(BaseModel):
+    """값 목록 한 항목 — 값과 그 값을 가진 결과 행 수."""
+
+    value: str
+    count: int
+
+
+class DistinctValuesResponse(BaseModel):
+    """컬럼별 "지금 이 Job 데이터의 값 목록"(§4-14, 2026-08-05).
+
+    엑셀 컬럼 필터의 값 체크박스 목록에 해당한다. §4-13-C에서 "백엔드에
+    distinct-value 조회가 없어 범위 밖(향후 과제)"이라고 남겨 뒀던 부분이다.
+    """
+
+    field: str
+    # 개수 내림차순 → 값 오름차순. 화면이 가나다순으로 다시 정렬해도 무방하다.
+    values: list[DistinctValueItem]
+    # `values`에 담긴 개수와 `limit`을 적용하기 전 실제 고유값 개수. 둘이 다르면
+    # `truncated=true`이며, 화면은 "검색으로 좁혀 주세요" 안내를 띄워야 한다 —
+    # 잘린 줄 모르고 "전부 선택"하면 화면에 안 보이는 값이 조용히 빠진다.
+    total_distinct: int
+    truncated: bool
+    # 그 컬럼이 NULL이거나 빈 문자열인 행 수("값 없음"). `values`에는 넣지 않고
+    # 별도로 알려준다 — 화면은 이 값을 "(값 없음) N건" 항목으로 그리고, 선택하면
+    # `?field_in=__BLANK__`(= `blank_token`)를 보낸다. 0이면 항목을 그리지 않는다.
+    blank_count: int
+    # 위 "값 없음" 항목이 쓸 예약 토큰. 화면이 문자열을 하드코딩하지 않도록 응답에
+    # 실어 준다(백엔드가 토큰을 바꿔도 화면이 따라온다).
+    blank_token: str = BLANK_VALUE_TOKEN
+    # 그 Job의 전체 결과 행 수(참고용) — `blank_count`/각 `count`의 분모.
+    total_rows: int
+
+
+@router.get("/{job_id}/results/distinct-values", response_model=DistinctValuesResponse)
+async def list_result_distinct_values(
+    job_id: int,
+    field: str,
+    q: str | None = None,
+    limit: int = _DISTINCT_VALUES_DEFAULT_LIMIT,
+    db: Session = Depends(get_db),
+) -> DistinctValuesResponse:
+    """컬럼 헤더 필터가 보여줄 **값 목록**을 그 Job의 데이터에서 뽑아 준다(§4-14).
+
+    - `field`: `induty_name`/`auditor_name`/`audit_opinion` 중 하나
+      (`DISTINCT_VALUE_FIELDS`). 그 외 값은 **400**이다 — 임의 컬럼명을 그대로
+      SELECT/GROUP BY에 넣지 않기 위한 화이트리스트로, 정렬(`SORTABLE_COLUMNS`)과
+      같은 방식이다. 회사명/주소는 고유값이 행 수와 사실상 같아 목록으로 고를 수
+      없으므로 일부러 빠져 있다(그쪽은 `*_contains` 텍스트 필터가 담당).
+    - `q`: 값 자체를 부분일치로 좁힌다(대소문자 무시, 와일드카드는 리터럴 이스케이프).
+      감사인처럼 값이 수백 개인 컬럼에서 화면이 "값 검색"을 제공하기 위한 것이다.
+    - `limit`: 1~2000(기본 1000)으로 클램프한다. 잘렸는지는 `truncated`로 알린다.
+
+    **집계 범위는 그 Job의 결과 전체이고, 화면에 걸려 있는 다른 필터는 반영하지
+    않는다.** 다른 필터를 반영하면 지금 화면에서 빠져 있는 값이 목록에서도 사라져
+    **"안 보이는 값을 다시 켜기"가 불가능**해진다(필터를 한 번 잘못 걸면 되돌릴 수
+    없는 상태가 된다). 읽기 전용이고 DB 스키마 변경·외부 API 호출 0건이라 기존 완료
+    Job에서도 그대로 동작한다.
+    """
+    if field not in DISTINCT_VALUE_FIELDS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"값 목록을 조회할 수 없는 컬럼입니다: {field!r} "
+                f"(가능한 값: {', '.join(DISTINCT_VALUE_FIELDS)})"
+            ),
+        )
+
+    job = db.get(Job, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job을 찾을 수 없습니다.")
+
+    column = getattr(Result, field)
+    limit = max(min(limit, _DISTINCT_VALUES_MAX_LIMIT), 1)
+    keyword = _normalize_text_filter(q, "q")
+
+    # 값이 있는 행만 그룹화한다 — "값 없음"은 blank_count로 따로 센다.
+    conditions = [Result.job_id == job_id, column.is_not(None), column != ""]
+    if keyword is not None:
+        conditions.append(column.ilike(_like_pattern(keyword), escape=_LIKE_ESCAPE_CHAR))
+
+    count_col = func.count().label("cnt")
+    rows = db.execute(
+        select(column, count_col)
+        .where(*conditions)
+        .group_by(column)
+        .order_by(count_col.desc(), column.asc())
+        .limit(limit)
+    ).all()
+    total_distinct = db.execute(
+        select(func.count(distinct(column))).where(*conditions)
+    ).scalar_one()
+
+    # blank_count/total_rows는 `q`(값 검색어)와 무관한 Job 전체 기준이다 — "값 없음"
+    # 항목은 글자로 검색되는 대상이 아니라 목록 맨 아래 고정 항목이기 때문이다.
+    blank_count = db.execute(
+        select(func.count()).where(Result.job_id == job_id, _is_blank(column))
+    ).scalar_one()
+    total_rows = db.execute(
+        select(func.count()).where(Result.job_id == job_id)
+    ).scalar_one()
+
+    return DistinctValuesResponse(
+        field=field,
+        values=[DistinctValueItem(value=value, count=count) for value, count in rows],
+        total_distinct=total_distinct,
+        truncated=total_distinct > len(rows),
+        blank_count=blank_count,
+        total_rows=total_rows,
     )
 
 
@@ -744,6 +1162,16 @@ async def export_job_results(
     revenue_max: int | None = None,
     assets_min: int | None = None,
     assets_max: int | None = None,
+    corp_name_contains: str | None = None,
+    corp_name_not_contains: str | None = None,
+    address_contains: str | None = None,
+    address_not_contains: str | None = None,
+    induty_name_in: list[str] | None = Query(default=None),
+    induty_name_not_in: list[str] | None = Query(default=None),
+    auditor_name_in: list[str] | None = Query(default=None),
+    auditor_name_not_in: list[str] | None = Query(default=None),
+    audit_opinion_in: list[str] | None = Query(default=None),
+    audit_opinion_not_in: list[str] | None = Query(default=None),
     sort: str | None = None,
     sort_by: str | None = None,
     sort_dir: str = "asc",
@@ -754,9 +1182,12 @@ async def export_job_results(
     `parse_status`/`excluded_by_revenue`/`excluded_by_assets`/
     `excluded_by_stale_disclosure`/`has_disclosure`/`q`/`auditor_changed`/
     `parse_status_ext`/`auditor_changed_ext`/`revenue_min`/`revenue_max`/
-    `assets_min`/`assets_max`/`sort`/`sort_by`/`sort_dir`는 `/results`와 동일한
-    의미다(다중 정렬 `sort`와 §4-13-B 컬럼 필터 6개 포함) — 화면에서 걸러 놓고
-    정렬한 그대로를 내려받게 된다. `format`이 xlsx/csv가 아니면 400.
+    `assets_min`/`assets_max`/`corp_name_contains`/`corp_name_not_contains`/
+    `address_contains`/`address_not_contains`/`induty_name_in`/`induty_name_not_in`/
+    `auditor_name_in`/`auditor_name_not_in`/`audit_opinion_in`/`audit_opinion_not_in`/
+    `sort`/`sort_by`/`sort_dir`는 `/results`와 동일한 의미다(다중 정렬 `sort`와
+    §4-13-B 컬럼 필터 6개 + §4-14 텍스트/값 목록 필터 10개 포함) — 화면에서 걸러
+    놓고 정렬한 그대로를 내려받게 된다. `format`이 xlsx/csv가 아니면 400.
 
     **다중 선택 다운로드(§4-11, 2026-07-28)** — 위 "필터 전체" 내보내기와 별개로,
     화면에서 체크박스로 고른 회사만 받는 두 파라미터를 지원한다:
@@ -829,6 +1260,16 @@ async def export_job_results(
             revenue_max=revenue_max,
             assets_min=assets_min,
             assets_max=assets_max,
+            corp_name_contains=corp_name_contains,
+            corp_name_not_contains=corp_name_not_contains,
+            address_contains=address_contains,
+            address_not_contains=address_not_contains,
+            induty_name_in=induty_name_in,
+            induty_name_not_in=induty_name_not_in,
+            auditor_name_in=auditor_name_in,
+            auditor_name_not_in=auditor_name_not_in,
+            audit_opinion_in=audit_opinion_in,
+            audit_opinion_not_in=audit_opinion_not_in,
         )
         sort_specs = _resolve_sort_specs(sort, sort_by, sort_dir)
         rows = db.execute(_apply_sort(stmt, sort_specs)).scalars().all()

@@ -1,6 +1,8 @@
 import { apiClient } from './client'
 import type {
   AccountDetailResponse,
+  DistinctValueField,
+  DistinctValuesResponse,
   DocumentSection,
   DocumentSectionResponse,
   ExportFormat,
@@ -55,6 +57,44 @@ export interface ListResultsParams {
   assets_min?: number
   assets_max?: number
 
+  // --- §4-14 결과화면 컬럼 필터 2차(2026-08-05) --------------------------------
+  // 회사명/주소/업종/감사인/감사의견 5개 컬럼. 모든 컬럼이 **포함과 제외를 모두**
+  // 지원하고, 기존 파라미터와는 전부 AND로 결합된다.
+
+  /** 회사명 **부분일치**(대소문자 무시). LIKE 와일드카드는 백엔드가 리터럴로
+   * 이스케이프한다. 공백뿐이면 필터 없음이고 200자 초과는 400.
+   *
+   * NULL/빈 값 행의 처리가 두 방향에서 다르다 — `_contains`(포함)에서는 빠지고,
+   * `_not_contains`(제외)에서는 **항상 통과**한다(값이 없는 회사가 "○○ 제외"로
+   * 조용히 사라지지 않게 한 백엔드 계약). */
+  corp_name_contains?: string
+  corp_name_not_contains?: string
+  /** 같은 규칙의 주소 부분일치. */
+  address_contains?: string
+  address_not_contains?: string
+
+  /** 업종명 **완전일치 다중 선택**(포함/제외). 콤마 구분이 아니라 **같은 파라미터를
+   * 여러 번 반복**하는 형식이다(`?induty_name_in=A&induty_name_in=B`) — 업종명에
+   * 쉼표가 실제로 흔해("직물, 편조원단 및 의복류 염색 가공업") 콤마 규약이면 값이
+   * 조용히 쪼개진다. axios가 이 형식으로 직렬화하도록 `client.ts`에
+   * `paramsSerializer: { indexes: null }`이 걸려 있다.
+   *
+   * 고를 값 목록은 `listDistinctValues()`가 준다. "값 없음"은 그 응답의
+   * `blank_token`(`__BLANK__`)을 그대로 넣어 고른다.
+   *
+   * 빈 배열은 axios가 파라미터 자체를 만들지 않아 "필터 없음"이 된다 —
+   * 백엔드 규약상 `?induty_name_in=`(빈 문자열 토큰)은 0건이지만, 화면은 그 상태를
+   * 만들지 않는다(`resultFiltersToParams()`가 선택 0개면 아예 보내지 않는다). */
+  induty_name_in?: string[]
+  induty_name_not_in?: string[]
+  /** 같은 규칙의 감사인명 목록 필터. 목록 셀은 "법인명(지역)"으로 합쳐 보이지만
+   * 필터 대상은 `auditor_name` 하나뿐이다. */
+  auditor_name_in?: string[]
+  auditor_name_not_in?: string[]
+  /** 같은 규칙의 감사의견 목록 필터(적정/한정/부적정/의견거절). */
+  audit_opinion_in?: string[]
+  audit_opinion_not_in?: string[]
+
   /** 회사명/주소/대표자/업종/감사인명 부분일치 검색. */
   q?: string
   /** 다중 컬럼 정렬 — 콤마 구분 `field:dir` 목록(예: `corp_name:asc,induty_name:desc`).
@@ -76,6 +116,27 @@ export async function listResults(
   const { data } = await apiClient.get<ResultListResponse>(`/jobs/${jobId}/results`, {
     params,
   })
+  return data
+}
+
+/** §4-14 값 목록 필터가 보여줄 **"지금 이 Job 데이터의 값 목록"**을 가져온다.
+ *
+ * **화면에 걸려 있는 다른 필터는 넘기지 않는다** — 백엔드도 Job 전체를 기준으로
+ * 집계한다(다른 필터를 반영하면 지금 목록에서 빠져 있는 값이 선택지에서도 사라져
+ * "안 보이는 값을 다시 켜기"가 불가능해진다). 그래서 이 함수는 `ListResultsParams`를
+ * 받지 않는다 — 필터 상태를 여기에 섞지 말 것.
+ *
+ * `q`는 **값 자체**를 부분일치로 좁힌다(목록 검색창용, 목록의 행을 거르는 검색어 `q`와
+ * 다르다). `limit`을 넘는 고유값은 응답의 `truncated=true`로 알려 온다. */
+export async function listDistinctValues(
+  jobId: number,
+  field: DistinctValueField,
+  options: { q?: string; limit?: number } = {},
+): Promise<DistinctValuesResponse> {
+  const { data } = await apiClient.get<DistinctValuesResponse>(
+    `/jobs/${jobId}/results/distinct-values`,
+    { params: { field, q: options.q || undefined, limit: options.limit } },
+  )
   return data
 }
 

@@ -20,6 +20,8 @@ from sqlalchemy.pool import StaticPool
 from app import main as app_main
 from app.api.results import (
     AUDITOR_CHANGED_EXT_VALUES,
+    BLANK_VALUE_TOKEN,
+    DISTINCT_VALUE_FIELDS,
     PARSE_STATUS_EXT_VALUES,
     SORTABLE_COLUMNS,
 )
@@ -782,6 +784,437 @@ def test_export_applies_new_column_filters(client_with_db):
     # parse_status_ext=OK,PARTIAL에 걸려 ㈜실패테스트(FAILED)만 빠진다.
     assert "㈜금액없음" in text
     assert "㈜실패테스트" not in text
+
+
+# ---------------------------------------------------------------------------
+# §4-14 텍스트/값 목록 컬럼 필터 + 값 목록 조회 (2026-08-05)
+# ---------------------------------------------------------------------------
+
+
+def _seed_text_value_filter_rows(factory, job_id: int) -> None:
+    """회사명/주소/업종/감사인/감사의견이 서로 다른 행 — "값 없음"과 LIKE 특수문자 포함.
+
+    시드 2건(㈜성공테스트: 적정/안경회계법인/금속가공제품 제조업,
+    ㈜실패테스트: 감사의견·감사인 없음/금속가공제품 제조업)에 3건을 더해 총 5건이 된다.
+    """
+    db = factory()
+    try:
+        db.add_all(
+            [
+                Result(
+                    job_id=job_id,
+                    corp_code="00100041",
+                    rcept_no="20260601000041",
+                    corp_name="㈜무역상사",
+                    address="부산광역시 해운대구 센텀로 3",
+                    induty_code="46",
+                    induty_name="상품 종합 도매업",
+                    audit_opinion="한정",
+                    auditor_name="대주회계법인",
+                    parse_status=ParseStatus.OK,
+                ),
+                # 감사의견/감사인이 **빈 문자열**인 행 — NULL과 함께 "값 없음"으로 묶인다.
+                Result(
+                    job_id=job_id,
+                    corp_code="00100042",
+                    rcept_no="20260601000042",
+                    corp_name="㈜빈값테스트",
+                    address=None,
+                    induty_code=None,
+                    induty_name=None,
+                    audit_opinion="",
+                    auditor_name="",
+                    parse_status=ParseStatus.PARTIAL,
+                ),
+                # 회사명에 LIKE 와일드카드(%), 주소에 언더스코어(_)가 들어간 행.
+                Result(
+                    job_id=job_id,
+                    corp_code="00100043",
+                    rcept_no="20260601000043",
+                    corp_name="㈜50%할인마트",
+                    address="경상남도 김해시 대로_1",
+                    induty_code="47",
+                    induty_name="종합 소매업",
+                    audit_opinion="적정",
+                    auditor_name="안경회계법인",
+                    parse_status=ParseStatus.OK,
+                ),
+            ]
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_corp_name_contains_and_not_contains(client_with_db):
+    """회사명 부분일치 — 포함/제외 두 모드 모두 지원한다(§4-14)."""
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+    _seed_text_value_filter_rows(factory, job_id)
+
+    def names(params: dict) -> set[str]:
+        body = client.get(
+            f"/api/jobs/{job_id}/results", params={"page_size": 500, **params}
+        ).json()
+        assert body["total"] == len(body["items"])
+        return {r["corp_name"] for r in body["items"]}
+
+    assert names({"corp_name_contains": "테스트"}) == {
+        "㈜성공테스트",
+        "㈜실패테스트",
+        "㈜빈값테스트",
+    }
+    assert names({"corp_name_not_contains": "테스트"}) == {"㈜무역상사", "㈜50%할인마트"}
+    # 포함 + 제외를 함께 주면 AND(교집합)다.
+    assert names({"corp_name_contains": "테스트", "corp_name_not_contains": "빈값"}) == {
+        "㈜성공테스트",
+        "㈜실패테스트",
+    }
+    # 빈 값/공백뿐인 입력은 "필터 없음"이다(검색어 `q`와 같은 방침).
+    assert len(names({"corp_name_contains": "   "})) == 5
+    assert len(names({"corp_name_contains": ""})) == 5
+
+
+def test_text_filter_escapes_like_wildcards(client_with_db):
+    """`%`/`_`는 LIKE 와일드카드가 아니라 **사용자가 친 글자 그대로** 찾는다.
+
+    이스케이프가 없으면 `%`만 쳐도 전 행이 매칭돼 필터가 통째로 무의미해진다.
+    """
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+    _seed_text_value_filter_rows(factory, job_id)
+
+    def names(params: dict) -> set[str]:
+        return {
+            r["corp_name"]
+            for r in client.get(
+                f"/api/jobs/{job_id}/results", params={"page_size": 500, **params}
+            ).json()["items"]
+        }
+
+    assert names({"corp_name_contains": "50%할인"}) == {"㈜50%할인마트"}
+    # 와일드카드로 해석됐다면 전 행이 남았을 입력.
+    assert names({"corp_name_contains": "%"}) == {"㈜50%할인마트"}
+    # `_`도 리터럴 — "대로_1"만 걸리고 "대로A1"류를 잡는 와일드카드가 아니다.
+    assert names({"address_contains": "대로_1"}) == {"㈜50%할인마트"}
+    assert names({"corp_name_contains": "_"}) == set()
+
+
+def test_text_filter_exclude_keeps_rows_without_value(client_with_db):
+    """제외 조건에서 값이 NULL/빈 문자열인 행은 **반드시 통과**한다.
+
+    `NOT (col LIKE ...)`만 쓰면 NULL이 NULL로 평가돼 주소 없는 회사가 조용히
+    사라진다 — 금액 범위 필터의 NULL 통과 방침과 같은 이유(검수용 화면).
+    """
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+    _seed_text_value_filter_rows(factory, job_id)
+
+    body = client.get(
+        f"/api/jobs/{job_id}/results",
+        params={"page_size": 500, "address_not_contains": "김해시"},
+    ).json()
+    assert {r["corp_name"] for r in body["items"]} == {
+        "㈜무역상사",
+        "㈜빈값테스트",  # address IS NULL — 빠지면 안 된다.
+    }
+
+    # 포함 조건에서는 반대로 값이 없는 행이 빠진다("김해시를 포함"할 수 없으므로).
+    included = client.get(
+        f"/api/jobs/{job_id}/results",
+        params={"page_size": 500, "address_contains": "김해시"},
+    ).json()
+    assert "㈜빈값테스트" not in {r["corp_name"] for r in included["items"]}
+
+
+def test_text_filter_rejects_too_long_keyword(client_with_db):
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+
+    resp = client.get(
+        f"/api/jobs/{job_id}/results", params={"corp_name_contains": "가" * 201}
+    )
+    assert resp.status_code == 400
+    assert "corp_name_contains" in resp.json()["detail"]
+
+
+def test_value_list_filters_include_and_exclude(client_with_db):
+    """업종/감사인/감사의견 값 목록 다중 선택 — 포함/제외 두 모드(§4-14).
+
+    값 자체에 쉼표가 들어갈 수 있어 콤마 구분이 아니라 **같은 파라미터 반복**이다.
+    """
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+    _seed_text_value_filter_rows(factory, job_id)
+
+    def names(params: dict) -> set[str]:
+        body = client.get(
+            f"/api/jobs/{job_id}/results", params={"page_size": 500, **params}
+        ).json()
+        assert body["total"] == len(body["items"])
+        return {r["corp_name"] for r in body["items"]}
+
+    assert names({"induty_name_in": ["금속가공제품 제조업"]}) == {
+        "㈜성공테스트",
+        "㈜실패테스트",
+    }
+    assert names({"induty_name_in": ["금속가공제품 제조업", "종합 소매업"]}) == {
+        "㈜성공테스트",
+        "㈜실패테스트",
+        "㈜50%할인마트",
+    }
+    # 제외 모드 — 고른 업종만 빠지고, 업종이 없는 행(㈜빈값테스트)은 남는다.
+    assert names({"induty_name_not_in": ["금속가공제품 제조업"]}) == {
+        "㈜무역상사",
+        "㈜빈값테스트",
+        "㈜50%할인마트",
+    }
+    # 같은 컬럼에 포함+제외를 함께 주면 교집합이다.
+    assert names(
+        {
+            "induty_name_in": ["금속가공제품 제조업", "종합 소매업"],
+            "induty_name_not_in": ["종합 소매업"],
+        }
+    ) == {"㈜성공테스트", "㈜실패테스트"}
+
+    assert names({"auditor_name_in": ["안경회계법인"]}) == {"㈜성공테스트", "㈜50%할인마트"}
+    assert names({"audit_opinion_in": ["적정", "한정"]}) == {
+        "㈜성공테스트",
+        "㈜50%할인마트",
+        "㈜무역상사",
+    }
+    # 감사의견이 없는 행(NULL/빈 문자열)은 "적정 제외"에서 살아남아야 한다.
+    assert names({"audit_opinion_not_in": ["적정"]}) == {
+        "㈜무역상사",
+        "㈜실패테스트",
+        "㈜빈값테스트",
+    }
+    # 서로 다른 컬럼의 필터는 AND로 결합된다.
+    assert names(
+        {"auditor_name_in": ["안경회계법인"], "induty_name_in": ["종합 소매업"]}
+    ) == {"㈜50%할인마트"}
+
+
+def test_value_list_blank_token_selects_and_excludes_missing_values(client_with_db):
+    """"값 없음"(NULL 또는 빈 문자열)은 `__BLANK__` 예약 토큰으로 직접 고른다.
+
+    이 토큰이 있어야 포함 모드에서 값 없는 행이 "조용히 사라지는" 게 아니라
+    사용자가 명시적으로 켜고 끄는 대상이 된다(`distinct-values`의 `blank_count`가
+    화면에 그 존재를 알린다).
+    """
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+    _seed_text_value_filter_rows(factory, job_id)
+
+    def names(params: dict) -> set[str]:
+        return {
+            r["corp_name"]
+            for r in client.get(
+                f"/api/jobs/{job_id}/results", params={"page_size": 500, **params}
+            ).json()["items"]
+        }
+
+    # NULL(㈜실패테스트)과 빈 문자열(㈜빈값테스트)이 하나로 묶인다.
+    assert names({"auditor_name_in": [BLANK_VALUE_TOKEN]}) == {
+        "㈜실패테스트",
+        "㈜빈값테스트",
+    }
+    assert names({"auditor_name_not_in": [BLANK_VALUE_TOKEN]}) == {
+        "㈜성공테스트",
+        "㈜무역상사",
+        "㈜50%할인마트",
+    }
+    # 실제 값과 함께 고를 수도 있다.
+    assert names({"auditor_name_in": ["대주회계법인", BLANK_VALUE_TOKEN]}) == {
+        "㈜무역상사",
+        "㈜실패테스트",
+        "㈜빈값테스트",
+    }
+    # 목록 전체(값 + 값 없음)를 다 고르면 필터를 안 건 것과 같은 집합이다.
+    assert names(
+        {
+            "auditor_name_in": [
+                "안경회계법인",
+                "대주회계법인",
+                BLANK_VALUE_TOKEN,
+            ]
+        }
+    ) == names({})
+
+
+def test_value_list_empty_param_and_limits(client_with_db):
+    """빈 값 규약 — 포함은 0건(아무 것도 안 고름), 제외는 no-op(뺄 것 없음)."""
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+    _seed_text_value_filter_rows(factory, job_id)
+
+    empty_in = client.get(
+        f"/api/jobs/{job_id}/results", params={"induty_name_in": ""}
+    ).json()
+    assert empty_in["total"] == 0 and empty_in["items"] == []
+
+    empty_not_in = client.get(
+        f"/api/jobs/{job_id}/results", params={"page_size": 500, "induty_name_not_in": ""}
+    ).json()
+    assert empty_not_in["total"] == 5
+
+    # 파라미터를 아예 안 주면 둘 다 필터 없음.
+    assert client.get(f"/api/jobs/{job_id}/results").json()["total"] == 5
+
+    too_many = client.get(
+        f"/api/jobs/{job_id}/results",
+        params={"induty_name_in": [f"v{i}" for i in range(501)]},
+    )
+    assert too_many.status_code == 400
+    assert "induty_name_in" in too_many.json()["detail"]
+
+    too_long = client.get(
+        f"/api/jobs/{job_id}/results", params={"auditor_name_in": ["가" * 501]}
+    )
+    assert too_long.status_code == 400
+
+
+def test_distinct_values_returns_counts_and_blank_count(client_with_db):
+    """값 목록 조회(§4-14) — 값별 건수 + "값 없음" 건수를 함께 준다."""
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+    _seed_text_value_filter_rows(factory, job_id)
+
+    body = client.get(
+        f"/api/jobs/{job_id}/results/distinct-values", params={"field": "auditor_name"}
+    ).json()
+    assert body["field"] == "auditor_name"
+    # 개수 내림차순 → 값 오름차순. 값이 없는 행은 values에 넣지 않는다.
+    assert body["values"] == [
+        {"value": "안경회계법인", "count": 2},
+        {"value": "대주회계법인", "count": 1},
+    ]
+    assert body["total_distinct"] == 2
+    assert body["truncated"] is False
+    # NULL(㈜실패테스트) + 빈 문자열(㈜빈값테스트)
+    assert body["blank_count"] == 2
+    assert body["total_rows"] == 5
+    assert body["blank_token"] == BLANK_VALUE_TOKEN
+
+    opinions = client.get(
+        f"/api/jobs/{job_id}/results/distinct-values", params={"field": "audit_opinion"}
+    ).json()
+    assert [v["value"] for v in opinions["values"]] == ["적정", "한정"]
+    assert opinions["blank_count"] == 2
+
+    # 응답의 값을 그대로 필터에 되돌려 보내면 그 건수와 일치해야 한다(계약).
+    for item in body["values"]:
+        listed = client.get(
+            f"/api/jobs/{job_id}/results",
+            params={"page_size": 500, "auditor_name_in": [item["value"]]},
+        ).json()
+        assert listed["total"] == item["count"]
+
+
+def test_distinct_values_search_limit_and_validation(client_with_db):
+    """`q`(값 검색)·`limit`(잘림 표시)·화이트리스트 밖 컬럼 400·없는 Job 404."""
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+    _seed_text_value_filter_rows(factory, job_id)
+
+    searched = client.get(
+        f"/api/jobs/{job_id}/results/distinct-values",
+        params={"field": "induty_name", "q": "도매"},
+    ).json()
+    assert [v["value"] for v in searched["values"]] == ["상품 종합 도매업"]
+    assert searched["total_distinct"] == 1
+    # blank_count/total_rows는 값 검색어와 무관한 Job 전체 기준이다.
+    assert searched["blank_count"] == 1 and searched["total_rows"] == 5
+
+    truncated = client.get(
+        f"/api/jobs/{job_id}/results/distinct-values",
+        params={"field": "induty_name", "limit": 1},
+    ).json()
+    assert len(truncated["values"]) == 1
+    assert truncated["total_distinct"] == 3
+    assert truncated["truncated"] is True
+
+    # 회사명/주소는 고유값이 행 수와 사실상 같아 값 목록 대상이 아니다(텍스트 필터 담당).
+    assert "corp_name" not in DISTINCT_VALUE_FIELDS
+    assert "address" not in DISTINCT_VALUE_FIELDS
+    bad_field = client.get(
+        f"/api/jobs/{job_id}/results/distinct-values", params={"field": "corp_name"}
+    )
+    assert bad_field.status_code == 400
+    assert "induty_name" in bad_field.json()["detail"]
+
+    injection = client.get(
+        f"/api/jobs/{job_id}/results/distinct-values",
+        params={"field": "id; DROP TABLE results"},
+    )
+    assert injection.status_code == 400
+
+    missing_job = client.get(
+        "/api/jobs/9999/results/distinct-values", params={"field": "auditor_name"}
+    )
+    assert missing_job.status_code == 404
+
+
+def test_distinct_values_scopes_to_job(client_with_db):
+    """값 목록은 그 Job의 결과만 센다(다른 Job의 값이 섞이면 안 된다)."""
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+    other_job_id = _seed_job_with_results(factory)
+
+    db = factory()
+    try:
+        db.add(
+            Result(
+                job_id=other_job_id,
+                corp_code="00100099",
+                corp_name="㈜타잡",
+                auditor_name="다른회계법인",
+                parse_status=ParseStatus.OK,
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    body = client.get(
+        f"/api/jobs/{job_id}/results/distinct-values", params={"field": "auditor_name"}
+    ).json()
+    assert [v["value"] for v in body["values"]] == ["안경회계법인"]
+    assert body["total_rows"] == 2
+
+
+def test_ids_only_and_export_apply_text_and_value_filters(client_with_db):
+    """`ids_only`(현재 필터 전체 선택)와 `/export`(필터 전체 내보내기)도 §4-14
+    파라미터를 똑같이 반영한다 — 화면에 보이는 것과 선택/다운로드되는 것이 갈리면 안 된다."""
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+    _seed_text_value_filter_rows(factory, job_id)
+
+    params = {
+        "corp_name_not_contains": "테스트",
+        "auditor_name_in": ["안경회계법인"],
+    }
+    listed = client.get(
+        f"/api/jobs/{job_id}/results", params={"page_size": 500, **params}
+    ).json()
+    assert [r["corp_name"] for r in listed["items"]] == ["㈜50%할인마트"]
+
+    ids_only = client.get(
+        f"/api/jobs/{job_id}/results", params={"ids_only": True, **params}
+    ).json()
+    assert ids_only["ids"] == [r["id"] for r in listed["items"]]
+    assert ids_only["total"] == 1
+
+    exported = client.get(
+        f"/api/jobs/{job_id}/export",
+        params={"format": "csv", "audit_opinion_not_in": ["적정"]},
+    )
+    assert exported.status_code == 200
+    text = exported.content.decode("utf-8-sig")
+    assert "㈜무역상사" in text  # 한정
+    assert "㈜실패테스트" in text  # 감사의견 없음 — 제외 조건에서 살아남는다
+    assert "㈜성공테스트" not in text
+    assert "㈜50%할인마트" not in text
 
 
 def test_list_results_not_found_returns_404(client_with_db):

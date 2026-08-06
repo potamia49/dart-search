@@ -1,8 +1,20 @@
-import { ActionIcon, Button, Checkbox, Divider, NumberInput, Popover, Stack, Text } from '@mantine/core'
+import {
+  ActionIcon,
+  Button,
+  Checkbox,
+  Divider,
+  NumberInput,
+  Popover,
+  SegmentedControl,
+  Stack,
+  Text,
+  TextInput,
+} from '@mantine/core'
 import { IconFilter, IconFilterFilled } from '@tabler/icons-react'
 import type { ReactNode } from 'react'
 import {
   AUDITOR_CHANGED_LABELS,
+  MAX_TEXT_FILTER_LEN,
   PARSE_STATUS_LABELS,
   isAssetsFilterActive,
   isAuditorChangedFilterActive,
@@ -10,8 +22,17 @@ import {
   isRangeInverted,
   isRevenueFilterActive,
   isStaleFilterActive,
+  isTextFilterActive,
+  isValueFilterActive,
 } from '../util/resultFilters'
-import type { EokInput, ResultColumnFilterState } from '../util/resultFilters'
+import type {
+  EokInput,
+  FilterMode,
+  ResultColumnFilterState,
+  TextFilterState,
+  ValueListFilterState,
+} from '../util/resultFilters'
+import { ValueListFilterBody } from './ResultValueListFilter'
 
 /**
  * 결과 화면(§4-13-C) 컬럼 헤더 필터의 **UI**. 상태 정의·쿼리 변환 규칙은
@@ -192,19 +213,152 @@ function AmountRangeFilter({
   )
 }
 
+/** §4-14 회사명/주소 — 검색어 1개 + 포함/제외(부분일치).
+ *
+ * 값 목록 방식이 아닌 이유는 고유값이 행 수와 사실상 같아 목록에서 고를 수 없기
+ * 때문이다(백엔드도 `distinct-values`에서 이 두 컬럼을 일부러 뺐다). */
+function TextFilter({
+  label,
+  placeholder,
+  filter,
+  onChange,
+  hint,
+}: {
+  label: string
+  placeholder: string
+  filter: TextFilterState
+  onChange: (next: TextFilterState) => void
+  hint?: string
+}) {
+  return (
+    <Stack gap="xs">
+      <SegmentedControl
+        size="xs"
+        fullWidth
+        value={filter.mode}
+        onChange={(value) => onChange({ ...filter, mode: value as FilterMode })}
+        data={[
+          { value: 'INCLUDE', label: '이 글자 포함' },
+          { value: 'EXCLUDE', label: '이 글자 제외' },
+        ]}
+      />
+      <TextInput
+        size="xs"
+        placeholder={placeholder}
+        value={filter.keyword}
+        // 상한은 백엔드와 같은 200자다 — 넘겨 보내면 400이라 목록이 통째로 안 뜬다.
+        maxLength={MAX_TEXT_FILTER_LEN}
+        onChange={(event) => onChange({ ...filter, keyword: event.currentTarget.value })}
+      />
+      <Text size="xs" c="dimmed">
+        {label}에 이 글자가 <b>들어가는지</b>로 거릅니다(대소문자 구분 없음, 완전일치가 아님).
+        {filter.mode === 'INCLUDE'
+          ? ` ${label} 값이 없는 회사는 빠집니다.`
+          : ` ${label} 값이 없는 회사는 그대로 남습니다.`}
+      </Text>
+      {hint && (
+        <Text size="xs" c="dimmed">
+          {hint}
+        </Text>
+      )}
+      <Divider />
+      <Button
+        size="compact-xs"
+        variant="subtle"
+        disabled={filter.keyword === ''}
+        onClick={() => onChange({ ...filter, keyword: '' })}
+      >
+        검색어 지우기
+      </Button>
+    </Stack>
+  )
+}
+
 /** 결과 테이블 헤더에 붙일 필터 컨트롤 — 필터가 있는 컬럼이면 아이콘을, 없으면 null.
  *
- * 업종/감사의견처럼 고유값이 많은 컬럼의 "지금 데이터의 값 목록" 드롭다운은 백엔드에
- * distinct-value 조회가 없어 §4-13 범위 밖이다(향후 과제). */
+ * 업종/감사인/감사의견의 "지금 데이터의 값 목록"은 §4-14(2026-08-05)에서 백엔드
+ * `distinct-values` 조회가 생겨 지원한다 — 목록 조회는 팝오버가 열릴 때만 일어난다
+ * (`ValueListFilterBody`). 그래서 이 컨트롤은 `jobId`를 받는다. */
 export function ResultColumnFilterControl({
+  jobId,
   columnKey,
   filters,
   onChange,
 }: {
+  jobId: number
   columnKey: string
   filters: ResultColumnFilterState
   onChange: (patch: Partial<ResultColumnFilterState>) => void
 }) {
+  /** 값 목록 필터 3종은 껍데기가 같아 한 곳에서 만든다. */
+  function valueListPopover(
+    label: string,
+    field: 'induty_name' | 'auditor_name' | 'audit_opinion',
+    filter: ValueListFilterState,
+    apply: (next: ValueListFilterState) => Partial<ResultColumnFilterState>,
+    hint?: string,
+  ) {
+    return (
+      <ColumnFilterPopover label={label} active={isValueFilterActive(filter)} width={320}>
+        <ValueListFilterBody
+          jobId={jobId}
+          field={field}
+          label={label}
+          filter={filter}
+          hint={hint}
+          onChange={(next) => onChange(apply(next))}
+        />
+      </ColumnFilterPopover>
+    )
+  }
+
+  if (columnKey === 'corp_name') {
+    return (
+      <ColumnFilterPopover label="회사명" active={isTextFilterActive(filters.corpName)} width={300}>
+        <TextFilter
+          label="회사명"
+          placeholder="예: 산업"
+          filter={filters.corpName}
+          onChange={(corpName) => onChange({ corpName })}
+        />
+      </ColumnFilterPopover>
+    )
+  }
+  if (columnKey === 'address') {
+    return (
+      <ColumnFilterPopover label="주소" active={isTextFilterActive(filters.address)} width={300}>
+        <TextFilter
+          label="주소"
+          placeholder="예: 창원시 성산구"
+          filter={filters.address}
+          onChange={(address) => onChange({ address })}
+          hint="주소는 DART 기업개황 원본 표기 그대로입니다 — 같은 지역이라도 표기가 다를 수 있으니 짧은 단위(시·군·구, 읍·면·동)로 넣는 편이 잘 잡힙니다."
+        />
+      </ColumnFilterPopover>
+    )
+  }
+  if (columnKey === 'induty_name') {
+    return valueListPopover('업종', 'induty_name', filters.indutyName, (indutyName) => ({
+      indutyName,
+    }))
+  }
+  if (columnKey === 'auditor_name') {
+    return valueListPopover(
+      '감사인',
+      'auditor_name',
+      filters.auditorName,
+      (auditorName) => ({ auditorName }),
+      // 목록 셀은 "안경회계법인(경상남도 창원시)"처럼 사무소 주소를 붙여 보여주지만,
+      // 필터가 거르는 값은 **법인명뿐**이다(주소는 별개 컬럼) — 아래 값 목록에 주소가
+      // 안 보이는 이유를 그 자리에서 설명해 둔다.
+      '표에는 "회계법인명(사무소 지역)"으로 함께 보이지만, 이 목록은 감사인 이름만으로 고릅니다.',
+    )
+  }
+  if (columnKey === 'audit_opinion') {
+    return valueListPopover('감사의견', 'audit_opinion', filters.auditOpinion, (auditOpinion) => ({
+      auditOpinion,
+    }))
+  }
   if (columnKey === 'revenue_cur') {
     return (
       <ColumnFilterPopover label="매출액" active={isRevenueFilterActive(filters)} width={280}>

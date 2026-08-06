@@ -759,7 +759,10 @@ function FinancialsResultsView({ jobId, viewerOnly = false }: { jobId: number; v
                                 </Group>
                               </UnstyledButton>
                             )}
+                            {/* jobId는 §4-14 값 목록 필터(업종/감사인/감사의견)가 팝오버를
+                                열 때 `distinct-values`를 조회하는 데 쓴다. */}
                             <ResultColumnFilterControl
+                              jobId={jobId}
                               columnKey={col.key}
                               filters={filters}
                               onChange={updateFilters}

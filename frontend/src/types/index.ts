@@ -399,6 +399,40 @@ export interface SelectionSummaryResponse {
   no_history: number
 }
 
+/** §4-14 값 목록 필터를 지원하는 컬럼 — 백엔드 `DISTINCT_VALUE_FIELDS`와 1:1이다.
+ * 회사명/주소는 고유값이 행 수와 사실상 같아 **일부러 빠져 있다**(그쪽은 텍스트
+ * 부분일치 필터가 담당한다). */
+export type DistinctValueField = 'induty_name' | 'auditor_name' | 'audit_opinion'
+
+/** 값 목록 한 항목 — 값과 그 값을 가진 결과 행 수. */
+export interface DistinctValueItem {
+  value: string
+  count: number
+}
+
+/** `GET /api/jobs/{id}/results/distinct-values` 응답(§4-14, 2026-08-05).
+ *
+ * 엑셀 컬럼 필터의 "값 체크박스 목록"에 해당한다. **집계 범위는 그 Job의 결과
+ * 전체이고 화면에 걸린 다른 필터를 반영하지 않는다** — 반영하면 지금 화면에서
+ * 빠져 있는 값이 목록에서도 사라져 "안 보이는 값을 다시 켜기"가 불가능해진다. */
+export interface DistinctValuesResponse {
+  field: DistinctValueField
+  /** 개수 내림차순 → 값 오름차순. "값 없음"은 여기 들어가지 않는다(아래 blank_*). */
+  values: DistinctValueItem[]
+  /** `limit` 적용 전 실제 고유값 개수. */
+  total_distinct: number
+  /** true면 목록이 잘렸다 — 화면은 "검색으로 좁히세요"를 안내해야 한다(잘린 줄
+   * 모르고 "전체 선택"하면 안 보이는 값이 조용히 빠진다). */
+  truncated: boolean
+  /** 그 컬럼이 NULL이거나 빈 문자열인 행 수. 0이면 "(값 없음)" 항목을 그리지 않는다. */
+  blank_count: number
+  /** "(값 없음)"을 고를 때 필터 파라미터에 실을 예약 토큰(`__BLANK__`).
+   * 백엔드가 토큰을 바꿔도 화면이 따라오도록 응답에 실려 온다 — 하드코딩하지 말 것. */
+  blank_token: string
+  /** 그 Job의 전체 결과 행 수(각 count·blank_count의 분모). */
+  total_rows: number
+}
+
 /** 계정 상세 1행 — 원문 라벨(각주 포함)/상대 계층 레벨/당기·전기 값. */
 export interface AccountRow {
   label: string
