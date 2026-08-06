@@ -36,7 +36,13 @@ body {
   background: #c9a227;
 }
 
-/* ── 결과/상세 테이블 헤더를 딥 네이비로 통일 (보고서 표와 동일 규격) ── */
+/* ── 결과/상세 테이블 헤더를 딥 네이비로 통일 (보고서 표와 동일 규격) ──
+   결과 표의 고정 헤더(`Table stickyHeader`, 2026-08-06)가 데이터 행을 가리려면 이
+   불투명 배경이 반드시 살아 있어야 한다. Mantine의 sticky 규칙도 같은 자리에
+   `background-color: var(--mantine-color-body)`(흰색)를 걸지만 특정도가 같아
+   **나중에 선언된 이 규칙이 이긴다** — main.tsx가 `@mantine/core/styles.css` **뒤에**
+   이 파일을 import하기 때문이다. import 순서를 바꾸면 고정 헤더가 흰색이 되고
+   그 위로 행이 비쳐 보인다. */
 .mantine-Table-th {
   background: #0a192f;
   color: #fff;
@@ -76,4 +82,42 @@ tr.result-row-selected .result-select-cell {
 }
 tr:hover .result-select-cell {
   background-color: var(--mantine-color-gray-1);
+}
+
+/* ── 결과 표 스크롤 뷰포트 (헤더 고정, 2026-08-06) ──
+   세로 스크롤이 창(window)이 아니라 이 뷰포트 안에서 일어나기 때문에, 창 스크롤이
+   공짜로 주던 것들(포커스 이동 시 자동 스크롤 여백·키보드 스크롤·인쇄 시 전체 출력)을
+   여기서 다시 챙겨 줘야 한다. */
+
+/* 고정 헤더 높이만큼 스크롤 여백을 둔다 — 없으면 Shift+Tab으로 위쪽 행의 체크박스에
+   포커스가 갔을 때 브라우저 기본 스크롤이 "뷰포트 맨 위"까지만 올려서 그 행이
+   **고정 헤더 뒤에 가려진다**(sticky 헤더의 전형적인 부작용).
+   헤더 실측 높이는 38.8px이고 여유를 둬 52px로 잡았다 — 실측(Shift+Tab 30회 반복)에서
+   0px일 때 최악 -48.1px(완전히 가림) → 52px일 때 +12.4px(항상 헤더 아래 노출)였다. */
+.result-table-viewport {
+  scroll-padding-top: 52px;
+}
+
+/* 뷰포트에 tabIndex=0을 줘 키보드 스크롤 대상이 되게 했으므로(ResultPage.tsx),
+   포커스 링은 키보드 이동일 때만 그린다 — 마우스로 표를 클릭할 때마다 표 전체를
+   두르는 테두리가 나타나면 과하다. */
+.result-table-viewport:focus {
+  outline: none;
+}
+.result-table-viewport:focus-visible {
+  outline: 2px solid var(--mantine-color-blue-5);
+  outline-offset: -2px;
+}
+
+/* 인쇄 시에는 높이 제한을 풀어 전체 행이 출력되게 한다 — 화면용 max-height를 그대로
+   두면 표가 컨테이너 높이만큼만 인쇄되고 나머지 행이 통째로 잘린다.
+   실제 `max-height`는 루트(.result-table-scroll)가 아니라 Mantine 내부의
+   `scrollContainerInner`(.result-table-scroll-inner)에 걸리므로 셋을 함께 푼다. */
+@media print {
+  .result-table-scroll,
+  .result-table-scroll-inner,
+  .result-table-viewport {
+    max-height: none !important;
+    overflow: visible !important;
+  }
 }

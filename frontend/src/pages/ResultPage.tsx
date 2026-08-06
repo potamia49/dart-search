@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useParams } from 'react-router-dom'
 import {
   Alert,
@@ -95,6 +95,31 @@ const RIGHT_ALIGN_COLUMN_KEYS = new Set<ResultColumn['key']>([
 /** 검색어 입력마다 요청을 보내지 않도록 하는 디바운스 지연(ms) — SearchPage의
  * 후보 수 미리보기와 같은 값을 쓴다. */
 const SEARCH_DEBOUNCE_MS = 400
+
+/** 결과 표의 세로 스크롤 높이 (2026-08-06, 헤더 고정).
+ *
+ * **왜 표에 높이를 주는가** — 헤더 고정(`Table stickyHeader`)은 `position: sticky`라
+ * "가장 가까운 스크롤 컨테이너" 기준으로만 붙는다. 이 화면의 표는 이미
+ * `Table.ScrollContainer`(Mantine `ScrollArea`, 가로 스크롤용)로 감싸여 있어 세로 sticky도
+ * **그 컨테이너 기준**이 되는데, 지금까지는 높이 제한이 없어 컨테이너가 표 전체 높이만큼
+ * 늘어났다 — 스크롤은 페이지(window)가 하고 컨테이너는 통째로 밀려 올라가므로 sticky를
+ * 걸어도 아무 일도 일어나지 않는다(컨테이너 안에서는 스크롤이 0이다). 그래서 표에
+ * 최대 높이를 줘 **세로 스크롤을 컨테이너 안으로 들여온다**.
+ *
+ * 빼는 420px은 표 위·아래 크롬(chrome)의 **실측 합계**다(2026-08-06 Playwright 실측,
+ * 여러 해상도) — AppShell 헤더 60 + main 상하 padding 32 + 푸터 34 + 표 위 블록(제목·
+ * 필터바·선택 표시줄·건수 안내) 약 229 + 페이지네이션 약 48 ≈ 403~420.
+ * 최초 구현은 이 값을 320으로 잡았는데 실측보다 100~213px 작아, **기본 상태에서도 페이지
+ * 자체 스크롤이 늘 남아 있었다**(휴면·폐업 추정 Alert가 뜨면 171~213px). 그러면 표 내부
+ * 스크롤과 페이지 스크롤이 동시에 존재해, 휠이 표 끝에 닿는 순간 스크롤 체이닝으로 화면이
+ * 통째로 튄다. 실측값으로 맞춘 뒤(1920x1080 / 1536x864 / 1366x768 모두) 잔여 페이지
+ * 스크롤은 **0px**이 됐다 — 고정된 헤더가 늘 화면 안에 남는다.
+ * 다만 "휴면·폐업 추정 포함" Alert가 뜨면 그 높이만큼(실측 71px) 페이지가 다시 조금
+ * 스크롤된다 — 상수 하나로는 조건부 Alert 높이를 알 수 없어 감수한다(320px 시절의
+ * 171~213px보다는 크게 줄었고, 그 상태에서도 헤더는 표 안에 고정돼 있다).
+ * 창이 아주 낮을 때 값이 음수가 되면 CSS가 선언을 통째로 버려 높이 제한이 사라지므로
+ * `max()`로 하한을 둔다. */
+const TABLE_MAX_HEIGHT = 'calc(max(240px, 100vh - 420px))'
 
 /** 이 개수를 넘게 고르면 파일 생성이 오래 걸릴 수 있다고 안내한다(§4-11 — 상한을 걸어
  * 막지는 않는다. 로컬 SQLite 조회뿐이라 수백~수천 건도 동작 자체는 가능하다). */
@@ -294,6 +319,19 @@ function FinancialsResultsView({ jobId, viewerOnly = false }: { jobId: number; v
       .then(setData)
       .catch(() => setError('결과를 불러오지 못했습니다. 백엔드 서버가 실행 중인지 확인하세요.'))
       .finally(() => setLoading(false))
+  }, [jobId, page, query])
+
+  /** 표 내부 스크롤 뷰포트(Mantine ScrollArea) — 헤더 고정 이후 세로 스크롤이 페이지가
+   * 아니라 이 요소에서 일어난다. 아래 스크롤 위치 리셋과 키보드 스크롤(tabIndex)에 쓴다. */
+  const tableViewportRef = useRef<HTMLDivElement>(null)
+
+  // 목록 내용이 통째로 바뀌면(페이지 이동·정렬 변경·필터/검색 변경) 표 안의 스크롤을
+  // 맨 위로 되돌린다 — 그러지 않으면 표 아래쪽을 보던 중 페이지를 넘겼을 때 새 목록의
+  // 앞부분이 위로 잘린 채 중간부터 보인다(페이지 스크롤이던 시절엔 창 스크롤을 사용자가
+  // 직접 올렸으므로 드러나지 않던 문제다). 데이터 도착을 기다리지 않고 조건이 바뀌는
+  // 즉시 올린다 — 새 데이터가 더 짧아도 브라우저가 scrollTop을 알아서 clamp한다.
+  useEffect(() => {
+    tableViewportRef.current?.scrollTo({ top: 0 })
   }, [jobId, page, query])
 
   /** 컬럼 필터 변경 — 필터가 바뀌면 결과 집합 자체가 바뀌므로 항상 1페이지로 돌아간다
@@ -761,8 +799,41 @@ function FinancialsResultsView({ jobId, viewerOnly = false }: { jobId: number; v
           )}
           <Box pos="relative">
             <LoadingOverlay visible={loading} zIndex={100} overlayProps={{ blur: 1 }} />
-              <Table.ScrollContainer minWidth={800}>
-              <Table striped highlightOnHover withTableBorder>
+              {/* `maxHeight`가 있어야 세로 스크롤이 이 컨테이너 안에서 일어나고,
+                  그래야 `stickyHeader`(컬럼명 + 정렬 화살표 + 필터 아이콘 줄 전체)가
+                  실제로 위에 붙는다 — 근거는 TABLE_MAX_HEIGHT 주석 참고.
+
+                  `scrollAreaProps`가 필요한 이유(2026-08-06 디자인 리뷰):
+                  - `type: 'always'` — Mantine ScrollArea의 기본값은 `hover`라 **마우스가
+                    표 밖에 있으면 세로 스크롤바가 `display:none`으로 사라진다**. 세로
+                    스크롤이 창에서 표 안으로 들어온 지금은 그게 유일한 "전체 길이·현재
+                    위치" 단서라(페이지당 50건씩 수천 건을 훑는 검수 화면이다) 항상 보이게 둔다.
+                  - `viewportRef` — 페이지/정렬/필터 변경 시 스크롤을 맨 위로 되돌린다.
+                  - `viewportProps.tabIndex` — 뷰포트가 포커스를 받을 수 있어야 표 밖(body)에
+                    포커스가 있을 때도 PageDown/Home/End 같은 키보드 스크롤이 표에 닿는다.
+                    포커스 링은 index.css에서 `:focus-visible`로만 그린다(마우스 클릭 때는
+                    테두리가 튀지 않게).
+                  - 클래스 2개는 인쇄 시 높이 제한 해제와 `scroll-padding-top`(고정 헤더가
+                    포커스 행을 가리지 않게)을 걸기 위한 훅이다 — index.css 참고.
+                    **뷰포트 클래스는 `viewportProps.className`이 아니라 `classNames.viewport`
+                    로 줘야 한다** — ScrollArea가 `{...viewportProps}` **뒤에**
+                    `getStyles('viewport')`를 펼쳐 className을 통째로 덮어쓰기 때문이다
+                    (실측으로 클래스가 사라지는 것을 확인했다). */}
+              <Table.ScrollContainer
+                minWidth={800}
+                maxHeight={TABLE_MAX_HEIGHT}
+                className="result-table-scroll"
+                // `maxHeight`는 루트가 아니라 Mantine 내부의 `scrollContainerInner`에 걸린다
+                // (실측 확인) — 인쇄 시 높이 제한을 풀려면 이 요소를 잡아야 한다.
+                classNames={{ scrollContainerInner: 'result-table-scroll-inner' }}
+                scrollAreaProps={{
+                  type: 'always',
+                  viewportRef: tableViewportRef,
+                  viewportProps: { tabIndex: 0 },
+                  classNames: { viewport: 'result-table-viewport' },
+                }}
+              >
+              <Table striped highlightOnHover withTableBorder stickyHeader>
                 <Table.Thead>
                   <Table.Tr>
                     {/* §4-11 선택 열 — 헤더 체크박스는 현재 페이지 행만 전체선택/해제한다.
