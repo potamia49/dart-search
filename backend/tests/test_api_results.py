@@ -24,6 +24,9 @@ from app.api.results import (
     DISTINCT_VALUE_FIELDS,
     PARSE_STATUS_EXT_VALUES,
     SORTABLE_COLUMNS,
+    _DETAIL_NOTICE_EMPTY,
+    _DETAIL_NOTICE_PARSE_FAILED,
+    _DETAIL_NOTICE_PDF,
 )
 from app.core.db import get_db
 from app.exporters.excel import RESULT_COLUMN_LABELS
@@ -1371,7 +1374,12 @@ def test_export_ids_selects_only_given_rows_and_ignores_other_filters(client_wit
 def test_export_ids_uses_long_account_format(client_with_db):
     """선택 다운로드는 회사 1건이 당기 계정과목 24행으로 풀리는 long 포맷이다
     (2026-07-28, 2026-08-05 세부계정 5항목 추가로 19 → 24). 값이 없는 계정과목도
-    금액만 빈 채로 행이 남는다."""
+    금액만 빈 채로 행이 남는다.
+
+    이 시드 데이터는 원문 캐시가 없어 §4-15(2026-08-06) 세부계정 행이 붙지 않는다 —
+    요약 24행 + "세부계정비고"만 채워진 상태를 함께 잠근다(세부계정이 실제로 붙는
+    경우는 `test_export_ids_includes_raw_account_detail_rows`).
+    """
     client, factory = client_with_db
     job_id = _seed_job_with_results(factory)
     ok_id = _get_result_id(factory, job_id, "00100001")
@@ -1400,9 +1408,14 @@ def test_export_ids_uses_long_account_format(client_with_db):
         "감사인",
         "감사인주소",
         "감사인변동여부",
+        "재무제표명",  # §4-15(2026-08-06) — 세부계정이 어느 표의 어느 대분류 밑인지
+        "구분",
+        "상위계정",
         "계정과목명",
+        "계정단계",
         "금액",
-        "파싱상태",  # 계정과목명/금액보다도 뒤, 맨 마지막 컬럼(2026-07-28 사용자 확정)
+        "파싱상태",  # 계정과목명/금액보다도 뒤(2026-07-28 사용자 확정)
+        "세부계정비고",  # 파싱상태보다도 뒤(§4-15)
     ]
     assert ws.max_row == 25  # 헤더 + 계정과목 24행
 
@@ -1420,6 +1433,25 @@ def test_export_ids_uses_long_account_format(client_with_db):
     status_col = header.index("파싱상태") + 1
     assert {ws.cell(row=r, column=corp_col).value for r in range(2, 26)} == {"㈜성공테스트"}
     assert {ws.cell(row=r, column=status_col).value for r in range(2, 26)} == {"OK"}
+    # 요약 행은 상위계정이 비고 계정단계가 0이며, 재무제표명은 ② 시트와 같은 체계다.
+    kind_col = header.index("구분") + 1
+    parent_col = header.index("상위계정") + 1
+    level_col = header.index("계정단계") + 1
+    stmt_col = header.index("재무제표명") + 1
+    assert {ws.cell(row=r, column=kind_col).value for r in range(2, 26)} == {"요약"}
+    assert {ws.cell(row=r, column=parent_col).value for r in range(2, 26)} == {None}
+    assert {ws.cell(row=r, column=level_col).value for r in range(2, 26)} == {0}
+    # ① 시트의 요약 항목 순서는 "도입 시점 순"이라 ②(재무제표별 그룹)와 달리
+    # 영업외수익/비용이 현금흐름표 뒤에 온다 — 라벨·소속은 같고 순서만 다르다
+    # (excel.py의 `RESULT_COLUMN_LABELS` 주석에 남아 있는 의도된 차이).
+    assert [ws.cell(row=r, column=stmt_col).value for r in range(2, 26)] == (
+        ["재무상태표"] * 9 + ["손익계산서"] * 7 + ["현금흐름표"] * 6 + ["손익계산서"] * 2
+    )
+    # 원문 캐시가 없는 회사는 세부계정 행 대신 사유가 모든 행에 반복된다.
+    notice_col = header.index("세부계정비고") + 1
+    assert {ws.cell(row=r, column=notice_col).value for r in range(2, 26)} == {
+        "원문 캐시 없음(재수집 필요)"
+    }
 
 
 def test_export_ids_csv_uses_long_account_format(client_with_db):
@@ -1433,9 +1465,257 @@ def test_export_ids_csv_uses_long_account_format(client_with_db):
     )
     assert resp.status_code == 200
     lines = resp.content.decode("utf-8-sig").splitlines()
-    assert lines[0].endswith("계정과목명,금액,파싱상태")
+    assert lines[0].endswith("재무제표명,구분,상위계정,계정과목명,계정단계,금액,파싱상태,세부계정비고")
     assert len(lines) == 25
-    assert any(line.endswith("매출액,10000000000,OK") for line in lines[1:])
+    assert any(
+        line.endswith("손익계산서,요약,,매출액,0,10000000000,OK,원문 캐시 없음(재수집 필요)")
+        for line in lines[1:]
+    )
+
+
+def test_export_ids_includes_raw_account_detail_rows(client_with_db, monkeypatch, tmp_path):
+    """선택 다운로드에 **원문 그대로의 전체 세부계정**이 대분류 밑에 실린다(§4-15).
+
+    화면의 "세부계정 펼치기"와 같은 경로(`parse_account_detail` + 로컬 문서 캐시)를
+    재사용하므로 DART 호출·쿼터가 0건이고 기존 완료 Job에서도 그대로 동작한다.
+    """
+    client, factory = client_with_db
+    job_id, result_id = _seed_result_with_rcept(factory, "20260630000641")
+    _point_cache_at_tmp(monkeypatch, tmp_path, "20260630000641", "20260630000641")
+
+    resp = client.get(
+        f"/api/jobs/{job_id}/export", params={"format": "xlsx", "ids": str(result_id)}
+    )
+    assert resp.status_code == 200
+    ws = openpyxl.load_workbook(io.BytesIO(resp.content))["results"]
+    header = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
+    idx = {name: header.index(name) for name in header}
+    rows = [
+        [ws.cell(row=r, column=c + 1).value for c in range(len(header))]
+        for r in range(2, ws.max_row + 1)
+    ]
+
+    kinds = [r[idx["구분"]] for r in rows]
+    assert kinds.count("요약") == 24  # 요약 항목은 하나도 사라지지 않는다
+    assert kinds.count("세부") > 20  # 원문 세부계정이 실제로 붙었다
+
+    # 유동자산 요약 행 **바로 다음**부터 그 대분류의 세부계정이 온다.
+    pos = next(i for i, r in enumerate(rows) if r[idx["계정과목명"]] == "유동자산")
+    assert rows[pos][idx["구분"]] == "요약"
+    assert rows[pos + 1][idx["구분"]] == "세부"
+    assert rows[pos + 1][idx["상위계정"]] == "유동자산"
+    assert rows[pos + 1][idx["재무제표명"]] == "재무상태표"
+
+    ca_rows = [r for r in rows if r[idx["상위계정"]] == "유동자산"]
+    assert all(r[idx["계정단계"]] >= 1 for r in ca_rows)
+    assert any(r[idx["금액"]] is not None for r in ca_rows)
+    # 금액은 정수로 쓰인다(원문 파싱값은 float라 그대로 두면 셀에 소수점이 붙는다).
+    assert all(
+        isinstance(r[idx["금액"]], int) for r in ca_rows if r[idx["금액"]] is not None
+    )
+    # 세부계정을 얻었으므로 비고는 비어 있고, 기본정보는 모든 행에 반복된다.
+    assert {r[idx["세부계정비고"]] for r in rows} == {None}
+    assert {r[idx["회사명"]] for r in rows} == {"㈜원문"}
+
+
+def test_export_ids_marks_company_without_disclosure_in_detail_notice(client_with_db):
+    """원문(rcept_no)이 아예 없는 회사는 세부계정 행 대신 사유가 남는다.
+
+    행을 조용히 빼면 "원문에 세부계정이 없는 회사"와 "원문을 못 읽은 회사"가
+    파일에서 구분되지 않는다 — 값이 없는 계정과목의 행을 남기는 기존 방침과 같다.
+    """
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+    db = factory()
+    try:
+        row = db.execute(
+            select(Result).where(Result.job_id == job_id, Result.corp_code == "00100002")
+        ).scalar_one()
+        row.rcept_no = None
+        db.commit()
+        target_id = row.id
+    finally:
+        db.close()
+
+    resp = client.get(
+        f"/api/jobs/{job_id}/export", params={"format": "csv", "ids": str(target_id)}
+    )
+    assert resp.status_code == 200
+    lines = resp.content.decode("utf-8-sig").splitlines()
+    assert len(lines) == 25  # 요약 24행만
+    assert all(line.endswith("원문 없음(감사보고서 미공시)") for line in lines[1:])
+
+
+def test_export_ids_marks_pdf_only_document_in_detail_notice(
+    client_with_db, monkeypatch, tmp_path
+):
+    """원문이 PDF뿐이면 "캐시 없음"이 아니라 PDF 사유가 남는다(§4-15 비고 5종 중 ③).
+
+    둘을 구분하지 않으면 "재수집하면 되는 회사"와 "재수집해도 세부계정을 못 얻는
+    회사"가 파일에서 섞인다(HWP/PDF 원문은 세부계정 파싱 미지원).
+    """
+    client, factory = client_with_db
+    job_id, result_id = _seed_result_with_rcept(factory, "20260630000641")
+    (tmp_path / "20260630000641").mkdir(parents=True)
+    (tmp_path / "20260630000641" / "document.pdf").write_bytes(b"%PDF-1.4 stub")
+    monkeypatch.setattr(
+        "app.api.results.get_settings",
+        lambda: SimpleNamespace(document_cache_dir=str(tmp_path)),
+    )
+
+    resp = client.get(
+        f"/api/jobs/{job_id}/export", params={"format": "csv", "ids": str(result_id)}
+    )
+    assert resp.status_code == 200
+    lines = resp.content.decode("utf-8-sig").splitlines()
+    assert len(lines) == 25  # 요약 24행만(세부계정 없음)
+    assert all(line.endswith(_DETAIL_NOTICE_PDF) for line in lines[1:])
+
+
+def test_export_ids_marks_parse_failure_in_detail_notice(client_with_db, monkeypatch, tmp_path):
+    """회사 1건의 원문 파싱이 터져도 다운로드 전체가 실패하지 않고 사유만 남는다(④)."""
+    client, factory = client_with_db
+    job_id, result_id = _seed_result_with_rcept(factory, "20260630000641")
+    _point_cache_at_tmp(monkeypatch, tmp_path, "20260630000641", "20260630000641")
+
+    def _boom(_raw: bytes):
+        raise ValueError("깨진 원문")
+
+    monkeypatch.setattr("app.api.results.parse_account_detail", _boom)
+
+    resp = client.get(
+        f"/api/jobs/{job_id}/export", params={"format": "csv", "ids": str(result_id)}
+    )
+    assert resp.status_code == 200  # 500이 아니다 — 회사 1건의 문제로 파일을 버리지 않는다
+    lines = resp.content.decode("utf-8-sig").splitlines()
+    assert len(lines) == 25
+    assert all(line.endswith(_DETAIL_NOTICE_PARSE_FAILED) for line in lines[1:])
+
+
+def test_export_ids_marks_document_without_accounts_in_detail_notice(
+    client_with_db, monkeypatch, tmp_path
+):
+    """원문은 읽었지만 세부계정을 한 행도 못 얻은 회사도 사유를 남긴다(⑤).
+
+    개발 캐시 실측으로 원문 보유 회사의 7.1%가 이 경로다(서식이 달라 대분류 자체를
+    못 잡는 경우 등) — 비고가 없으면 "원문에 세부계정이 없는 회사"와 "정상적으로
+    세부계정이 0건인 회사"를 파일에서 구분할 수 없다.
+    """
+    client, factory = client_with_db
+    job_id, result_id = _seed_result_with_rcept(factory, "20260630000641")
+    target = tmp_path / "20260630000641"
+    target.mkdir(parents=True)
+    (target / "document.xml").write_bytes(
+        '<?xml version="1.0" encoding="utf-8"?><DOCUMENT><BODY><P>재무제표 없음</P></BODY>'
+        "</DOCUMENT>".encode()
+    )
+    monkeypatch.setattr(
+        "app.api.results.get_settings",
+        lambda: SimpleNamespace(document_cache_dir=str(tmp_path)),
+    )
+
+    resp = client.get(
+        f"/api/jobs/{job_id}/export", params={"format": "csv", "ids": str(result_id)}
+    )
+    assert resp.status_code == 200
+    lines = resp.content.decode("utf-8-sig").splitlines()
+    assert len(lines) == 25
+    assert all(line.endswith(_DETAIL_NOTICE_EMPTY) for line in lines[1:])
+
+
+def test_export_xlsx_rejects_selection_over_sheet_row_limit(
+    client_with_db, monkeypatch, tmp_path
+):
+    """xlsx 시트 행 상한을 넘는 선택은 500이 아니라 400 + 한국어 안내로 막는다.
+
+    §4-15로 회사당 행 수가 평균 86.9행(원문 보유 회사는 약 142행)이 돼 7,400건
+    남짓만 골라도 1,048,576행을 넘긴다 — 그대로 두면 직렬화 단계의 ValueError가
+    처리되지 않은 500으로 새어 나간다(dart-qa 2026-08-06 Medium-1).
+    """
+    client, factory = client_with_db
+    job_id, result_id = _seed_result_with_rcept(factory, "20260630000641")
+    _point_cache_at_tmp(monkeypatch, tmp_path, "20260630000641", "20260630000641")
+    # 실제로 100만 행을 만들 수는 없으므로 상한 쪽을 낮춰 같은 분기를 태운다.
+    monkeypatch.setattr("app.api.results._XLSX_MAX_DATA_ROWS", 10)
+
+    resp = client.get(
+        f"/api/jobs/{job_id}/export", params={"format": "xlsx", "ids": str(result_id)}
+    )
+    assert resp.status_code == 400
+    detail = resp.json()["detail"]
+    assert "1,048,576" in detail  # 상한은 안내 문구에 항상 실제 값으로 적는다
+    assert "CSV" in detail  # csv에는 이 상한이 없으므로 대안을 안내한다
+
+    # 같은 선택이라도 csv는 상한이 없다.
+    ok = client.get(
+        f"/api/jobs/{job_id}/export", params={"format": "csv", "ids": str(result_id)}
+    )
+    assert ok.status_code == 200
+
+
+def test_export_xlsx_row_limit_counts_detail_rows(client_with_db, monkeypatch, tmp_path):
+    """행 수 판정은 요약 24행뿐 아니라 **세부계정 실제 행 수**까지 합산한다.
+
+    요약 24행만 셌다면 이 선택(24행 < 상한 40)은 통과했겠지만, 세부계정이 붙어
+    실제로는 수백 행이라 막혀야 한다.
+    """
+    client, factory = client_with_db
+    job_id, result_id = _seed_result_with_rcept(factory, "20260630000641")
+    _point_cache_at_tmp(monkeypatch, tmp_path, "20260630000641", "20260630000641")
+    monkeypatch.setattr("app.api.results._XLSX_MAX_DATA_ROWS", 40)
+
+    resp = client.get(
+        f"/api/jobs/{job_id}/export", params={"format": "xlsx", "ids": str(result_id)}
+    )
+    assert resp.status_code == 400
+    assert "results 시트" in resp.json()["detail"]
+
+
+def test_export_xlsx_row_limit_applies_to_history_sheet(client_with_db, monkeypatch):
+    """② `financial_history` 시트(스냅샷 1건 = 24행)에도 같은 상한을 적용한다."""
+    client, factory = client_with_db
+    job_id = _seed_job_with_results(factory)
+    ok_id = _get_result_id(factory, job_id, "00100001")
+    db = factory()
+    try:
+        db.add_all(
+            [
+                FinancialSnapshot(
+                    result_id=ok_id, rcept_no="R1", fiscal_year="2024", revenue=1
+                ),
+                FinancialSnapshot(
+                    result_id=ok_id, rcept_no="R2", fiscal_year="2025", revenue=2
+                ),
+            ]
+        )
+        db.commit()
+    finally:
+        db.close()
+    # 스냅샷 2건 × 24항목 = 48행 > 30. ① 시트(회사 3건 × 24 = 72행)에 먼저 걸리지
+    # 않도록 `ids`로 1개사만 고른다(=24행).
+    monkeypatch.setattr("app.api.results._XLSX_MAX_DATA_ROWS", 30)
+
+    resp = client.get(
+        f"/api/jobs/{job_id}/export",
+        params={"format": "xlsx", "ids": str(ok_id), "include_history": "true"},
+    )
+    assert resp.status_code == 400
+    assert "financial_history 시트" in resp.json()["detail"]
+
+
+def test_export_without_ids_has_no_detail_columns(client_with_db, monkeypatch, tmp_path):
+    """필터 전체 내보내기(wide)는 §4-15와 무관하게 기존 포맷 그대로다."""
+    client, factory = client_with_db
+    job_id, _ = _seed_result_with_rcept(factory, "20260630000641")
+    _point_cache_at_tmp(monkeypatch, tmp_path, "20260630000641", "20260630000641")
+
+    resp = client.get(f"/api/jobs/{job_id}/export", params={"format": "xlsx"})
+    assert resp.status_code == 200
+    ws = openpyxl.load_workbook(io.BytesIO(resp.content))["results"]
+    header = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
+    assert "세부계정비고" not in header and "상위계정" not in header
+    assert "매출액(전기)" in header
+    assert ws.max_row == 2  # 회사 1건 = 1행
 
 
 @pytest.mark.parametrize("format", ["xlsx", "csv"])
@@ -1600,7 +1880,7 @@ def test_export_include_history_writes_two_sheets_with_joined_corp_name(client_w
     # 기본정보 시트는 long 포맷 — 헤더 + 선택한 1개사 × 계정과목 24행(2026-07-28).
     assert ws_results.max_row == 25
     results_header = [c.value for c in next(ws_results.iter_rows(min_row=1, max_row=1))]
-    assert results_header[-3:] == ["계정과목명", "금액", "파싱상태"]
+    assert results_header[-5:] == ["계정과목명", "계정단계", "금액", "파싱상태", "세부계정비고"]
     corp_col = results_header.index("회사명") + 1
     assert ws_results.cell(row=2, column=corp_col).value == "㈜성공테스트"
 

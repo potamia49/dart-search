@@ -34,18 +34,193 @@ long 포맷(`SELECTION_EXPORT_COLUMN_LABELS`/`results_to_selection_dataframe()`/
 `include_history=true`만 온 요청(필터 전체 + 재무이력)의 기본정보 시트는 wide다.
 그래서 `export_results_with_history()`가 `use_selection_format` 인자를 받아
 호출부(`export_job_results()`)가 넘긴 `selected_ids is not None`을 그대로 따른다.
+
+2026-08-06(§4-15): 선택 다운로드 ① 시트에 **원문 그대로의 전체 세부계정**을 함께
+싣는다. 기존 요약 24항목 행은 그대로 두고, 각 요약 항목 **바로 아래**에 그 대분류에
+속한 원문 계정과목 행을 이어 붙인다(`SelectionAccountDetail`). 세부계정 데이터는
+이 모듈이 직접 만들지 않고 **호출부가 넘긴다** — 원문 캐시 경로/파싱은 API 계층
+(`app/api/results.py::_load_selection_account_details()`)의 일이고 이 모듈은 순수
+직렬화만 담당한다는 기존 구조(`corp_name_by_result_id`를 넘겨받는 방식)를 따른다.
+
+2026-08-06 후속(§4-15, dart-qa Medium-2): xlsx 직렬화를 `DataFrame.to_excel`에서
+**openpyxl write-only 스트리밍**(`_write_xlsx()`)으로 바꿔 피크 메모리를 줄였다.
+셀 값·헤더 서식은 pandas가 쓰던 것과 동일하며(드리프트 가드 테스트가 두 방식의
+출력을 직접 대조한다), csv 경로와 DataFrame 생성 로직은 무변경이다.
+
+2026-08-06 후속(dart-qa Low): 그 write-only 전환이 `%TEMP%` 임시파일 누수를 새로
+만들었던 것을 고쳤다 — 이제 **정상 종료든 예외든 임시파일이 반드시 정리된다**
+(`_discard_write_only_temp_files()`). 함께 `_xlsx_cell_value()`가 모든 문자열 셀의
+제어문자를 제거하도록 해, 기본정보 컬럼(회사명/주소/감사인명)에 제어문자가 섞였을 때
+다운로드 전체가 실패하던 **선행 이슈**(pandas 경로에도 있던 문제)도 막는다.
 """
 
 from __future__ import annotations
 
 import io
+import re
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from typing import Literal
 
 import pandas as pd
+from openpyxl import Workbook
+from openpyxl.cell import WriteOnlyCell
+from openpyxl.styles import Alignment, Border, Font, Side
 
 from app.models.financial_snapshot import FinancialSnapshot
 from app.models.result import Result
+from app.parsers.account_detail import AccountRow
+
+# ---------------------------------------------------------------------------
+# xlsx 직렬화 (2026-08-06, dart-qa Medium-2) — openpyxl write-only 스트리밍
+# ---------------------------------------------------------------------------
+#
+# 기존에는 `DataFrame.to_excel(engine="openpyxl")`을 그대로 썼는데, 그 방식은
+# **모든 셀을 `Cell` 객체로 메모리에 쌓아 둔 뒤** 마지막에 한 번에 직렬화한다.
+# §4-15로 선택 다운로드 ① 시트의 행 수가 105,192행 → 380,992행(개발 DB Job 27
+# 전량)으로 늘면서 피크 메모리가 946MB → 3,349MB로 뛰었고, 배포 대상이 브라우저·
+# 엑셀이 함께 떠 있는 사무실 PC(exe)라 실사용에서 감당하기 어려운 수치였다.
+#
+# write-only 모드는 `ws.append()` 때마다 행을 임시 파일로 흘려보내 셀 객체를 남기지
+# 않는다. **출력물은 pandas 방식과 동일하다** — 셀 값/타입, 헤더 서식(굵게 + 얇은
+# 테두리 + 가운데·위 정렬), 시트 이름·순서가 모두 같고, 다음 두 가지만 다르다:
+#   ① 빈 값 셀을 pandas는 빈 inlineStr(`<c t="inlineStr"></c>`)로 쓰고 write-only는
+#      아예 쓰지 않는다 — 엑셀에서도 openpyxl 재읽기에서도 똑같이 빈 칸(None)이다.
+#   ② `<dimension>`(사용 범위 힌트)이 빠진다 — 엑셀이 열 때 스스로 계산하는 값이고
+#      openpyxl 재읽기의 `max_row`/`max_column`도 동일하다.
+# 이 동등성은 `tests/test_exporters.py`의 대조 테스트가 pandas 출력과 직접 비교해
+# 잠근다(pandas가 기본 헤더 서식을 바꾸면 그 테스트가 먼저 깨진다).
+
+# 엑셀 워크시트 1장의 물리적 최대 행 수(헤더 포함). pandas는 이 상한을 넘으면
+# `ValueError: This sheet is too large!`를 던졌는데, write-only 모드에는 그 검사가
+# 없어 **손상된 파일이 조용히 만들어진다** — 그래서 같은 성격의 검사를 여기서 한다.
+# API 계층(`export_job_results`)은 직렬화에 들어가기 전에 예상 행 수를 먼저 세어
+# 400으로 막는다(사용자에게 보이는 안내는 그쪽이고, 여기는 최후의 방어선이다).
+XLSX_MAX_ROWS = 1_048_576
+
+# pandas `ExcelFormatter.header_style`과 같은 헤더 서식(굵게 + 얇은 테두리 4면 +
+# 가로 가운데/세로 위 정렬). 값을 바꾸면 기존 파일과 서식이 달라진다.
+_XLSX_HEADER_FONT = Font(bold=True)
+_XLSX_HEADER_SIDE = Side(style="thin")
+_XLSX_HEADER_BORDER = Border(
+    left=_XLSX_HEADER_SIDE,
+    right=_XLSX_HEADER_SIDE,
+    top=_XLSX_HEADER_SIDE,
+    bottom=_XLSX_HEADER_SIDE,
+)
+_XLSX_HEADER_ALIGNMENT = Alignment(horizontal="center", vertical="top")
+
+# openpyxl이 셀 값으로 거부하는 제어문자(`openpyxl.cell.cell.ILLEGAL_CHARACTERS_RE`와
+# 동일 집합. 줄바꿈 `\n`/`\r`/탭은 허용이라 제외 — 원문 라벨에 셀 안 개행이 실제로
+# 흔하다). `app/reports/audit_proposal.py::_excel_safe()`와 같은 방어다.
+_EXCEL_ILLEGAL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _xlsx_cell_value(value: object) -> object:
+    """DataFrame 셀 값을 openpyxl이 쓸 수 있는 값으로 변환(pandas와 같은 규칙).
+
+    pandas `ExcelFormatter`는 결측(NaN/NaT)을 빈 값으로, 무한대를 `inf`/`-inf`
+    문자열로 바꿔서 넘긴다 — 그 두 가지를 재현한다. NaN을 그대로 넘기면 엑셀이
+    읽지 못하는 `<v>nan</v>` 셀이 만들어진다.
+
+    거기에 더해 **모든 문자열 셀에서 제어문자를 제거한다**(2026-08-06, dart-qa Low).
+    이건 pandas 동작과 다른 유일한 지점이자 의도된 보정이다 — pandas 경로도 제어문자가
+    섞이면 `IllegalCharacterError`로 **다운로드 전체가 500**이 됐고(선행 이슈, 실측
+    재현), 기본정보 컬럼(회사명/주소/감사인명 등 DART 원문 유래 값)에는 방어가 없었다.
+    세부계정 라벨만 막던 `_detail_label()`과 같은 규칙을 여기서 전 컬럼에 적용해
+    xlsx 3경로(wide/선택 long/재무이력)를 한 곳에서 덮는다. 값 자체가 바뀌는 것은
+    제어문자가 실제로 있을 때뿐이다(개발 DB `results` 5,204행 전 문자열 컬럼 실측 0건).
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return _EXCEL_ILLEGAL_CHARS.sub("", value)
+    if isinstance(value, float):
+        if value != value:  # NaN
+            return None
+        if value == float("inf"):
+            return "inf"
+        if value == float("-inf"):
+            return "-inf"
+    elif value is pd.NaT:
+        return None
+    return value
+
+
+def _discard_write_only_temp_files(workbook: Workbook) -> None:
+    """write-only 워크북이 `%TEMP%`에 스풀링해 둔 시트 임시파일을 지운다.
+
+    write-only 모드는 `ws.append()` 때마다 행을 `%TEMP%`의 임시파일(`openpyxl.*`)로
+    흘려보내고, **`Workbook.save()`가** 그 파일을 zip에 넣은 뒤
+    `WorksheetWriter.cleanup()`으로 지운다 — 즉 `save()`에 도달하지 못하면 임시파일이
+    그대로 남는다(dart-qa 2026-08-06 Low, 제어문자 값 → `IllegalCharacterError`로
+    실제 재현). 개발 DB Job 27 전량의 시트 XML이 압축 전 약 604MB라 누수 1건이 그
+    크기이고, 사무실 exe는 서버가 며칠씩 떠 있어 재시도할 때마다 누적된다.
+
+    **`Workbook.close()`로는 정리되지 않는다**(openpyxl 3.1.5 실측). docstring에는
+    write-only에도 영향이 있다고 적혀 있지만 구현은 read-only 전용 `_archive`만 닫는다.
+    openpyxl이 프로세스 종료 시 도는 `atexit` 정리(`ALL_TEMP_FILES`)도 Windows에서는
+    파일 핸들이 열린 채라 `PermissionError`로 실패한다 — 그래서 **핸들을 먼저 닫고
+    (`writer.close()`) 지운다(`writer.cleanup()`)**. `close()` 자체는 향후 openpyxl이
+    여기서 정리하게 될 때를 위해 함께 호출해 둔다(지금은 무해한 no-op).
+
+    정상 종료 뒤에 다시 불러도 안전하다(이미 지워진 파일은 `OSError`로 걸러진다).
+    정리 과정의 실패가 원래 예외를 덮으면 안 되므로 예외는 전부 삼킨다.
+    """
+    workbook.close()
+    for worksheet in workbook.worksheets:
+        writer = getattr(worksheet, "_writer", None)
+        if writer is None:  # 행을 한 줄도 안 쓴 시트 — 임시파일 자체가 없다
+            continue
+        try:
+            writer.close()  # 열린 파일 핸들 해제(Windows는 열린 파일을 지울 수 없다)
+        except Exception:  # noqa: BLE001 - best-effort 정리
+            pass
+        try:
+            writer.cleanup()
+        except Exception:  # noqa: BLE001 - 이미 지워졌거나(정상 경로) 지울 수 없는 경우
+            pass
+
+
+def _write_xlsx(sheets: Sequence[tuple[str, pd.DataFrame]]) -> bytes:
+    """DataFrame 목록을 시트별로 담은 xlsx 바이트를 **행 단위 스트리밍**으로 만든다.
+
+    `sheets`는 (시트명, DataFrame) 순서쌍이고 컬럼 헤더는 DataFrame의 컬럼명을
+    그대로 쓴다(인덱스는 싣지 않는다 — 기존 `to_excel(index=False)`와 동일).
+
+    쓰기 도중 예외가 나도 `%TEMP%`에 스풀링된 시트 임시파일을 남기지 않는다
+    (`_discard_write_only_temp_files()` 참고).
+    """
+    for name, df in sheets:
+        if len(df) + 1 > XLSX_MAX_ROWS:
+            raise ValueError(
+                f"엑셀 시트 최대 행 수({XLSX_MAX_ROWS:,}행)를 초과했습니다: "
+                f"{name} 시트 {len(df) + 1:,}행"
+            )
+
+    workbook = Workbook(write_only=True)
+    try:
+        for name, df in sheets:
+            worksheet = workbook.create_sheet(title=name)
+            header = []
+            for column in df.columns:
+                cell = WriteOnlyCell(worksheet, value=column)
+                cell.font = _XLSX_HEADER_FONT
+                cell.border = _XLSX_HEADER_BORDER
+                cell.alignment = _XLSX_HEADER_ALIGNMENT
+                header.append(cell)
+            worksheet.append(header)
+            for row in df.itertuples(index=False, name=None):
+                worksheet.append([_xlsx_cell_value(value) for value in row])
+
+        buffer = io.BytesIO()
+        workbook.save(buffer)
+    finally:
+        # 정상 경로에서는 save()가 이미 지운 뒤라 no-op이고, 중간에 예외가 나면
+        # 여기서만 임시파일이 정리된다.
+        _discard_write_only_temp_files(workbook)
+    return buffer.getvalue()
+
 
 # DB 필드명 -> 한국어 컬럼 헤더 (PRD 3-1/3-2 항목 기준). 파일 출력 시에만 사용.
 RESULT_COLUMN_LABELS: dict[str, str] = {
@@ -172,14 +347,9 @@ def export_results(results: Sequence[Result], fmt: Literal["xlsx", "csv"]) -> by
 
     df = results_to_dataframe(results).rename(columns=RESULT_COLUMN_LABELS)
 
-    buffer = io.BytesIO()
     if fmt == "xlsx":
-        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-            df.to_excel(writer, sheet_name="results", index=False)
-    else:
-        buffer.write(df.to_csv(index=False).encode("utf-8-sig"))
-
-    return buffer.getvalue()
+        return _write_xlsx([("results", df)])
+    return df.to_csv(index=False).encode("utf-8-sig")
 
 
 # ---------------------------------------------------------------------------
@@ -261,71 +431,220 @@ SELECTION_ACCOUNT_LABELS: dict[str, str] = {
     col: RESULT_COLUMN_LABELS[col].removesuffix("(당기)") for col in SELECTION_ACCOUNT_COLUMNS
 }
 
-# DB 필드명(가상 필드 `account_name`/`amount` 포함) -> 한국어 헤더. dict 순서가 곧
+# --- 원문 세부계정(§4-15, 2026-08-06) -------------------------------------
+#
+# 요약 24항목만으로는 "유동자산 안에 무엇이 얼마나 있는지"를 알 수 없어, 감사보고서
+# 원문에서 뽑은 계정과목 전체를 같은 시트에 이어 싣는다. 라벨은 **원문 그대로**이며
+# 표준화하지 않는다(회사마다 다른 것이 정상 — 화면의 "세부계정 펼치기"와 동일한 값).
+#
+# 행 순서는 "요약 항목 → 그 대분류에 속한 원문 세부계정" 반복이다. 어느 대분류에
+# 속하는지는 `상위계정`(요약 라벨) 컬럼이, 원문 계층 깊이는 `계정단계`(요약=0,
+# 세부=원문 상대 레벨)가 담는다. `구분`(요약/세부)을 별도 컬럼으로 둔 것은 엑셀에서
+# 한 번에 걸러 보기 위함이며, 세부계정 라벨이 요약 라벨과 같은 글자일 수 있어
+# (예: 원문 "현금및현금성자산" vs 요약 "현금및현금성자산(순액)") 구분이 필요하다.
+SELECTION_ROW_KIND_SUMMARY = "요약"
+SELECTION_ROW_KIND_DETAIL = "세부"
+
+
+@dataclass
+class SelectionAccountDetail:
+    """회사 1건의 원문 세부계정(선택 다운로드 ① 시트 전용 입력).
+
+    `accounts`는 요약 필드명(`_cur` 접미어 **없음** — `current_assets` 등) → 그
+    대분류에 속한 원문 계정 행 목록이며, `app/parsers/account_detail.py`의
+    `AccountDetail.accounts`를 그대로 넘겨받는 형태다(새 파서를 만들지 않는다).
+
+    `notice`는 세부계정을 싣지 못한 사유(원문 없음/캐시 없음/PDF/파싱 실패 등)이며
+    그 회사의 **모든 행**에 "세부계정비고"로 반복된다. 값이 없는 계정과목의 행을
+    남기는 것과 같은 취지다 — 세부계정 행을 그냥 빼 버리면 "원문에 세부계정이 없는
+    회사"와 "원문을 못 읽은 회사"가 파일에서 구분되지 않는다.
+    """
+
+    accounts: Mapping[str, Sequence[AccountRow]] = field(default_factory=dict)
+    notice: str | None = None
+
+
+def _selection_statement_of(account_col: str) -> str:
+    """선택 다운로드 ① 시트의 계정과목이 속한 재무제표명.
+
+    ② `financial_history` 시트와 **같은 단일 정의**(`FINANCIAL_SNAPSHOT_ACCOUNTS_BY_
+    STATEMENT`)를 그대로 쓴다 — 두 시트가 같은 계정을 다른 재무제표로 분류하면
+    대조가 불가능해진다. `_cur` 접미어를 뗀 필드명이 그 dict의 키와 1:1이라는 것은
+    `tests/test_exporters.py`의 드리프트 가드 테스트가 잠근다.
+    """
+    return FINANCIAL_SNAPSHOT_STATEMENT_BY_ACCOUNT[account_col.removesuffix("_cur")]
+
+
+def _detail_label(label: str) -> str:
+    """원문 세부계정 라벨을 엑셀에 쓸 수 있게 최소한만 다듬는다(표준화하지 않는다).
+
+    라벨은 회사마다 다른 원문 표기 그대로 싣는 것이 원칙이라(각주 번호·번호 접두어·
+    셀 안 개행 포함) 내용은 건드리지 않고, xlsx 저장 자체를 실패시키는 제어문자만
+    제거한다 — 380,992행 중 한 라벨 때문에 다운로드 전체가 500이 되면 안 된다
+    (로컬 캐시 600건 표본에서는 실제 검출 0건이지만 방어는 남긴다).
+
+    2026-08-06부터 `_xlsx_cell_value()`가 **모든 xlsx 셀**에 같은 규칙을 적용하므로
+    xlsx만 보면 중복이지만, 이 함수는 **csv 경로에도 걸린다**(그쪽은 `_write_xlsx`를
+    거치지 않는다) — 라벨의 제어문자는 포맷과 무관하게 떼는 것이 맞아 그대로 둔다.
+    """
+    return _EXCEL_ILLEGAL_CHARS.sub("", label)
+
+
+def _as_export_amount(value: float | int | None) -> object | None:
+    """원문 파싱값(float)을 정수로 되돌린다 — csv에 `1234.0`이 찍히는 것을 막는다.
+
+    `results` 컬럼은 Integer라 DB 유래 금액은 이미 int지만, 세부계정은 원문에서
+    막 파싱한 `float`(`parse_won_amount`)이다. 원 단위 금액이라 소수부가 있는 값은
+    사실상 없지만, 있으면 그대로 둔다(임의로 반올림해 값을 바꾸지 않는다).
+    """
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return value
+
+
+# DB 필드명(가상 필드 `statement_name`/`row_kind`/`parent_account`/`account_name`/
+# `account_level`/`amount`/`detail_notice` 포함) -> 한국어 헤더. dict 순서가 곧
 # 파일의 컬럼 순서다 — `SELECTION_TRAILING_COLUMNS`(파싱상태)만 계정과목명/금액 뒤로
-# 밀려난다.
+# 밀려나고, 그보다도 뒤에 "세부계정비고"가 온다(둘 다 회사 단위 상태 컬럼이라 나란히
+# 둔다). "재무제표명"은 ② `financial_history` 시트의 같은 이름 컬럼과 값 체계가
+# 동일하다.
 SELECTION_EXPORT_COLUMN_LABELS: dict[str, str] = {
     **{
         col: RESULT_COLUMN_LABELS[col]
         for col in SELECTION_BASE_COLUMNS
         if col not in SELECTION_TRAILING_COLUMNS
     },
+    "statement_name": "재무제표명",
+    "row_kind": "구분",
+    "parent_account": "상위계정",
     "account_name": "계정과목명",
+    "account_level": "계정단계",
     "amount": "금액",
     **{col: RESULT_COLUMN_LABELS[col] for col in SELECTION_TRAILING_COLUMNS},
+    "detail_notice": "세부계정비고",
 }
 
 SELECTION_EXPORT_COLUMNS: list[str] = list(SELECTION_EXPORT_COLUMN_LABELS.keys())
 
 
-def results_to_selection_dataframe(results: Sequence[Result]) -> pd.DataFrame:
+def _append_selection_row(
+    data: dict[str, list[object | None]],
+    base: Mapping[str, object | None],
+    *,
+    statement: str,
+    row_kind: str,
+    parent: str | None,
+    account_name: str,
+    level: int,
+    amount: object | None,
+    notice: str | None,
+) -> None:
+    """선택 다운로드 ① 시트 1행을 **컬럼별 리스트**에 덧붙인다.
+
+    행 dict를 쌓아 `pd.DataFrame(rows)`에 넘기지 않는 이유는 메모리다 — 세부계정을
+    싣기 시작하면서 최대 규모(개발 DB Job 27, 결과 4,383건)의 행 수가 105,192행에서
+    **380,992행**으로 늘었는데, 23키짜리 dict 하나가 832바이트라 그 방식이면 행 dict
+    만으로 약 302MB다(컬럼별 리스트는 포인터 배열이라 같은 조건에서 약 64MB).
+    ② 시트(`snapshots_to_dataframe`)는 행 수가 그대로라 기존 dict 방식을 유지한다.
+    """
+    for col in SELECTION_BASE_COLUMNS:
+        data[col].append(base[col])
+    data["statement_name"].append(statement)
+    data["row_kind"].append(row_kind)
+    data["parent_account"].append(parent)
+    data["account_name"].append(account_name)
+    data["account_level"].append(level)
+    data["amount"].append(amount)
+    data["detail_notice"].append(notice)
+
+
+def results_to_selection_dataframe(
+    results: Sequence[Result],
+    detail_by_result_id: Mapping[int, SelectionAccountDetail] | None = None,
+) -> pd.DataFrame:
     """`results` 레코드를 "회사 × 계정과목" long 포맷 DataFrame으로 변환.
 
-    회사 1건이 `SELECTION_ACCOUNT_COLUMNS` 개수(24)만큼의 행이 되고, 기본정보
-    컬럼(`SELECTION_BASE_COLUMNS`)은 그 행들에 그대로 반복된다. 입력 순서
-    (호출부의 id 오름차순)를 보존한다. 컬럼 순서는 `SELECTION_EXPORT_COLUMNS`가
-    정한다 — `parse_status`는 계정과목명/금액 뒤(맨 마지막)로 간다.
+    회사 1건은 요약 계정과목(`SELECTION_ACCOUNT_COLUMNS`, 24개) 행 + 각 요약 항목
+    **바로 아래**에 이어지는 원문 세부계정 행으로 풀리고, 기본정보 컬럼
+    (`SELECTION_BASE_COLUMNS`)은 그 행들에 그대로 반복된다. 입력 순서(호출부의 id
+    오름차순)를 보존한다. 컬럼 순서는 `SELECTION_EXPORT_COLUMNS`가 정한다 —
+    `parse_status`/`detail_notice`는 계정과목명/금액 뒤(맨 마지막)로 간다.
+
+    `detail_by_result_id`가 없으면(또는 그 회사 항목이 없으면) 요약 24행만 나오고
+    세부계정 컬럼은 비어 있다 — 2026-08-06 이전 동작과 행 구성이 같다.
+
+    세부계정은 **당기(`AccountRow.cur`)만** 싣는다 — 요약 항목이 `_cur`만 싣는 기존
+    방침("전기 항목은 전년도 당기 항목")과 같다. 어느 시점의 값인지는 각 행에 이미
+    반복되는 기본정보의 `결산기준일`/`접수번호`가 말해 준다(세부계정은 그 접수번호
+    원문의 당기 열에서 뽑은 값이라 요약 항목과 같은 회계기간이다).
 
     값이 없는(`None`) 계정과목도 **행은 그대로 만들고 금액만 비운다** — 어떤
     계정과목이 결측인지 파일에서 알 수 있어야 하므로 스킵하지 않는다. 이를 위해
     "금액" 컬럼은 object dtype으로 고정한다(그대로 두면 pandas가 float64로 올려
     `10000000000.0`처럼 소수점이 붙고 결측이 `NaN`으로 출력된다).
     """
-    rows: list[dict[str, object | None]] = []
-    amounts: list[object | None] = []
+    data: dict[str, list[object | None]] = {col: [] for col in SELECTION_EXPORT_COLUMNS}
+    details = detail_by_result_id or {}
     for result in results:
         base = {col: getattr(result, col, None) for col in SELECTION_BASE_COLUMNS}
+        detail = details.get(getattr(result, "id", None))  # type: ignore[arg-type]
+        notice = detail.notice if detail is not None else None
+        children_by_field: Mapping[str, Sequence[AccountRow]] = (
+            detail.accounts if detail is not None else {}
+        )
         for col in SELECTION_ACCOUNT_COLUMNS:
-            value = getattr(result, col, None)
-            rows.append({**base, "account_name": SELECTION_ACCOUNT_LABELS[col], "amount": value})
-            amounts.append(value)
+            statement = _selection_statement_of(col)
+            label = SELECTION_ACCOUNT_LABELS[col]
+            _append_selection_row(
+                data,
+                base,
+                statement=statement,
+                row_kind=SELECTION_ROW_KIND_SUMMARY,
+                parent=None,
+                account_name=label,
+                level=0,
+                amount=getattr(result, col, None),
+                notice=notice,
+            )
+            for child in children_by_field.get(col.removesuffix("_cur"), ()):
+                _append_selection_row(
+                    data,
+                    base,
+                    statement=statement,
+                    row_kind=SELECTION_ROW_KIND_DETAIL,
+                    parent=label,
+                    account_name=_detail_label(child.label),
+                    level=child.level,
+                    amount=_as_export_amount(child.cur),
+                    notice=notice,
+                )
 
-    df = pd.DataFrame(rows, columns=SELECTION_EXPORT_COLUMNS)
-    df["amount"] = pd.Series(amounts, dtype=object, index=df.index)
+    df = pd.DataFrame(data, columns=SELECTION_EXPORT_COLUMNS)
+    df["amount"] = pd.Series(data["amount"], dtype=object, index=df.index)
     return df
 
 
 def export_selection_results(
-    results: Sequence[Result], fmt: Literal["xlsx", "csv"]
+    results: Sequence[Result],
+    fmt: Literal["xlsx", "csv"],
+    detail_by_result_id: Mapping[int, SelectionAccountDetail] | None = None,
 ) -> bytes:
     """선택 다운로드용 기본정보 파일(long 포맷)을 xlsx/csv 바이트로 직렬화.
 
     `export_results()`와 형식(시트명 `results`, csv의 UTF-8 BOM)은 같고 컬럼
     구성만 다르다 — 전체 내보내기는 계속 `export_results()`를 쓴다.
+    `detail_by_result_id`는 원문 세부계정으로, xlsx/csv 모두 동일하게 반영된다.
     """
     if fmt not in ("xlsx", "csv"):
         raise ValueError(f"지원하지 않는 형식입니다: {fmt}")
 
-    df = results_to_selection_dataframe(results).rename(columns=SELECTION_EXPORT_COLUMN_LABELS)
+    df = results_to_selection_dataframe(results, detail_by_result_id).rename(
+        columns=SELECTION_EXPORT_COLUMN_LABELS
+    )
 
-    buffer = io.BytesIO()
     if fmt == "xlsx":
-        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-            df.to_excel(writer, sheet_name="results", index=False)
-    else:
-        buffer.write(df.to_csv(index=False).encode("utf-8-sig"))
-
-    return buffer.getvalue()
+        return _write_xlsx([("results", df)])
+    return df.to_csv(index=False).encode("utf-8-sig")
 
 
 # ---------------------------------------------------------------------------
@@ -469,6 +788,7 @@ def export_results_with_history(
     snapshots: Sequence[FinancialSnapshot],
     corp_name_by_result_id: Mapping[int, str | None],
     use_selection_format: bool = False,
+    detail_by_result_id: Mapping[int, SelectionAccountDetail] | None = None,
 ) -> bytes:
     """기본정보(`results`) + 재무이력(`financial_history`) 2시트 xlsx 바이트 생성.
 
@@ -484,9 +804,17 @@ def export_results_with_history(
     **포맷은 오직 `ids` 유무로만 갈린다** — `include_history`만 붙인 필터 전체
     내보내기의 기본정보 시트는 wide 그대로다(dart-qa 2026-07-28 리뷰 반영).
     시트 ②는 어느 쪽이든 동일하다.
+
+    `detail_by_result_id`(원문 세부계정, §4-15)는 시트 ①이 long 포맷일 때만 쓰인다 —
+    wide 포맷에는 계정과목 행 자체가 없다. 시트 ②(연도별 스냅샷)는 **무변경**이다:
+    세부계정을 연도마다 실으려면 회사×연도 수만큼 원문을 다시 파싱해야 해 비용이
+    수 배로 뛰고, 이 기능의 요구("선택 다운로드에 원문 전체 계정과목")는 당기 기준
+    ① 시트로 충족된다.
     """
     results_df = (
-        results_to_selection_dataframe(results).rename(columns=SELECTION_EXPORT_COLUMN_LABELS)
+        results_to_selection_dataframe(results, detail_by_result_id).rename(
+            columns=SELECTION_EXPORT_COLUMN_LABELS
+        )
         if use_selection_format
         else results_to_dataframe(results).rename(columns=RESULT_COLUMN_LABELS)
     )
@@ -494,8 +822,4 @@ def export_results_with_history(
         columns=FINANCIAL_SNAPSHOT_COLUMN_LABELS
     )
 
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        results_df.to_excel(writer, sheet_name="results", index=False)
-        history_df.to_excel(writer, sheet_name="financial_history", index=False)
-    return buffer.getvalue()
+    return _write_xlsx([("results", results_df), ("financial_history", history_df)])

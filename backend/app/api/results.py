@@ -35,8 +35,9 @@ STEP 5(파싱, M3)가 채워져 `parse_status`/재무 항목이 실제 값을 �
 
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from functools import partial
 from pathlib import Path
 
@@ -50,6 +51,10 @@ from app.config import get_settings
 from app.core.db import get_db
 from app.core.pipeline import auditor_change_flags
 from app.exporters.excel import (
+    FINANCIAL_SNAPSHOT_ACCOUNT_COLUMNS,
+    SELECTION_ACCOUNT_COLUMNS,
+    XLSX_MAX_ROWS,
+    SelectionAccountDetail,
     export_results,
     export_results_with_history,
     export_selection_results,
@@ -69,6 +74,8 @@ from app.parsers.auditor import extract_auditor
 from app.parsers.document_sections import SECTION_TITLE_MARKS, extract_section_html
 
 router = APIRouter(prefix="/api/jobs", tags=["results"])
+
+logger = logging.getLogger(__name__)
 
 
 # 정렬 허용 컬럼 화이트리스트 (2026-07-20) — 임의 컬럼명을 그대로 ORDER BY에
@@ -1143,6 +1150,110 @@ def _parse_export_ids(ids: str | None) -> list[int] | None:
     return parsed
 
 
+# --- 선택 다운로드 원문 세부계정(§4-15, 2026-08-06) ------------------------
+#
+# 세부계정을 싣지 못한 사유는 회사 단위 "세부계정비고" 컬럼으로 파일에 남긴다 —
+# 세부계정 행만 조용히 빠지면 "원문에 세부계정이 없는 회사"와 "원문을 못 읽은
+# 회사"가 구분되지 않는다(값 없는 계정과목의 행을 남기는 기존 방침과 같은 취지).
+_DETAIL_NOTICE_NO_RCEPT = "원문 없음(감사보고서 미공시)"
+_DETAIL_NOTICE_NO_CACHE = "원문 캐시 없음(재수집 필요)"
+_DETAIL_NOTICE_PDF = "PDF 원문(세부계정 미지원)"
+_DETAIL_NOTICE_PARSE_FAILED = "원문 파싱 실패"
+_DETAIL_NOTICE_EMPTY = "원문에서 세부계정을 찾지 못함"
+
+
+def _load_selection_account_details(
+    results: Sequence[Result],
+) -> dict[int, SelectionAccountDetail]:
+    """선택 다운로드에 실을 원문 세부계정을 회사별로 파싱한다(추가 API 호출 0건).
+
+    화면의 "세부계정 펼치기"(`GET .../account-detail`)와 **완전히 같은 경로**를
+    쓴다 — 로컬 문서 캐시에서 XML을 찾아(`_pick_cached_xml`) `parse_account_detail()`
+    을 부를 뿐이고, 새 파서를 만들지 않는다. 따라서 DART 쿼터를 전혀 쓰지 않고
+    기존 완료 Job에서도 그대로 동작한다.
+
+    **동기 blocking 함수다**(파일 I/O + lxml 파싱) — 호출부가 반드시
+    `run_in_threadpool`로 넘겨야 이벤트 루프가 멈추지 않는다. 실측: 원문이 있는
+    1건당 평균 15.4ms(개발 캐시 300건 표본 — 중앙값 13.8 / p95 27.8 / 최대
+    50.8ms)·세부계정 평균 118행이고, 개발 DB Job 27 전량(4,383건, 절반이 원문
+    없음)에서 이 단계에만 **31.5초**가 걸렸다.
+    """
+    cache_dir = Path(get_settings().document_cache_dir)
+    details: dict[int, SelectionAccountDetail] = {}
+    for result in results:
+        rcept_no = result.rcept_no
+        if not rcept_no:
+            details[result.id] = SelectionAccountDetail(notice=_DETAIL_NOTICE_NO_RCEPT)
+            continue
+
+        xml_path = _pick_cached_xml(cache_dir, rcept_no)
+        if xml_path is None:
+            target_dir = cache_dir / rcept_no
+            notice = (
+                _DETAIL_NOTICE_PDF
+                if target_dir.is_dir() and any(target_dir.rglob("*.pdf"))
+                else _DETAIL_NOTICE_NO_CACHE
+            )
+            details[result.id] = SelectionAccountDetail(notice=notice)
+            continue
+
+        try:
+            parsed = parse_account_detail(xml_path.read_bytes())
+        except Exception:  # noqa: BLE001 — 회사 1건의 원문 문제로 파일 전체를 실패시키지 않는다
+            logger.exception("세부계정 파싱 실패: result_id=%s rcept_no=%s", result.id, rcept_no)
+            details[result.id] = SelectionAccountDetail(notice=_DETAIL_NOTICE_PARSE_FAILED)
+            continue
+
+        # 대분류는 잡혔지만 하위 행이 없는 필드(자산총계 등 그 자체가 총계인 항목)는
+        # 빈 목록으로 오는 것이 정상이라 버린다 — 한 행도 못 얻었을 때만 비고를 남긴다.
+        accounts = {field: rows for field, rows in parsed.accounts.items() if rows}
+        details[result.id] = SelectionAccountDetail(
+            accounts=accounts,
+            notice=None if accounts else _DETAIL_NOTICE_EMPTY,
+        )
+    return details
+
+
+# --- xlsx 행 수 상한 가드(2026-08-06, dart-qa Medium-1) --------------------
+#
+# 엑셀 시트 1장은 1,048,576행이 물리적 상한이라 헤더를 빼면 아래 값이 데이터 행의
+# 상한이다. §4-15로 선택 다운로드 ① 시트가 회사당 평균 86.9행(원문이 있는 회사는
+# 약 142행)으로 늘어, 원문 보유율이 높은 Job은 **7,400건 남짓만 골라도** 이 상한을
+# 넘긴다 — 그대로 두면 직렬화 단계에서 터진 ValueError가 처리되지 않은 500으로
+# 새어 나간다. 무엇이 잘못됐는지 알 수 있는 400 + 한국어 안내로 바꾼다.
+_XLSX_MAX_DATA_ROWS = XLSX_MAX_ROWS - 1
+
+
+def _selection_sheet_row_count(
+    results: Sequence[Result],
+    detail_by_result_id: Mapping[int, SelectionAccountDetail] | None,
+) -> int:
+    """선택 다운로드 ① 시트의 데이터 행 수(요약 24행 × 회사 수 + 세부계정 실제 행 수).
+
+    `results_to_selection_dataframe()`이 만드는 행 수와 같은 식이다 — 세부계정을
+    이미 파싱해 둔 뒤라 추정이 아니라 정확한 값이다.
+    """
+    detail_rows = sum(
+        len(children)
+        for detail in (detail_by_result_id or {}).values()
+        for children in detail.accounts.values()
+    )
+    return len(results) * len(SELECTION_ACCOUNT_COLUMNS) + detail_rows
+
+
+def _assert_xlsx_row_limit(sheet_name: str, row_count: int, *, hint: str) -> None:
+    """xlsx 시트 행 수 상한 초과 시 400으로 막는다(csv에는 이 상한이 없다)."""
+    if row_count <= _XLSX_MAX_DATA_ROWS:
+        return
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"엑셀 시트 한 장에 담을 수 있는 최대 행 수({XLSX_MAX_ROWS:,}행)를 넘습니다"
+            f"({sheet_name} 시트 예상 {row_count + 1:,}행). {hint}"
+        ),
+    )
+
+
 @router.get("/{job_id}/export")
 async def export_job_results(
     job_id: int,
@@ -1203,14 +1314,19 @@ async def export_job_results(
       시트를 표현할 수 없으므로 `format=csv`와 함께 오면 400이다. 이 시트는
       2026-07-29부터 **long 포맷**이다 — 결과ID/회사명/회계연도/접수번호/
       재무제표명/계정과목/금액 7컬럼으로, 스냅샷 1건(회사×회계연도)이 재무
-      19항목만큼 19행으로 풀린다(값이 없는 계정과목도 금액만 빈 행으로 남는다).
+      24항목만큼 24행으로 풀린다(값이 없는 계정과목도 금액만 빈 행으로 남는다).
+      이 시트는 §4-15(원문 세부계정)의 대상이 아니라 요약 24항목 그대로다.
       "재무제표명"은 재무상태표/손익계산서/현금흐름표 중 하나이며, 이전에 있던
       감사인·파싱상태 컬럼은 제거됐다. 정렬은 `result_id`→`fiscal_year`
       오름차순이고 각 스냅샷 안에서는 재무상태표→손익계산서→현금흐름표 순이다.
 
-    **컬럼 구성(2026-07-28 변경)**: `ids`가 지정된 선택 다운로드의 기본정보는
-    기본정보 15컬럼 + "계정과목명"/"금액" + "파싱상태" **long 포맷**(회사 1건 =
-    당기 계정과목 19행, 값이 없는 계정과목도 금액만 비운 행으로 남는다)이다.
+    **컬럼 구성(2026-07-28 변경, 2026-08-06 §4-15로 확장)**: `ids`가 지정된 선택
+    다운로드의 기본정보는 기본정보 15컬럼 + "재무제표명"/"구분"/"상위계정"/
+    "계정과목명"/"계정단계"/"금액" + "파싱상태"/"세부계정비고" **long 포맷**이다.
+    회사 1건은 당기 요약 계정과목 24행 + 각 요약 항목 아래에 이어지는 **원문 그대로의
+    세부계정 행**(로컬 캐시 원문을 다시 파싱해 얻는다 — DART 호출 0건, 개발 캐시
+    실측 평균 118행)으로 풀린다. 값이 없는 요약 계정과목도 금액만 비운 행으로 남고,
+    세부계정을 얻지 못한 회사는 "세부계정비고"에 사유가 반복된다.
     `ids` 없는 필터 전체 내보내기는 `include_history` 여부와 **무관하게** 기존
     wide 포맷(당기/전기 한 행) 그대로다 — 포맷을 가르는 기준은 `ids` 유무 하나뿐이다.
     """
@@ -1280,6 +1396,29 @@ async def export_job_results(
     # 않는다, dart-qa 2026-07-28 리뷰 반영).
     use_selection_format = selected_ids is not None
 
+    # 선택 다운로드에는 요약 24항목 아래에 **원문 그대로의 전체 세부계정**을 함께
+    # 싣는다(§4-15, 2026-08-06). 회사마다 로컬 캐시의 원문 XML을 다시 파싱하므로
+    # (DART 호출·쿼터는 0건) 아래 직렬화와 마찬가지로 이벤트 루프를 막지 않도록
+    # 워커 스레드로 넘긴다. 필터 전체 내보내기(wide 포맷)에는 계정과목 행 자체가
+    # 없으므로 파싱도 하지 않는다.
+    detail_by_result_id: dict[int, SelectionAccountDetail] | None = None
+    if use_selection_format and rows:
+        detail_by_result_id = await run_in_threadpool(_load_selection_account_details, rows)
+
+    # 엑셀 시트 행 수 상한 검사(2026-08-06). 세부계정을 파싱한 **뒤**라야 실제 행 수를
+    # 알 수 있어 여기서 판정한다 — 수천 건 선택이면 위 파싱에 이미 수십 초가 든 뒤지만,
+    # 어차피 그 시간을 들여야 알 수 있는 값이고 500으로 터지는 것보다는 낫다.
+    if format == "xlsx":
+        _assert_xlsx_row_limit(
+            "results",
+            _selection_sheet_row_count(rows, detail_by_result_id)
+            if use_selection_format
+            else len(rows),
+            hint="선택 건수를 줄이거나 CSV 형식(format=csv)으로 받아주세요."
+            if not include_history
+            else "선택 건수를 줄여 주세요(재무이력 시트는 xlsx에서만 지원합니다).",
+        )
+
     # pandas/openpyxl 직렬화는 순수 동기 CPU 작업이라 `async def` 핸들러 안에서
     # 그대로 부르면 그 시간 동안 이벤트 루프 전체가 멈춘다 — Job 진행률 폴링을
     # 포함한 다른 모든 요청이 같이 대기한다. `financial_history` 시트를 long
@@ -1303,15 +1442,24 @@ async def export_job_results(
             if result_ids
             else []
         )
+        # ② `financial_history` 시트도 같은 상한을 받는다(스냅샷 1건 = 24행).
+        _assert_xlsx_row_limit(
+            "financial_history",
+            len(snapshots) * len(FINANCIAL_SNAPSHOT_ACCOUNT_COLUMNS),
+            hint="선택 건수를 줄이거나 재무이력(include_history) 없이 받아주세요.",
+        )
         content = await run_in_threadpool(
             export_results_with_history,
             rows,
             snapshots,
             {r.id: r.corp_name for r in rows},
             use_selection_format=use_selection_format,
+            detail_by_result_id=detail_by_result_id,
         )
     elif use_selection_format:
-        content = await run_in_threadpool(export_selection_results, rows, format)
+        content = await run_in_threadpool(
+            export_selection_results, rows, format, detail_by_result_id
+        )
     else:
         content = await run_in_threadpool(export_results, rows, format)
 
