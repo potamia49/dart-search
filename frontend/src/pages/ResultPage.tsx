@@ -66,6 +66,32 @@ import type { ResultColumnFilterState } from '../util/resultFilters'
 
 const PAGE_SIZE = 50
 
+/** 회사명/주소/업종은 값이 길어 그대로 두면 줄바꿈되거나(각 2~3줄) 반대로 nowrap만 걸면
+ * 표 전체가 가로로 너무 길어진다 — 컬럼별 폭을 고정하고 한 줄로 말줄임(…) 처리한 뒤
+ * 전체 문구는 마우스오버 툴팁으로 보여준다(사용자 요청, 2026-08-06). 주소가 가장 길어
+ * 폭을 가장 넉넉히 준다. 감사인명(이름+지역, 예: "안경회계법인(경상남도 창원시)")도
+ * 같은 이유로 이어서 추가했고, 감사의견은 값 자체는 짧지만("적정"/"의견거절") 다른
+ * 컬럼에 폭을 더 내주기 위해 좁게 잡았다(사용자 요청 — 표 전체가 한 화면에 들어오게). */
+const TRUNCATE_COLUMN_WIDTHS: Partial<Record<ResultColumn['key'], number>> = {
+  corp_name: 160,
+  address: 220,
+  induty_name: 140,
+  auditor_name: 150,
+  audit_opinion: 64,
+}
+
+/** 감사인변동은 뱃지/문구(AuditorChangedCell)라 TruncatedCell을 못 쓰지만, 말줄임 대상
+ * 컬럼들과 같은 이유로 폭을 좁게 고정한다(위 audit_opinion과 동일 취지). */
+const AUDITOR_CHANGED_MAX_WIDTH = 88
+
+/** 자산총계/매출액/영업이익은 오른쪽 정렬한다(자릿수를 맞춰 비교하기 쉽도록,
+ * 사용자 요청, 2026-08-06). */
+const RIGHT_ALIGN_COLUMN_KEYS = new Set<ResultColumn['key']>([
+  'total_assets_cur',
+  'revenue_cur',
+  'operating_income_cur',
+])
+
 /** 검색어 입력마다 요청을 보내지 않도록 하는 디바운스 지연(ms) — SearchPage의
  * 후보 수 미리보기와 같은 값을 쓴다. */
 const SEARCH_DEBOUNCE_MS = 400
@@ -131,6 +157,38 @@ function ParseNoteCell({ text }: { text: string }) {
   return (
     <Tooltip multiline w={360} label={text} withinPortal>
       <Text size="sm" lineClamp={2} maw={280} style={{ cursor: 'help' }}>
+        {text}
+      </Text>
+    </Tooltip>
+  )
+}
+
+/** 회사명/주소/업종 셀 — 폭을 고정하고 한 줄로 말줄임(…) 처리한다(TRUNCATE_COLUMN_WIDTHS).
+ * 값이 짧아도 항상 툴팁을 붙인다(실제로 잘렸는지는 레이아웃 계산 없이는 알 수 없어,
+ * ParseNoteCell과 같은 방침으로 단순화했다). */
+function TruncatedCell({ text, maxWidth }: { text: string; maxWidth: number }) {
+  if (text === '-') {
+    return (
+      <Text span size="sm" c="dimmed">
+        -
+      </Text>
+    )
+  }
+  return (
+    <Tooltip label={text} multiline w={320} withinPortal>
+      <Text
+        span
+        size="sm"
+        style={{
+          display: 'inline-block',
+          maxWidth,
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+          whiteSpace: 'nowrap',
+          verticalAlign: 'bottom',
+          cursor: 'help',
+        }}
+      >
         {text}
       </Text>
     </Tooltip>
@@ -795,14 +853,24 @@ function FinancialsResultsView({ jobId, viewerOnly = false }: { jobId: number; v
                         </Table.Td>
                       )}
                       {visibleColumns.map((col) => (
-                        <Table.Td key={col.key}>
+                        <Table.Td
+                          key={col.key}
+                          style={RIGHT_ALIGN_COLUMN_KEYS.has(col.key) ? { textAlign: 'right' } : undefined}
+                        >
                           {col.key === 'auditor_changed' ? (
-                            <AuditorChangedCell
-                              value={row.auditor_changed}
-                              label={formatCell(col, row)}
-                            />
+                            <div style={{ maxWidth: AUDITOR_CHANGED_MAX_WIDTH }}>
+                              <AuditorChangedCell
+                                value={row.auditor_changed}
+                                label={formatCell(col, row)}
+                              />
+                            </div>
                           ) : col.key === 'parse_note' ? (
                             <ParseNoteCell text={formatCell(col, row)} />
+                          ) : TRUNCATE_COLUMN_WIDTHS[col.key] ? (
+                            <TruncatedCell
+                              text={formatCell(col, row)}
+                              maxWidth={TRUNCATE_COLUMN_WIDTHS[col.key]!}
+                            />
                           ) : (
                             formatCell(col, row)
                           )}
@@ -862,7 +930,10 @@ export default function ResultPage({ viewerOnly = false }: { viewerOnly?: boolea
   }, [jobId])
 
   return (
-    <Stack maw={1200} mx="auto">
+    // 결과 표는 컬럼 수가 많아 폭이 넓게 필요하다 — 예전 maw={1200}이 화면 좌우에
+    // 빈 공간을 남기고 표만 별도로 가로 스크롤되게 했다(사용자 지적, 2026-08-06).
+    // AppShell.Main 폭을 그대로 쓰도록 폭 제한을 없앴다.
+    <Stack>
       <div>
         <Title order={2}>결과 조회 — 작업 #{jobId}</Title>
         {job && (
